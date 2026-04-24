@@ -408,6 +408,29 @@ func TestExtractUsageWindowParsesResetAt(t *testing.T) {
 	}
 }
 
+func TestExtractUsageWindowParsesEmail(t *testing.T) {
+	t.Parallel()
+
+	payload := map[string]any{
+		"user_id": "user-email",
+		"email":   "user-email@example.com",
+		"rate_limit": map[string]any{
+			"primary_window": map[string]any{
+				"used_percent": json.Number("15.25"),
+			},
+		},
+	}
+
+	window, err := extractUsageWindow(payload)
+	if err != nil {
+		t.Fatalf("extractUsageWindow returned error: %v", err)
+	}
+
+	if window.Email != "user-email@example.com" {
+		t.Fatalf("expected parsed email, got %q", window.Email)
+	}
+}
+
 func TestExtractUsageWindowReturnsErrorWhenUserIDMissing(t *testing.T) {
 	t.Parallel()
 
@@ -842,6 +865,203 @@ func TestRunNoAlternateAccountLeavesAuthUnchanged(t *testing.T) {
 	}
 }
 
+func TestRunWithArgsAccountsListsUsageHighlightsCurrentAndPersistsByUserID(t *testing.T) {
+	t.Parallel()
+
+	fixedNow := time.Unix(1_700_000_000, 0)
+	currentReset := fixedNow.Unix() + (2 * 60 * 60) + (15 * 60)
+	otherReset := fixedNow.Unix() + (24 * 60 * 60) + (3 * 60 * 60)
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		auth := r.Header.Get("Authorization")
+		w.Header().Set("Content-Type", "application/json")
+		switch auth {
+		case "Bearer current-token":
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"user_id":"user-current","email":"current@example.com","rate_limit":{"primary_window":{"used_percent":22.5,"reset_at":` + strconv.FormatInt(currentReset, 10) + `}}}`))
+		case "Bearer other-token":
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"user_id":"user-other","email":"other@example.com","rate_limit":{"primary_window":{"used_percent":88,"reset_at":` + strconv.FormatInt(otherReset, 10) + `}}}`))
+		default:
+			w.WriteHeader(http.StatusUnauthorized)
+			_, _ = w.Write([]byte("unauthorized"))
+		}
+	}))
+	defer server.Close()
+
+	dir := t.TempDir()
+	authFile := filepath.Join(dir, "auth.json")
+	if err := os.WriteFile(authFile, []byte(`{"openai.access":"current-token","openai.accountId":"acct-current"}`), 0o600); err != nil {
+		t.Fatalf("write auth file: %v", err)
+	}
+
+	accountsFile := filepath.Join(dir, "accounts.json")
+	initialStore := map[string]map[string]any{
+		"legacy-current": {
+			"user_id": "user-current",
+			"access":  "current-token",
+		},
+		"user-other": {
+			"user_id": "user-other",
+			"access":  "other-token",
+		},
+	}
+	encoded, err := json.Marshal(initialStore)
+	if err != nil {
+		t.Fatalf("marshal initial store: %v", err)
+	}
+	if err := os.WriteFile(accountsFile, encoded, 0o600); err != nil {
+		t.Fatalf("write accounts file: %v", err)
+	}
+
+	var out strings.Builder
+	err = runWithArgs(context.Background(), config{
+		AuthFile:     authFile,
+		AccountsFile: accountsFile,
+		UsageURL:     server.URL,
+		HTTPClient:   server.Client(),
+		Now:          func() time.Time { return fixedNow },
+	}, &out, []string{"accounts"})
+	if err != nil {
+		t.Fatalf("runWithArgs returned error: %v", err)
+	}
+
+	printed := out.String()
+	if !strings.Contains(printed, "CURRENT  EMAIL  USED%  RESET") {
+		t.Fatalf("expected accounts header, got %q", printed)
+	}
+	if !strings.Contains(printed, "current@example.com") {
+		t.Fatalf("expected current account email in output, got %q", printed)
+	}
+	if !strings.Contains(printed, "other@example.com") {
+		t.Fatalf("expected other account email in output, got %q", printed)
+	}
+	if !strings.Contains(printed, "22.5") || !strings.Contains(printed, "88") {
+		t.Fatalf("expected used_percent values in output, got %q", printed)
+	}
+	if !strings.Contains(printed, "2h 15m") {
+		t.Fatalf("expected remaining duration 2h 15m in output, got %q", printed)
+	}
+	if !strings.Contains(printed, "1d 3h") {
+		t.Fatalf("expected remaining duration 1d 3h in output, got %q", printed)
+	}
+	if strings.Contains(printed, strconv.FormatInt(currentReset, 10)) || strings.Contains(printed, strconv.FormatInt(otherReset, 10)) {
+		t.Fatalf("did not expect reset unix timestamps in output, got %q", printed)
+	}
+	if strings.Contains(printed, "202") {
+		t.Fatalf("did not expect formatted date/time in output, got %q", printed)
+	}
+
+	currentLine := lineContaining(printed, "current@example.com")
+	if !strings.HasPrefix(strings.TrimSpace(currentLine), "*") {
+		t.Fatalf("expected current account line to be highlighted, got %q", currentLine)
+	}
+
+	store := mustReadStore(t, accountsFile)
+	if _, hasLegacy := store["legacy-current"]; hasLegacy {
+		t.Fatalf("expected legacy key to be normalized away")
+	}
+
+	currentEntry, ok := store["user-current"]
+	if !ok {
+		t.Fatalf("expected user-current key in persisted store")
+	}
+	if got, _ := currentEntry["email"].(string); got != "current@example.com" {
+		t.Fatalf("expected persisted email current@example.com, got %q", got)
+	}
+	if got, _ := currentEntry["usedPercent"].(string); got != "22.5" {
+		t.Fatalf("expected persisted usedPercent 22.5, got %v", currentEntry["usedPercent"])
+	}
+	if got, ok := valueToInt64(currentEntry["resetAt"]); !ok || got != currentReset {
+		t.Fatalf("expected persisted resetAt %d, got %v", currentReset, currentEntry["resetAt"])
+	}
+}
+
+func TestFormatResetDisplay(t *testing.T) {
+	t.Parallel()
+
+	now := time.Unix(1_700_000_000, 0)
+
+	tests := []struct {
+		name    string
+		resetAt *int64
+		want    string
+	}{
+		{name: "missing", resetAt: nil, want: "-"},
+		{name: "expired", resetAt: int64Ptr(now.Unix()), want: "expired"},
+		{name: "sub minute", resetAt: int64Ptr(now.Unix() + 30), want: "now"},
+		{name: "minutes", resetAt: int64Ptr(now.Unix() + 45*60), want: "45m"},
+		{name: "hours and minutes", resetAt: int64Ptr(now.Unix() + 2*60*60 + 15*60), want: "2h 15m"},
+		{name: "days and hours", resetAt: int64Ptr(now.Unix() + 24*60*60 + 3*60*60), want: "1d 3h"},
+	}
+
+	for _, tc := range tests {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			if got := formatResetDisplay(tc.resetAt, now); got != tc.want {
+				t.Fatalf("formatResetDisplay() = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestRunWithArgsListAliasWorks(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"user_id":"user-only","email":"only@example.com","rate_limit":{"primary_window":{"used_percent":11}}}`))
+	}))
+	defer server.Close()
+
+	dir := t.TempDir()
+	authFile := filepath.Join(dir, "auth.json")
+	if err := os.WriteFile(authFile, []byte(`{"openai.access":"token-only"}`), 0o600); err != nil {
+		t.Fatalf("write auth file: %v", err)
+	}
+
+	accountsFile := filepath.Join(dir, "accounts.json")
+	encoded, err := json.Marshal(map[string]map[string]any{
+		"user-only": {
+			"user_id": "user-only",
+			"access":  "token-only",
+		},
+	})
+	if err != nil {
+		t.Fatalf("marshal store: %v", err)
+	}
+	if err := os.WriteFile(accountsFile, encoded, 0o600); err != nil {
+		t.Fatalf("write accounts file: %v", err)
+	}
+
+	var out strings.Builder
+	err = runWithArgs(context.Background(), config{
+		AuthFile:     authFile,
+		AccountsFile: accountsFile,
+		UsageURL:     server.URL,
+		HTTPClient:   server.Client(),
+	}, &out, []string{"list"})
+	if err != nil {
+		t.Fatalf("runWithArgs(list) returned error: %v", err)
+	}
+
+	if !strings.Contains(out.String(), "only@example.com") {
+		t.Fatalf("expected list alias output to include email, got %q", out.String())
+	}
+}
+
+func lineContaining(text, needle string) string {
+	for _, line := range strings.Split(text, "\n") {
+		if strings.Contains(line, needle) {
+			return line
+		}
+	}
+	return ""
+}
+
 func mustReadStore(t *testing.T, accountsFile string) map[string]map[string]any {
 	t.Helper()
 
@@ -856,4 +1076,8 @@ func mustReadStore(t *testing.T, accountsFile string) map[string]map[string]any 
 	}
 
 	return store
+}
+
+func int64Ptr(v int64) *int64 {
+	return &v
 }

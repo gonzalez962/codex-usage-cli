@@ -1,0 +1,8 @@
+# Build artifacts
+*.exe
+*.test
+*.out
+codex-usage-cli
+bin/
+build/
+dist/

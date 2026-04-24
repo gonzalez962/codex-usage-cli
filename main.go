@@ -24,16 +24,18 @@ type config struct {
 	AccountsFile string
 	UsageURL     string
 	HTTPClient   *http.Client
+	Now          func() time.Time
 }
 
 type usageWindow struct {
 	UsedPercent string
 	ResetAt     *int64
 	UserID      string
+	Email       string
 }
 
 func main() {
-	if err := run(context.Background(), defaultConfig(), os.Stdout); err != nil {
+	if err := runWithArgs(context.Background(), defaultConfig(), os.Stdout, os.Args[1:]); err != nil {
 		fmt.Fprintln(os.Stderr, err.Error())
 		os.Exit(1)
 	}
@@ -60,10 +62,15 @@ func defaultConfig() config {
 		AccountsFile: accountsFile,
 		UsageURL:     defaultUsageURL,
 		HTTPClient:   http.DefaultClient,
+		Now:          time.Now,
 	}
 }
 
 func run(ctx context.Context, cfg config, stdout io.Writer) error {
+	return runWithArgs(ctx, cfg, stdout, nil)
+}
+
+func runWithArgs(ctx context.Context, cfg config, stdout io.Writer, args []string) error {
 	if cfg.AuthFile == "" {
 		return errors.New("auth file path is empty")
 	}
@@ -76,6 +83,24 @@ func run(ctx context.Context, cfg config, stdout io.Writer) error {
 	if cfg.HTTPClient == nil {
 		cfg.HTTPClient = http.DefaultClient
 	}
+	if cfg.Now == nil {
+		cfg.Now = time.Now
+	}
+
+	if len(args) > 0 {
+		command := strings.ToLower(strings.TrimSpace(args[0]))
+		switch command {
+		case "accounts", "list":
+			return runAccountsCommand(ctx, cfg, stdout)
+		default:
+			return fmt.Errorf("unknown command %q (available: accounts, list)", command)
+		}
+	}
+
+	return runDefaultCommand(ctx, cfg, stdout)
+}
+
+func runDefaultCommand(ctx context.Context, cfg config, stdout io.Writer) error {
 
 	account, err := readOpenAIAccount(cfg.AuthFile)
 	if err != nil {
@@ -109,10 +134,217 @@ func run(ctx context.Context, cfg config, stdout io.Writer) error {
 	return err
 }
 
+type accountUsageRow struct {
+	Current      bool
+	UserID       string
+	Email        string
+	UsedPercent  string
+	ResetDisplay string
+	Err          error
+}
+
+func runAccountsCommand(ctx context.Context, cfg config, stdout io.Writer) error {
+	currentAccount, err := readOpenAIAccount(cfg.AuthFile)
+	if err != nil {
+		return err
+	}
+
+	currentToken, _ := currentAccount["access"].(string)
+
+	store, err := readAccountsStore(cfg.AccountsFile)
+	if err != nil {
+		return err
+	}
+	store = normalizeAccountsStoreByUserID(store)
+
+	if len(store) == 0 {
+		_, err := fmt.Fprintf(stdout, "No saved accounts found in %s\n", cfg.AccountsFile)
+		return err
+	}
+
+	keys := make([]string, 0, len(store))
+	for userID := range store {
+		keys = append(keys, userID)
+	}
+	sort.Strings(keys)
+
+	rows := make([]accountUsageRow, 0, len(keys))
+	successCount := 0
+	currentUserID := ""
+	for _, userID := range keys {
+		account := copyAccountData(store[userID])
+		access, _ := account["access"].(string)
+		current := strings.TrimSpace(currentToken) != "" && access == currentToken
+
+		storedUserID, _ := account["user_id"].(string)
+		if strings.TrimSpace(storedUserID) == "" {
+			storedUserID = userID
+		}
+
+		row := accountUsageRow{
+			Current: current,
+			UserID:  storedUserID,
+		}
+
+		if strings.TrimSpace(access) == "" {
+			row.Email = accountEmailFallback(account, row.UserID)
+			row.UsedPercent = "ERR"
+			row.ResetDisplay = "-"
+			row.Err = errors.New("missing access token")
+			rows = append(rows, row)
+			continue
+		}
+
+		usage, fetchErr := fetchUsageWindow(ctx, cfg.HTTPClient, cfg.UsageURL, access)
+		if fetchErr != nil {
+			row.Email = accountEmailFallback(account, row.UserID)
+			row.UsedPercent = "ERR"
+			row.ResetDisplay = "-"
+			row.Err = fetchErr
+			rows = append(rows, row)
+			continue
+		}
+
+		if usage.UserID != "" {
+			row.UserID = usage.UserID
+		}
+		row.Email = usageEmailOrFallback(usage.Email, row.UserID)
+		row.UsedPercent = usage.UsedPercent
+		row.ResetDisplay = formatResetDisplay(usage.ResetAt, cfg.Now())
+		if current {
+			currentUserID = row.UserID
+		}
+
+		updated := accountWithUsage(account, usage)
+		if persistErr := persistOpenAIAccount(cfg.AccountsFile, updated); persistErr != nil {
+			row.Err = persistErr
+		} else {
+			successCount++
+		}
+
+		rows = append(rows, row)
+	}
+
+	if strings.TrimSpace(currentUserID) != "" {
+		for i := range rows {
+			rows[i].Current = rows[i].Current || rows[i].UserID == currentUserID
+		}
+	}
+
+	sort.SliceStable(rows, func(i, j int) bool {
+		if rows[i].Current != rows[j].Current {
+			return rows[i].Current
+		}
+
+		emailI := strings.ToLower(rows[i].Email)
+		emailJ := strings.ToLower(rows[j].Email)
+		if emailI != emailJ {
+			return emailI < emailJ
+		}
+
+		return strings.ToLower(rows[i].UserID) < strings.ToLower(rows[j].UserID)
+	})
+
+	if err := printAccountsTable(stdout, rows); err != nil {
+		return err
+	}
+
+	if successCount == 0 {
+		return errors.New("failed to fetch usage for all saved accounts")
+	}
+
+	return nil
+}
+
+func printAccountsTable(stdout io.Writer, rows []accountUsageRow) error {
+	if _, err := fmt.Fprintln(stdout, "CURRENT  EMAIL  USED%  RESET"); err != nil {
+		return err
+	}
+
+	for _, row := range rows {
+		marker := ""
+		if row.Current {
+			marker = "*"
+		}
+
+		line := fmt.Sprintf("%-7s  %s  %s  %s", marker, row.Email, row.UsedPercent, row.ResetDisplay)
+		if row.Err != nil {
+			line += "  [ERR: " + row.Err.Error() + "]"
+		}
+
+		if _, err := fmt.Fprintln(stdout, line); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func formatResetDisplay(resetAt *int64, now time.Time) string {
+	if resetAt == nil {
+		return "-"
+	}
+
+	remaining := time.Unix(*resetAt, 0).Sub(now)
+	if remaining <= 0 {
+		return "expired"
+	}
+
+	seconds := int64(remaining / time.Second)
+	if seconds < 60 {
+		return "now"
+	}
+
+	days := seconds / (24 * 60 * 60)
+	hours := (seconds % (24 * 60 * 60)) / (60 * 60)
+	minutes := (seconds % (60 * 60)) / 60
+
+	if days > 0 {
+		if hours > 0 {
+			return fmt.Sprintf("%dd %dh", days, hours)
+		}
+		return fmt.Sprintf("%dd", days)
+	}
+
+	if hours > 0 {
+		if minutes > 0 {
+			return fmt.Sprintf("%dh %dm", hours, minutes)
+		}
+		return fmt.Sprintf("%dh", hours)
+	}
+
+	return fmt.Sprintf("%dm", minutes)
+}
+
+func usageEmailOrFallback(email, userID string) string {
+	if strings.TrimSpace(email) != "" {
+		return email
+	}
+	if strings.TrimSpace(userID) != "" {
+		return userID
+	}
+	return "(sin email)"
+}
+
+func accountEmailFallback(account map[string]any, userID string) string {
+	if storedEmail, _ := account["email"].(string); strings.TrimSpace(storedEmail) != "" {
+		return storedEmail
+	}
+	if strings.TrimSpace(userID) != "" {
+		return userID
+	}
+	return "(sin email)"
+}
+
 func ensureCurrentAccountRegistered(accountsFile string, account map[string]any, usage usageWindow) error {
+	return persistOpenAIAccount(accountsFile, accountWithUsage(account, usage))
+}
+
+func accountWithUsage(account map[string]any, usage usageWindow) map[string]any {
 	accountWithUsage := copyAccountData(account)
 	accountWithUsage["user_id"] = usage.UserID
 	accountWithUsage["usedPercent"] = usage.UsedPercent
+	accountWithUsage["email"] = usageEmailOrFallback(usage.Email, usage.UserID)
 	if usage.ResetAt != nil {
 		accountWithUsage["resetAt"] = *usage.ResetAt
 	} else {
@@ -127,7 +359,7 @@ func ensureCurrentAccountRegistered(accountsFile string, account map[string]any,
 		delete(accountWithUsage, "cooldownUntil")
 	}
 
-	return persistOpenAIAccount(accountsFile, accountWithUsage)
+	return accountWithUsage
 }
 
 func readOpenAIAccount(authFile string) (map[string]any, error) {
@@ -437,6 +669,12 @@ func extractUsageWindow(payload map[string]any) (usageWindow, error) {
 		return usageWindow{}, errors.New(`usage JSON key "user_id" must be a non-empty string`)
 	}
 	window.UserID = userID
+
+	if rawEmail, ok := payload["email"]; ok && rawEmail != nil {
+		if email, ok := rawEmail.(string); ok {
+			window.Email = strings.TrimSpace(email)
+		}
+	}
 
 	resetAt, err := extractResetAt(primaryWindow)
 	if err != nil {
