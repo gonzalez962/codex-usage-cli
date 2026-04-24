@@ -10,17 +10,26 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
+	"time"
 )
 
 const defaultUsageURL = "https://chatgpt.com/backend-api/wham/usage"
+const usageRotationThreshold = 80.0
 
 type config struct {
 	AuthFile     string
 	AccountsFile string
 	UsageURL     string
 	HTTPClient   *http.Client
+}
+
+type usageWindow struct {
+	UsedPercent string
+	ResetAt     *int64
+	UserID      string
 }
 
 func main() {
@@ -73,18 +82,52 @@ func run(ctx context.Context, cfg config, stdout io.Writer) error {
 		return err
 	}
 
-	if err := persistOpenAIAccount(cfg.AccountsFile, account); err != nil {
-		return err
-	}
-
 	token, _ := account["access"].(string)
-	usedPercent, err := fetchUsedPercent(ctx, cfg.HTTPClient, cfg.UsageURL, token)
+	usage, err := fetchUsageWindow(ctx, cfg.HTTPClient, cfg.UsageURL, token)
 	if err != nil {
 		return err
 	}
 
-	_, err = io.WriteString(stdout, usedPercent)
+	if err := ensureCurrentAccountRegistered(cfg.AccountsFile, account, usage); err != nil {
+		return err
+	}
+
+	if usedPercentAtOrAboveThreshold(usage.UsedPercent, usageRotationThreshold) {
+		store, err := readAccountsStore(cfg.AccountsFile)
+		if err != nil {
+			return err
+		}
+
+		if nextAccount, ok := selectEligibleAlternateAccount(store, usage.UserID, time.Now().Unix()); ok {
+			if err := updateOpenAIAuthFile(cfg.AuthFile, nextAccount); err != nil {
+				return err
+			}
+		}
+	}
+
+	_, err = io.WriteString(stdout, usage.UsedPercent)
 	return err
+}
+
+func ensureCurrentAccountRegistered(accountsFile string, account map[string]any, usage usageWindow) error {
+	accountWithUsage := copyAccountData(account)
+	accountWithUsage["user_id"] = usage.UserID
+	accountWithUsage["usedPercent"] = usage.UsedPercent
+	if usage.ResetAt != nil {
+		accountWithUsage["resetAt"] = *usage.ResetAt
+	} else {
+		delete(accountWithUsage, "resetAt")
+	}
+
+	if usedPercentAtOrAboveThreshold(usage.UsedPercent, usageRotationThreshold) {
+		if usage.ResetAt != nil {
+			accountWithUsage["cooldownUntil"] = *usage.ResetAt
+		}
+	} else {
+		delete(accountWithUsage, "cooldownUntil")
+	}
+
+	return persistOpenAIAccount(accountsFile, accountWithUsage)
 }
 
 func readOpenAIAccount(authFile string) (map[string]any, error) {
@@ -115,14 +158,12 @@ func extractOpenAIAccount(payload map[string]any) (map[string]any, error) {
 		return nil, err
 	}
 
-	accountID, err := extractAccountID(payload)
-	if err != nil {
-		return nil, err
+	account := map[string]any{
+		"access": token,
 	}
 
-	account := map[string]any{
-		"accountId": accountID,
-		"access":    token,
+	if accountID, ok := extractAccountID(payload); ok {
+		account["accountId"] = accountID
 	}
 
 	for key, value := range payload {
@@ -185,65 +226,130 @@ func extractToken(payload map[string]any) (string, error) {
 	return token, nil
 }
 
-func extractAccountID(payload map[string]any) (string, error) {
+func extractAccountID(payload map[string]any) (string, bool) {
 	if raw, ok := payload["openai.accountId"]; ok {
 		accountID, ok := raw.(string)
 		if !ok || strings.TrimSpace(accountID) == "" {
-			return "", errors.New(`auth JSON key "openai.accountId" must be a non-empty string`)
+			return "", false
 		}
-		return accountID, nil
+		return accountID, true
 	}
 
 	rawOpenAI, ok := payload["openai"]
 	if !ok {
-		return "", errors.New(`auth JSON missing key "openai.accountId"`)
+		return "", false
 	}
 
 	openAIMap, ok := rawOpenAI.(map[string]any)
 	if !ok {
-		return "", errors.New(`auth JSON key "openai" is not an object`)
+		return "", false
 	}
 
 	rawAccountID, ok := openAIMap["accountId"]
 	if !ok {
-		return "", errors.New(`auth JSON missing key "openai.accountId"`)
+		return "", false
 	}
 
 	accountID, ok := rawAccountID.(string)
 	if !ok || strings.TrimSpace(accountID) == "" {
-		return "", errors.New(`auth JSON key "openai.accountId" must be a non-empty string`)
+		return "", false
 	}
 
-	return accountID, nil
+	return accountID, true
 }
 
 func persistOpenAIAccount(accountsFile string, account map[string]any) error {
-	accountID, ok := account["accountId"].(string)
-	if !ok || strings.TrimSpace(accountID) == "" {
-		return errors.New("account data missing non-empty accountId")
+	userID, ok := account["user_id"].(string)
+	if !ok || strings.TrimSpace(userID) == "" {
+		return errors.New("account data missing non-empty user_id")
 	}
 
 	if err := os.MkdirAll(filepath.Dir(accountsFile), 0o700); err != nil {
 		return fmt.Errorf("creating accounts directory: %w", err)
 	}
 
-	store := make(map[string]map[string]any)
-	if data, err := os.ReadFile(accountsFile); err == nil {
-		if len(bytes.TrimSpace(data)) > 0 {
-			if err := json.Unmarshal(data, &store); err != nil {
-				return fmt.Errorf("parsing accounts file JSON: %w", err)
-			}
-		}
-	} else if !errors.Is(err, os.ErrNotExist) {
-		return fmt.Errorf("reading accounts file: %w", err)
+	store, err := readAccountsStore(accountsFile)
+	if err != nil {
+		return err
 	}
 
+	store = normalizeAccountsStoreByUserID(store)
+
+	copyAccount := copyAccountData(account)
+	if existing, ok := store[userID]; ok {
+		merged := copyAccountData(existing)
+		for key, value := range copyAccount {
+			merged[key] = value
+		}
+		copyAccount = merged
+	}
+
+	store[userID] = copyAccount
+
+	if err := writeAccountsStore(accountsFile, store); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func normalizeAccountsStoreByUserID(store map[string]map[string]any) map[string]map[string]any {
+	normalized := make(map[string]map[string]any, len(store))
+
+	mergeEntry := func(key string, entry map[string]any) {
+		if existing, ok := normalized[key]; ok {
+			merged := copyAccountData(existing)
+			for field, value := range entry {
+				merged[field] = value
+			}
+			normalized[key] = merged
+			return
+		}
+		normalized[key] = entry
+	}
+
+	for key, entry := range store {
+		entryCopy := copyAccountData(entry)
+		if userID, ok := entryCopy["user_id"].(string); ok && strings.TrimSpace(userID) != "" {
+			entryCopy["user_id"] = userID
+			mergeEntry(userID, entryCopy)
+			continue
+		}
+
+		mergeEntry(key, entryCopy)
+	}
+
+	return normalized
+}
+
+func copyAccountData(account map[string]any) map[string]any {
 	copyAccount := make(map[string]any, len(account))
 	for key, value := range account {
 		copyAccount[key] = value
 	}
+	return copyAccount
+}
 
-	store[accountID] = copyAccount
+func readAccountsStore(accountsFile string) (map[string]map[string]any, error) {
+	store := make(map[string]map[string]any)
+	data, err := os.ReadFile(accountsFile)
+	if err == nil {
+		if len(bytes.TrimSpace(data)) > 0 {
+			if err := json.Unmarshal(data, &store); err != nil {
+				return nil, fmt.Errorf("parsing accounts file JSON: %w", err)
+			}
+		}
+		return store, nil
+	}
+
+	if errors.Is(err, os.ErrNotExist) {
+		return store, nil
+	}
+
+	return nil, fmt.Errorf("reading accounts file: %w", err)
+}
+
+func writeAccountsStore(accountsFile string, store map[string]map[string]any) error {
 
 	encoded, err := json.Marshal(store)
 	if err != nil {
@@ -257,10 +363,10 @@ func persistOpenAIAccount(accountsFile string, account map[string]any) error {
 	return nil
 }
 
-func fetchUsedPercent(ctx context.Context, client *http.Client, usageURL, token string) (string, error) {
+func fetchUsageWindow(ctx context.Context, client *http.Client, usageURL, token string) (usageWindow, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, usageURL, nil)
 	if err != nil {
-		return "", fmt.Errorf("building usage request: %w", err)
+		return usageWindow{}, fmt.Errorf("building usage request: %w", err)
 	}
 
 	req.Header.Set("Authorization", "Bearer "+token)
@@ -268,7 +374,7 @@ func fetchUsedPercent(ctx context.Context, client *http.Client, usageURL, token 
 
 	resp, err := client.Do(req)
 	if err != nil {
-		return "", fmt.Errorf("requesting usage endpoint: %w", err)
+		return usageWindow{}, fmt.Errorf("requesting usage endpoint: %w", err)
 	}
 	defer resp.Body.Close()
 
@@ -276,9 +382,9 @@ func fetchUsedPercent(ctx context.Context, client *http.Client, usageURL, token 
 		message, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 		msg := strings.TrimSpace(string(message))
 		if msg != "" {
-			return "", fmt.Errorf("usage endpoint returned %d: %s", resp.StatusCode, msg)
+			return usageWindow{}, fmt.Errorf("usage endpoint returned %d: %s", resp.StatusCode, msg)
 		}
-		return "", fmt.Errorf("usage endpoint returned %d", resp.StatusCode)
+		return usageWindow{}, fmt.Errorf("usage endpoint returned %d", resp.StatusCode)
 	}
 
 	decoder := json.NewDecoder(resp.Body)
@@ -286,34 +392,216 @@ func fetchUsedPercent(ctx context.Context, client *http.Client, usageURL, token 
 
 	var payload map[string]any
 	if err := decoder.Decode(&payload); err != nil {
-		return "", fmt.Errorf("parsing usage JSON: %w", err)
+		return usageWindow{}, fmt.Errorf("parsing usage JSON: %w", err)
 	}
 
-	usedPercent, err := extractUsedPercent(payload)
+	window, err := extractUsageWindow(payload)
 	if err != nil {
-		return "", err
+		return usageWindow{}, err
 	}
 
-	return usedPercent, nil
+	return window, nil
 }
 
-func extractUsedPercent(payload map[string]any) (string, error) {
+func extractUsageWindow(payload map[string]any) (usageWindow, error) {
+	window := usageWindow{}
+
 	rateLimit, ok := payload["rate_limit"].(map[string]any)
 	if !ok {
-		return "", errors.New(`usage JSON missing object "rate_limit"`)
+		return usageWindow{}, errors.New(`usage JSON missing object "rate_limit"`)
 	}
 
 	primaryWindow, ok := rateLimit["primary_window"].(map[string]any)
 	if !ok {
-		return "", errors.New(`usage JSON missing object "rate_limit.primary_window"`)
+		return usageWindow{}, errors.New(`usage JSON missing object "rate_limit.primary_window"`)
 	}
 
 	value, ok := primaryWindow["used_percent"]
 	if !ok {
-		return "", errors.New(`usage JSON missing key "rate_limit.primary_window.used_percent"`)
+		return usageWindow{}, errors.New(`usage JSON missing key "rate_limit.primary_window.used_percent"`)
 	}
 
-	return valueToString(value)
+	usedPercent, err := valueToString(value)
+	if err != nil {
+		return usageWindow{}, err
+	}
+	window.UsedPercent = usedPercent
+
+	rawUserID, ok := payload["user_id"]
+	if !ok {
+		return usageWindow{}, errors.New(`usage JSON missing key "user_id"`)
+	}
+
+	userID, ok := rawUserID.(string)
+	if !ok || strings.TrimSpace(userID) == "" {
+		return usageWindow{}, errors.New(`usage JSON key "user_id" must be a non-empty string`)
+	}
+	window.UserID = userID
+
+	resetAt, err := extractResetAt(primaryWindow)
+	if err != nil {
+		return usageWindow{}, err
+	}
+	window.ResetAt = resetAt
+
+	return window, nil
+}
+
+func extractResetAt(primaryWindow map[string]any) (*int64, error) {
+	rawResetAt, ok := primaryWindow["reset_at"]
+	if !ok || rawResetAt == nil {
+		return nil, nil
+	}
+
+	parsed, ok := valueToInt64(rawResetAt)
+	if !ok {
+		return nil, fmt.Errorf("usage JSON key \"rate_limit.primary_window.reset_at\" has unsupported type %T", rawResetAt)
+	}
+
+	return &parsed, nil
+}
+
+func valueToInt64(value any) (int64, bool) {
+	switch v := value.(type) {
+	case json.Number:
+		parsed, err := v.Int64()
+		if err == nil {
+			return parsed, true
+		}
+		floatParsed, err := strconv.ParseFloat(v.String(), 64)
+		if err != nil {
+			return 0, false
+		}
+		return int64(floatParsed), true
+	case string:
+		parsed, err := strconv.ParseInt(strings.TrimSpace(v), 10, 64)
+		if err != nil {
+			return 0, false
+		}
+		return parsed, true
+	case int:
+		return int64(v), true
+	case int64:
+		return v, true
+	case float64:
+		return int64(v), true
+	case float32:
+		return int64(v), true
+	default:
+		return 0, false
+	}
+}
+
+func usedPercentAtOrAboveThreshold(usedPercent string, threshold float64) bool {
+	parsed, err := strconv.ParseFloat(strings.TrimSpace(usedPercent), 64)
+	if err != nil {
+		return false
+	}
+
+	return parsed >= threshold
+}
+
+func selectEligibleAlternateAccount(store map[string]map[string]any, currentUserID string, nowUnix int64) (map[string]any, bool) {
+	store = normalizeAccountsStoreByUserID(store)
+
+	keys := make([]string, 0, len(store))
+	for userID := range store {
+		keys = append(keys, userID)
+	}
+	sort.Strings(keys)
+
+	for _, userID := range keys {
+		if userID == currentUserID {
+			continue
+		}
+
+		account := store[userID]
+		storedUserID, _ := account["user_id"].(string)
+		if strings.TrimSpace(storedUserID) == "" {
+			storedUserID = userID
+		}
+		if strings.TrimSpace(storedUserID) == "" || storedUserID == currentUserID {
+			continue
+		}
+
+		if token, ok := account["access"].(string); !ok || strings.TrimSpace(token) == "" {
+			continue
+		}
+
+		if cooldownUntil, hasCooldown := extractCooldownUntil(account); hasCooldown && cooldownUntil > nowUnix {
+			continue
+		}
+
+		selected := copyAccountData(account)
+		selected["user_id"] = storedUserID
+		return selected, true
+	}
+
+	return nil, false
+}
+
+func extractCooldownUntil(account map[string]any) (int64, bool) {
+	raw, ok := account["cooldownUntil"]
+	if !ok || raw == nil {
+		return 0, false
+	}
+
+	parsed, ok := valueToInt64(raw)
+	if !ok {
+		return 0, false
+	}
+
+	return parsed, true
+}
+
+func updateOpenAIAuthFile(authFile string, account map[string]any) error {
+	access, ok := account["access"].(string)
+	if !ok || strings.TrimSpace(access) == "" {
+		return errors.New("account data missing non-empty access token")
+	}
+
+	accountID, hasAccountID := account["accountId"].(string)
+	hasAccountID = hasAccountID && strings.TrimSpace(accountID) != ""
+
+	data, err := os.ReadFile(authFile)
+	if err != nil {
+		return fmt.Errorf("reading auth file: %w", err)
+	}
+
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.UseNumber()
+
+	var payload map[string]any
+	if err := decoder.Decode(&payload); err != nil {
+		return fmt.Errorf("parsing auth file JSON: %w", err)
+	}
+
+	payload["openai.access"] = access
+	if hasAccountID {
+		payload["openai.accountId"] = accountID
+	}
+
+	rawOpenAI, hasNested := payload["openai"]
+	if hasNested {
+		if openAIMap, ok := rawOpenAI.(map[string]any); ok {
+			openAIMap["access"] = access
+			if hasAccountID {
+				openAIMap["accountId"] = accountID
+			}
+			payload["openai"] = openAIMap
+		}
+	}
+
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		return fmt.Errorf("encoding auth JSON: %w", err)
+	}
+
+	if err := os.WriteFile(authFile, encoded, 0o600); err != nil {
+		return fmt.Errorf("writing auth file: %w", err)
+	}
+
+	return nil
 }
 
 func valueToString(value any) (string, error) {
