@@ -2,7 +2,7 @@
 *.exe
 *.test
 *.out
-codex-usage-cli
+/codex-usage-cli
 bin/
 build/
 dist/
