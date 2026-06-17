@@ -636,6 +636,56 @@ func TestUpdateOpenAIAuthFileUpdatesFlatAndNestedFields(t *testing.T) {
 	}
 }
 
+func TestUpdateOpenAIAuthFileClearsStaleAccountIDWhenTargetHasNone(t *testing.T) {
+	t.Parallel()
+
+	authFile := filepath.Join(t.TempDir(), "auth.json")
+	content := `{"openai.access":"old-flat","openai.accountId":"old-flat-id","openai":{"access":"old-nested","accountId":"old-nested-id"},"other":true}`
+	if err := os.WriteFile(authFile, []byte(content), 0o600); err != nil {
+		t.Fatalf("write auth file: %v", err)
+	}
+
+	// Target account intentionally has no `accountId` field.
+	if err := updateOpenAIAuthFile(authFile, map[string]any{
+		"access": "new-token",
+	}); err != nil {
+		t.Fatalf("updateOpenAIAuthFile returned error: %v", err)
+	}
+
+	data, err := os.ReadFile(authFile)
+	if err != nil {
+		t.Fatalf("read auth file: %v", err)
+	}
+
+	var payload map[string]any
+	if err := json.Unmarshal(data, &payload); err != nil {
+		t.Fatalf("parse auth JSON: %v", err)
+	}
+
+	if got, _ := payload["openai.access"].(string); got != "new-token" {
+		t.Fatalf("expected updated openai.access, got %q", got)
+	}
+	if _, exists := payload["openai.accountId"]; exists {
+		t.Fatalf("expected stale openai.accountId to be removed, payload=%v", payload)
+	}
+
+	openAI, ok := payload["openai"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected nested openai object")
+	}
+	if got, _ := openAI["access"].(string); got != "new-token" {
+		t.Fatalf("expected updated nested access, got %q", got)
+	}
+	if _, exists := openAI["accountId"]; exists {
+		t.Fatalf("expected stale nested accountId to be removed, openai=%v", openAI)
+	}
+
+	// Unrelated top-level fields must be preserved.
+	if got, _ := payload["other"].(bool); !got {
+		t.Fatalf("expected unrelated top-level field 'other' to be preserved, got %v", payload["other"])
+	}
+}
+
 func TestRunRotatesToEligibleAlternateAccount(t *testing.T) {
 	t.Parallel()
 
@@ -871,6 +921,8 @@ func TestRunWithArgsAccountsListsUsageHighlightsCurrentAndPersistsByUserID(t *te
 	fixedNow := time.Unix(1_700_000_000, 0)
 	currentReset := fixedNow.Unix() + (2 * 60 * 60) + (15 * 60)
 	otherReset := fixedNow.Unix() + (24 * 60 * 60) + (3 * 60 * 60)
+	currentWeeklyReset := fixedNow.Unix() + (5 * 24 * 60 * 60) + (12 * 60 * 60)
+	otherWeeklyReset := fixedNow.Unix() + (3 * 24 * 60 * 60) + (4 * 60 * 60)
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		auth := r.Header.Get("Authorization")
@@ -878,10 +930,10 @@ func TestRunWithArgsAccountsListsUsageHighlightsCurrentAndPersistsByUserID(t *te
 		switch auth {
 		case "Bearer current-token":
 			w.WriteHeader(http.StatusOK)
-			_, _ = w.Write([]byte(`{"user_id":"user-current","email":"current@example.com","rate_limit":{"primary_window":{"used_percent":22.5,"reset_at":` + strconv.FormatInt(currentReset, 10) + `}}}`))
+			_, _ = w.Write([]byte(`{"user_id":"user-current","email":"current@example.com","rate_limit":{"primary_window":{"used_percent":22.5,"reset_at":` + strconv.FormatInt(currentReset, 10) + `},"secondary_window":{"used_percent":2.5,"reset_at":` + strconv.FormatInt(currentWeeklyReset, 10) + `}}}`))
 		case "Bearer other-token":
 			w.WriteHeader(http.StatusOK)
-			_, _ = w.Write([]byte(`{"user_id":"user-other","email":"other@example.com","rate_limit":{"primary_window":{"used_percent":88,"reset_at":` + strconv.FormatInt(otherReset, 10) + `}}}`))
+			_, _ = w.Write([]byte(`{"user_id":"user-other","email":"other@example.com","rate_limit":{"primary_window":{"used_percent":88,"reset_at":` + strconv.FormatInt(otherReset, 10) + `},"secondary_window":{"used_percent":12,"reset_at":` + strconv.FormatInt(otherWeeklyReset, 10) + `}}}`))
 		default:
 			w.WriteHeader(http.StatusUnauthorized)
 			_, _ = w.Write([]byte("unauthorized"))
@@ -927,7 +979,7 @@ func TestRunWithArgsAccountsListsUsageHighlightsCurrentAndPersistsByUserID(t *te
 	}
 
 	printed := out.String()
-	if !strings.Contains(printed, "CURRENT  EMAIL  USED%  RESET") {
+	if !strings.Contains(printed, "ID  CURRENT  EMAIL  USED%  WEEK%  RESET  WEEK-RESET") {
 		t.Fatalf("expected accounts header, got %q", printed)
 	}
 	if !strings.Contains(printed, "current@example.com") {
@@ -937,24 +989,50 @@ func TestRunWithArgsAccountsListsUsageHighlightsCurrentAndPersistsByUserID(t *te
 		t.Fatalf("expected other account email in output, got %q", printed)
 	}
 	if !strings.Contains(printed, "22.5") || !strings.Contains(printed, "88") {
-		t.Fatalf("expected used_percent values in output, got %q", printed)
+		t.Fatalf("expected primary used_percent values in output, got %q", printed)
+	}
+	if !strings.Contains(printed, "2.5") || !strings.Contains(printed, "12") {
+		t.Fatalf("expected secondary used_percent values in output, got %q", printed)
 	}
 	if !strings.Contains(printed, "2h 15m") {
-		t.Fatalf("expected remaining duration 2h 15m in output, got %q", printed)
+		t.Fatalf("expected primary remaining duration 2h 15m in output, got %q", printed)
 	}
 	if !strings.Contains(printed, "1d 3h") {
-		t.Fatalf("expected remaining duration 1d 3h in output, got %q", printed)
+		t.Fatalf("expected primary remaining duration 1d 3h in output, got %q", printed)
+	}
+	if !strings.Contains(printed, "5d 12h") {
+		t.Fatalf("expected weekly remaining duration 5d 12h in output, got %q", printed)
+	}
+	if !strings.Contains(printed, "3d 4h") {
+		t.Fatalf("expected weekly remaining duration 3d 4h in output, got %q", printed)
 	}
 	if strings.Contains(printed, strconv.FormatInt(currentReset, 10)) || strings.Contains(printed, strconv.FormatInt(otherReset, 10)) {
 		t.Fatalf("did not expect reset unix timestamps in output, got %q", printed)
+	}
+	if strings.Contains(printed, strconv.FormatInt(currentWeeklyReset, 10)) || strings.Contains(printed, strconv.FormatInt(otherWeeklyReset, 10)) {
+		t.Fatalf("did not expect weekly reset unix timestamps in output, got %q", printed)
 	}
 	if strings.Contains(printed, "202") {
 		t.Fatalf("did not expect formatted date/time in output, got %q", printed)
 	}
 
-	currentLine := lineContaining(printed, "current@example.com")
-	if !strings.HasPrefix(strings.TrimSpace(currentLine), "*") {
-		t.Fatalf("expected current account line to be highlighted, got %q", currentLine)
+	currentLine := strings.TrimSpace(lineContaining(printed, "current@example.com"))
+	if !strings.Contains(currentLine, "*") {
+		t.Fatalf("expected current account line to be highlighted with '*', got %q", currentLine)
+	}
+	otherLine := strings.TrimSpace(lineContaining(printed, "other@example.com"))
+	if strings.Contains(otherLine, "*") {
+		t.Fatalf("expected non-current account line to NOT contain '*', got %q", otherLine)
+	}
+
+	// Index column should match the stable alphabetical order of user_id.
+	currentIndexLine := strings.TrimSpace(lineContaining(printed, "current@example.com"))
+	otherIndexLine := strings.TrimSpace(lineContaining(printed, "other@example.com"))
+	if !strings.HasPrefix(currentIndexLine, "1 ") {
+		t.Fatalf("expected current account to be listed first (index 1), got %q", currentIndexLine)
+	}
+	if !strings.HasPrefix(otherIndexLine, "2 ") {
+		t.Fatalf("expected other account to be listed second (index 2), got %q", otherIndexLine)
 	}
 
 	store := mustReadStore(t, accountsFile)
@@ -974,6 +1052,12 @@ func TestRunWithArgsAccountsListsUsageHighlightsCurrentAndPersistsByUserID(t *te
 	}
 	if got, ok := valueToInt64(currentEntry["resetAt"]); !ok || got != currentReset {
 		t.Fatalf("expected persisted resetAt %d, got %v", currentReset, currentEntry["resetAt"])
+	}
+	if got, _ := currentEntry["secondaryUsedPercent"].(string); got != "2.5" {
+		t.Fatalf("expected persisted secondaryUsedPercent 2.5, got %v", currentEntry["secondaryUsedPercent"])
+	}
+	if got, ok := valueToInt64(currentEntry["secondaryResetAt"]); !ok || got != currentWeeklyReset {
+		t.Fatalf("expected persisted secondaryResetAt %d, got %v", currentWeeklyReset, currentEntry["secondaryResetAt"])
 	}
 }
 
@@ -1050,6 +1134,534 @@ func TestRunWithArgsListAliasWorks(t *testing.T) {
 
 	if !strings.Contains(out.String(), "only@example.com") {
 		t.Fatalf("expected list alias output to include email, got %q", out.String())
+	}
+}
+
+func TestExtractUsageWindowParsesSecondaryWindow(t *testing.T) {
+	t.Parallel()
+
+	payload := map[string]any{
+		"user_id": "user-secondary",
+		"email":   "secondary@example.com",
+		"rate_limit": map[string]any{
+			"primary_window": map[string]any{
+				"used_percent": json.Number("11.0"),
+				"reset_at":     json.Number("1777014899"),
+			},
+			"secondary_window": map[string]any{
+				"used_percent": json.Number("3.25"),
+				"reset_at":     json.Number("1777619699"),
+			},
+		},
+	}
+
+	window, err := extractUsageWindow(payload)
+	if err != nil {
+		t.Fatalf("extractUsageWindow returned error: %v", err)
+	}
+
+	if window.UsedPercent != "11.0" {
+		t.Fatalf("unexpected primary usedPercent: %q", window.UsedPercent)
+	}
+	if window.ResetAt == nil || *window.ResetAt != 1777014899 {
+		t.Fatalf("expected primary reset_at 1777014899, got %v", window.ResetAt)
+	}
+	if window.SecondaryUsedPercent != "3.25" {
+		t.Fatalf("unexpected secondary usedPercent: %q", window.SecondaryUsedPercent)
+	}
+	if window.SecondaryResetAt == nil || *window.SecondaryResetAt != 1777619699 {
+		t.Fatalf("expected secondary reset_at 1777619699, got %v", window.SecondaryResetAt)
+	}
+}
+
+func TestExtractUsageWindowAcceptsMissingSecondaryWindow(t *testing.T) {
+	t.Parallel()
+
+	payload := map[string]any{
+		"user_id": "user-no-secondary",
+		"rate_limit": map[string]any{
+			"primary_window": map[string]any{
+				"used_percent": json.Number("22.5"),
+			},
+		},
+	}
+
+	window, err := extractUsageWindow(payload)
+	if err != nil {
+		t.Fatalf("extractUsageWindow returned error: %v", err)
+	}
+
+	if window.UsedPercent != "22.5" {
+		t.Fatalf("unexpected primary usedPercent: %q", window.UsedPercent)
+	}
+	if window.SecondaryUsedPercent != "" {
+		t.Fatalf("expected empty secondary usedPercent when absent, got %q", window.SecondaryUsedPercent)
+	}
+	if window.SecondaryResetAt != nil {
+		t.Fatalf("expected nil secondary reset_at when absent, got %v", window.SecondaryResetAt)
+	}
+}
+
+func TestExtractUsageWindowRejectsInvalidSecondaryUsedPercent(t *testing.T) {
+	t.Parallel()
+
+	payload := map[string]any{
+		"user_id": "user-bad-secondary",
+		"rate_limit": map[string]any{
+			"primary_window": map[string]any{
+				"used_percent": json.Number("22.5"),
+			},
+			"secondary_window": map[string]any{
+				"used_percent": map[string]any{"not": "a number"},
+			},
+		},
+	}
+
+	_, err := extractUsageWindow(payload)
+	if err == nil {
+		t.Fatalf("expected error for unsupported secondary used_percent type")
+	}
+	if !strings.Contains(err.Error(), "secondary_window") {
+		t.Fatalf("expected error to mention secondary_window, got %v", err)
+	}
+}
+
+func TestExtractUsageWindowRejectsSecondaryWindowMissingUsedPercent(t *testing.T) {
+	t.Parallel()
+
+	payload := map[string]any{
+		"user_id": "user-no-secondary-pct",
+		"rate_limit": map[string]any{
+			"primary_window": map[string]any{
+				"used_percent": json.Number("22.5"),
+			},
+			"secondary_window": map[string]any{
+				"reset_at": json.Number("1777619699"),
+			},
+		},
+	}
+
+	_, err := extractUsageWindow(payload)
+	if err == nil {
+		t.Fatalf("expected error for secondary_window missing used_percent")
+	}
+	if !strings.Contains(err.Error(), "secondary_window.used_percent") {
+		t.Fatalf("expected error to mention secondary_window.used_percent, got %v", err)
+	}
+}
+
+func TestExtractUsageWindowRejectsNonObjectSecondaryWindow(t *testing.T) {
+	t.Parallel()
+
+	payload := map[string]any{
+		"user_id": "user-string-secondary",
+		"rate_limit": map[string]any{
+			"primary_window": map[string]any{
+				"used_percent": json.Number("22.5"),
+			},
+			"secondary_window": "not-an-object",
+		},
+	}
+
+	_, err := extractUsageWindow(payload)
+	if err == nil {
+		t.Fatalf("expected error when secondary_window is not an object")
+	}
+	if !strings.Contains(err.Error(), "secondary_window") {
+		t.Fatalf("expected error to mention secondary_window, got %v", err)
+	}
+}
+
+func TestResolveAccountIdentifierMatchesIndexUserIDAndEmail(t *testing.T) {
+	t.Parallel()
+
+	store := map[string]map[string]any{
+		"user-alpha": {
+			"user_id": "user-alpha",
+			"email":   "alpha@example.com",
+			"access":  "alpha-token",
+		},
+		"user-bravo": {
+			"user_id": "user-bravo",
+			"email":   "bravo@example.com",
+			"access":  "bravo-token",
+		},
+		"user-charlie": {
+			"user_id": "user-charlie",
+			"email":   "charlie@example.com",
+			"access":  "charlie-token",
+		},
+	}
+	keys := sortedUserIDs(store)
+
+	// Row index requires the `#` prefix: 1-based, 2 => bravo, 3 => charlie.
+	account, userID, err := resolveAccountIdentifier(store, keys, "#2")
+	if err != nil {
+		t.Fatalf("resolveAccountIdentifier(#2) returned error: %v", err)
+	}
+	if userID != "user-bravo" {
+		t.Fatalf("expected #2 to resolve to user-bravo, got %q", userID)
+	}
+	if got, _ := account["access"].(string); got != "bravo-token" {
+		t.Fatalf("expected bravo access token, got %q", got)
+	}
+
+	// Exact user_id.
+	account, userID, err = resolveAccountIdentifier(store, keys, "user-charlie")
+	if err != nil {
+		t.Fatalf("resolveAccountIdentifier(user_id) returned error: %v", err)
+	}
+	if userID != "user-charlie" {
+		t.Fatalf("expected user_id resolution to user-charlie, got %q", userID)
+	}
+
+	// Email (case-insensitive).
+	account, userID, err = resolveAccountIdentifier(store, keys, "Alpha@Example.com")
+	if err != nil {
+		t.Fatalf("resolveAccountIdentifier(email) returned error: %v", err)
+	}
+	if userID != "user-alpha" {
+		t.Fatalf("expected email resolution to user-alpha, got %q", userID)
+	}
+}
+
+func TestResolveAccountIdentifierDoesNotCollideNumericUserIDWithRowIndex(t *testing.T) {
+	t.Parallel()
+
+	// Store with numeric user_ids that sort lexicographically: "1", "10", "2".
+	// Index 2 of the sorted list is "10", but `use 2` MUST select user_id "2"
+	// (exact match), not user_id "10" via the row index.
+	store := map[string]map[string]any{
+		"1": {
+			"user_id": "1",
+			"email":   "one@example.com",
+			"access":  "one-token",
+		},
+		"2": {
+			"user_id": "2",
+			"email":   "two@example.com",
+			"access":  "two-token",
+		},
+		"10": {
+			"user_id": "10",
+			"email":   "ten@example.com",
+			"access":  "ten-token",
+		},
+	}
+	keys := sortedUserIDs(store)
+	if len(keys) != 3 || keys[0] != "1" || keys[1] != "10" || keys[2] != "2" {
+		t.Fatalf("expected sorted keys [1 10 2], got %v", keys)
+	}
+
+	// `use 2` must match the exact user_id "2", not the row at index 2.
+	account, userID, err := resolveAccountIdentifier(store, keys, "2")
+	if err != nil {
+		t.Fatalf("resolveAccountIdentifier(2) returned error: %v", err)
+	}
+	if userID != "2" {
+		t.Fatalf("expected exact user_id match for '2', got %q", userID)
+	}
+	if got, _ := account["access"].(string); got != "two-token" {
+		t.Fatalf("expected two-token, got %q", got)
+	}
+
+	// `use #2` must match the row at index 2, which is user_id "10".
+	account, userID, err = resolveAccountIdentifier(store, keys, "#2")
+	if err != nil {
+		t.Fatalf("resolveAccountIdentifier(#2) returned error: %v", err)
+	}
+	if userID != "10" {
+		t.Fatalf("expected #2 to resolve to user_id '10' (row 2), got %q", userID)
+	}
+	if got, _ := account["access"].(string); got != "ten-token" {
+		t.Fatalf("expected ten-token, got %q", got)
+	}
+}
+
+func TestResolveAccountIdentifierReturnsErrorOnUnknown(t *testing.T) {
+	t.Parallel()
+
+	store := map[string]map[string]any{
+		"user-alpha": {
+			"user_id": "user-alpha",
+			"access":  "alpha-token",
+		},
+	}
+	keys := sortedUserIDs(store)
+
+	_, _, err := resolveAccountIdentifier(store, keys, "user-zzz")
+	if err == nil {
+		t.Fatalf("expected error for unknown identifier")
+	}
+
+	_, _, err = resolveAccountIdentifier(store, keys, "#9")
+	if err == nil {
+		t.Fatalf("expected error for out-of-range index")
+	}
+
+	_, _, err = resolveAccountIdentifier(store, keys, "#0")
+	if err == nil {
+		t.Fatalf("expected error for non-positive index")
+	}
+}
+
+func TestRunUseCommandSwitchesAuthFileByIndex(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	authFile := filepath.Join(dir, "auth.json")
+	if err := os.WriteFile(authFile, []byte(`{"openai.access":"current-token","openai.accountId":"acct-current"}`), 0o600); err != nil {
+		t.Fatalf("write auth file: %v", err)
+	}
+
+	accountsFile := filepath.Join(dir, "accounts.json")
+	initialStore := map[string]map[string]any{
+		"user-current": {
+			"user_id":   "user-current",
+			"accountId": "acct-current",
+			"access":    "current-token",
+		},
+		"user-other": {
+			"user_id":   "user-other",
+			"accountId": "acct-other",
+			"email":     "other@example.com",
+			"access":    "other-token",
+		},
+	}
+	encoded, err := json.Marshal(initialStore)
+	if err != nil {
+		t.Fatalf("marshal store: %v", err)
+	}
+	if err := os.WriteFile(accountsFile, encoded, 0o600); err != nil {
+		t.Fatalf("write accounts file: %v", err)
+	}
+
+	var out strings.Builder
+	err = runUseCommand(config{
+		AuthFile:     authFile,
+		AccountsFile: accountsFile,
+	}, &out, "#2")
+	if err != nil {
+		t.Fatalf("runUseCommand returned error: %v", err)
+	}
+
+	if !strings.Contains(out.String(), "user-other") {
+		t.Fatalf("expected confirmation message to mention user-other, got %q", out.String())
+	}
+	if !strings.Contains(out.String(), "other@example.com") {
+		t.Fatalf("expected confirmation message to mention other@example.com, got %q", out.String())
+	}
+	if strings.Contains(out.String(), "other-token") {
+		t.Fatalf("must not leak access token in output, got %q", out.String())
+	}
+
+	data, err := os.ReadFile(authFile)
+	if err != nil {
+		t.Fatalf("read auth file: %v", err)
+	}
+
+	var authPayload map[string]any
+	if err := json.Unmarshal(data, &authPayload); err != nil {
+		t.Fatalf("parse auth JSON: %v", err)
+	}
+
+	if got, _ := authPayload["openai.access"].(string); got != "other-token" {
+		t.Fatalf("expected openai.access to be other-token, got %q", got)
+	}
+	if got, _ := authPayload["openai.accountId"].(string); got != "acct-other" {
+		t.Fatalf("expected openai.accountId to be acct-other, got %q", got)
+	}
+}
+
+func TestRunUseCommandAcceptsEmailAndUserID(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	authFile := filepath.Join(dir, "auth.json")
+	if err := os.WriteFile(authFile, []byte(`{"openai.access":"current-token","openai.accountId":"acct-current"}`), 0o600); err != nil {
+		t.Fatalf("write auth file: %v", err)
+	}
+
+	accountsFile := filepath.Join(dir, "accounts.json")
+	initialStore := map[string]map[string]any{
+		"user-current": {
+			"user_id":   "user-current",
+			"accountId": "acct-current",
+			"access":    "current-token",
+		},
+		"user-target": {
+			"user_id":   "user-target",
+			"accountId": "acct-target",
+			"email":     "target@example.com",
+			"access":    "target-token",
+		},
+	}
+	encoded, err := json.Marshal(initialStore)
+	if err != nil {
+		t.Fatalf("marshal store: %v", err)
+	}
+	if err := os.WriteFile(accountsFile, encoded, 0o600); err != nil {
+		t.Fatalf("write accounts file: %v", err)
+	}
+
+	t.Run("by user_id", func(t *testing.T) {
+		// Reset auth file to a known state for this subtest.
+		if err := os.WriteFile(authFile, []byte(`{"openai.access":"current-token","openai.accountId":"acct-current"}`), 0o600); err != nil {
+			t.Fatalf("write auth file: %v", err)
+		}
+
+		var out strings.Builder
+		if err := runUseCommand(config{
+			AuthFile:     authFile,
+			AccountsFile: accountsFile,
+		}, &out, "user-target"); err != nil {
+			t.Fatalf("runUseCommand(user_id) returned error: %v", err)
+		}
+
+		data, _ := os.ReadFile(authFile)
+		var authPayload map[string]any
+		if err := json.Unmarshal(data, &authPayload); err != nil {
+			t.Fatalf("parse auth JSON: %v", err)
+		}
+		if got, _ := authPayload["openai.access"].(string); got != "target-token" {
+			t.Fatalf("expected openai.access target-token, got %q", got)
+		}
+	})
+
+	t.Run("by email case-insensitive", func(t *testing.T) {
+		// Reset auth file again.
+		if err := os.WriteFile(authFile, []byte(`{"openai.access":"current-token","openai.accountId":"acct-current"}`), 0o600); err != nil {
+			t.Fatalf("write auth file: %v", err)
+		}
+
+		var out strings.Builder
+		if err := runUseCommand(config{
+			AuthFile:     authFile,
+			AccountsFile: accountsFile,
+		}, &out, "TARGET@example.com"); err != nil {
+			t.Fatalf("runUseCommand(email) returned error: %v", err)
+		}
+
+		data, _ := os.ReadFile(authFile)
+		var authPayload map[string]any
+		if err := json.Unmarshal(data, &authPayload); err != nil {
+			t.Fatalf("parse auth JSON: %v", err)
+		}
+		if got, _ := authPayload["openai.access"].(string); got != "target-token" {
+			t.Fatalf("expected openai.access target-token, got %q", got)
+		}
+	})
+}
+
+func TestRunUseCommandRejectsUnknownIdentifier(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	authFile := filepath.Join(dir, "auth.json")
+	if err := os.WriteFile(authFile, []byte(`{"openai.access":"current-token","openai.accountId":"acct-current"}`), 0o600); err != nil {
+		t.Fatalf("write auth file: %v", err)
+	}
+
+	accountsFile := filepath.Join(dir, "accounts.json")
+	initialStore := map[string]map[string]any{
+		"user-current": {
+			"user_id": "user-current",
+			"access":  "current-token",
+		},
+	}
+	encoded, err := json.Marshal(initialStore)
+	if err != nil {
+		t.Fatalf("marshal store: %v", err)
+	}
+	if err := os.WriteFile(accountsFile, encoded, 0o600); err != nil {
+		t.Fatalf("write accounts file: %v", err)
+	}
+
+	err = runUseCommand(config{
+		AuthFile:     authFile,
+		AccountsFile: accountsFile,
+	}, &strings.Builder{}, "user-missing")
+	if err == nil {
+		t.Fatalf("expected error for unknown identifier")
+	}
+
+	// Auth file should be unchanged after a failed switch.
+	data, _ := os.ReadFile(authFile)
+	if !strings.Contains(string(data), "current-token") {
+		t.Fatalf("expected auth file unchanged after failed switch, got %s", string(data))
+	}
+}
+
+func TestRunWithArgsUseRoutesToRunUseCommand(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	authFile := filepath.Join(dir, "auth.json")
+	if err := os.WriteFile(authFile, []byte(`{"openai.access":"current-token","openai.accountId":"acct-current"}`), 0o600); err != nil {
+		t.Fatalf("write auth file: %v", err)
+	}
+
+	accountsFile := filepath.Join(dir, "accounts.json")
+	initialStore := map[string]map[string]any{
+		"user-current": {
+			"user_id":   "user-current",
+			"accountId": "acct-current",
+			"access":    "current-token",
+		},
+		"user-next": {
+			"user_id":   "user-next",
+			"accountId": "acct-next",
+			"access":    "next-token",
+		},
+	}
+	encoded, err := json.Marshal(initialStore)
+	if err != nil {
+		t.Fatalf("marshal store: %v", err)
+	}
+	if err := os.WriteFile(accountsFile, encoded, 0o600); err != nil {
+		t.Fatalf("write accounts file: %v", err)
+	}
+
+	var out strings.Builder
+	err = runWithArgs(context.Background(), config{
+		AuthFile:     authFile,
+		AccountsFile: accountsFile,
+		UsageURL:     "http://unused.invalid/",
+	}, &out, []string{"use", "user-next"})
+	if err != nil {
+		t.Fatalf("runWithArgs(use) returned error: %v", err)
+	}
+
+	data, _ := os.ReadFile(authFile)
+	var authPayload map[string]any
+	if err := json.Unmarshal(data, &authPayload); err != nil {
+		t.Fatalf("parse auth JSON: %v", err)
+	}
+	if got, _ := authPayload["openai.access"].(string); got != "next-token" {
+		t.Fatalf("expected openai.access next-token, got %q", got)
+	}
+}
+
+func TestRunWithArgsUseRequiresIdentifier(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	authFile := filepath.Join(dir, "auth.json")
+	if err := os.WriteFile(authFile, []byte(`{"openai.access":"current-token"}`), 0o600); err != nil {
+		t.Fatalf("write auth file: %v", err)
+	}
+	accountsFile := filepath.Join(dir, "accounts.json")
+
+	err := runWithArgs(context.Background(), config{
+		AuthFile:     authFile,
+		AccountsFile: accountsFile,
+		UsageURL:     "http://unused.invalid/",
+	}, &strings.Builder{}, []string{"use"})
+	if err == nil {
+		t.Fatalf("expected error for use without identifier")
+	}
+	if !strings.Contains(err.Error(), "identifier") {
+		t.Fatalf("expected error to mention identifier, got %v", err)
 	}
 }
 

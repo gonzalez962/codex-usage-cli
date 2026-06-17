@@ -28,10 +28,12 @@ type config struct {
 }
 
 type usageWindow struct {
-	UsedPercent string
-	ResetAt     *int64
-	UserID      string
-	Email       string
+	UsedPercent          string
+	SecondaryUsedPercent string
+	ResetAt              *int64
+	SecondaryResetAt     *int64
+	UserID               string
+	Email                string
 }
 
 func main() {
@@ -92,8 +94,13 @@ func runWithArgs(ctx context.Context, cfg config, stdout io.Writer, args []strin
 		switch command {
 		case "accounts", "list":
 			return runAccountsCommand(ctx, cfg, stdout)
+		case "use":
+			if len(args) < 2 {
+				return errors.New("use command requires an account identifier (index, user_id, or email)")
+			}
+			return runUseCommand(cfg, stdout, strings.TrimSpace(args[1]))
 		default:
-			return fmt.Errorf("unknown command %q (available: accounts, list)", command)
+			return fmt.Errorf("unknown command %q (available: accounts, list, use <id>)", command)
 		}
 	}
 
@@ -135,12 +142,15 @@ func runDefaultCommand(ctx context.Context, cfg config, stdout io.Writer) error 
 }
 
 type accountUsageRow struct {
-	Current      bool
-	UserID       string
-	Email        string
-	UsedPercent  string
-	ResetDisplay string
-	Err          error
+	Current               bool
+	Index                 int
+	UserID                string
+	Email                 string
+	UsedPercent           string
+	SecondaryUsedPercent  string
+	ResetDisplay          string
+	SecondaryResetDisplay string
+	Err                   error
 }
 
 func runAccountsCommand(ctx context.Context, cfg config, stdout io.Writer) error {
@@ -171,7 +181,7 @@ func runAccountsCommand(ctx context.Context, cfg config, stdout io.Writer) error
 	rows := make([]accountUsageRow, 0, len(keys))
 	successCount := 0
 	currentUserID := ""
-	for _, userID := range keys {
+	for idx, userID := range keys {
 		account := copyAccountData(store[userID])
 		access, _ := account["access"].(string)
 		current := strings.TrimSpace(currentToken) != "" && access == currentToken
@@ -183,6 +193,7 @@ func runAccountsCommand(ctx context.Context, cfg config, stdout io.Writer) error
 
 		row := accountUsageRow{
 			Current: current,
+			Index:   idx + 1,
 			UserID:  storedUserID,
 		}
 
@@ -190,6 +201,8 @@ func runAccountsCommand(ctx context.Context, cfg config, stdout io.Writer) error
 			row.Email = accountEmailFallback(account, row.UserID)
 			row.UsedPercent = "ERR"
 			row.ResetDisplay = "-"
+			row.SecondaryUsedPercent = "-"
+			row.SecondaryResetDisplay = "-"
 			row.Err = errors.New("missing access token")
 			rows = append(rows, row)
 			continue
@@ -200,6 +213,8 @@ func runAccountsCommand(ctx context.Context, cfg config, stdout io.Writer) error
 			row.Email = accountEmailFallback(account, row.UserID)
 			row.UsedPercent = "ERR"
 			row.ResetDisplay = "-"
+			row.SecondaryUsedPercent = "-"
+			row.SecondaryResetDisplay = "-"
 			row.Err = fetchErr
 			rows = append(rows, row)
 			continue
@@ -211,6 +226,8 @@ func runAccountsCommand(ctx context.Context, cfg config, stdout io.Writer) error
 		row.Email = usageEmailOrFallback(usage.Email, row.UserID)
 		row.UsedPercent = usage.UsedPercent
 		row.ResetDisplay = formatResetDisplay(usage.ResetAt, cfg.Now())
+		row.SecondaryUsedPercent = usage.SecondaryUsedPercent
+		row.SecondaryResetDisplay = formatResetDisplay(usage.SecondaryResetAt, cfg.Now())
 		if current {
 			currentUserID = row.UserID
 		}
@@ -231,20 +248,8 @@ func runAccountsCommand(ctx context.Context, cfg config, stdout io.Writer) error
 		}
 	}
 
-	sort.SliceStable(rows, func(i, j int) bool {
-		if rows[i].Current != rows[j].Current {
-			return rows[i].Current
-		}
-
-		emailI := strings.ToLower(rows[i].Email)
-		emailJ := strings.ToLower(rows[j].Email)
-		if emailI != emailJ {
-			return emailI < emailJ
-		}
-
-		return strings.ToLower(rows[i].UserID) < strings.ToLower(rows[j].UserID)
-	})
-
+	// Rows are already in alphabetical user_id order; indices are stable for
+	// callers that want to reference them from `use <id>`.
 	if err := printAccountsTable(stdout, rows); err != nil {
 		return err
 	}
@@ -257,7 +262,7 @@ func runAccountsCommand(ctx context.Context, cfg config, stdout io.Writer) error
 }
 
 func printAccountsTable(stdout io.Writer, rows []accountUsageRow) error {
-	if _, err := fmt.Fprintln(stdout, "CURRENT  EMAIL  USED%  RESET"); err != nil {
+	if _, err := fmt.Fprintln(stdout, "ID  CURRENT  EMAIL  USED%  WEEK%  RESET  WEEK-RESET"); err != nil {
 		return err
 	}
 
@@ -267,7 +272,17 @@ func printAccountsTable(stdout io.Writer, rows []accountUsageRow) error {
 			marker = "*"
 		}
 
-		line := fmt.Sprintf("%-7s  %s  %s  %s", marker, row.Email, row.UsedPercent, row.ResetDisplay)
+		secondaryUsed := row.SecondaryUsedPercent
+		if secondaryUsed == "" {
+			secondaryUsed = "-"
+		}
+		secondaryReset := row.SecondaryResetDisplay
+		if secondaryReset == "" {
+			secondaryReset = "-"
+		}
+
+		line := fmt.Sprintf("%-3d  %-7s  %s  %-6s  %-6s  %-8s  %-10s",
+			row.Index, marker, row.Email, row.UsedPercent, secondaryUsed, row.ResetDisplay, secondaryReset)
 		if row.Err != nil {
 			line += "  [ERR: " + row.Err.Error() + "]"
 		}
@@ -278,6 +293,83 @@ func printAccountsTable(stdout io.Writer, rows []accountUsageRow) error {
 	}
 
 	return nil
+}
+
+func runUseCommand(cfg config, stdout io.Writer, identifier string) error {
+	if strings.TrimSpace(identifier) == "" {
+		return errors.New("use command requires an account identifier (index, user_id, or email)")
+	}
+
+	store, err := readAccountsStore(cfg.AccountsFile)
+	if err != nil {
+		return err
+	}
+	store = normalizeAccountsStoreByUserID(store)
+
+	if len(store) == 0 {
+		return errors.New("no saved accounts found; run the CLI once to register the active account")
+	}
+
+	keys := sortedUserIDs(store)
+
+	target, targetUserID, err := resolveAccountIdentifier(store, keys, identifier)
+	if err != nil {
+		return err
+	}
+
+	if err := updateOpenAIAuthFile(cfg.AuthFile, target); err != nil {
+		return err
+	}
+
+	email := accountEmailFallback(target, targetUserID)
+	_, err = fmt.Fprintf(stdout, "Switched active account to %s (%s)\n", email, targetUserID)
+	return err
+}
+
+func sortedUserIDs(store map[string]map[string]any) []string {
+	keys := make([]string, 0, len(store))
+	for userID := range store {
+		keys = append(keys, userID)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+func resolveAccountIdentifier(store map[string]map[string]any, sortedKeys []string, identifier string) (map[string]any, string, error) {
+	identifier = strings.TrimSpace(identifier)
+	if identifier == "" {
+		return nil, "", errors.New("identifier is empty")
+	}
+
+	// `#<n>` opts into row-index resolution; this prefix cannot collide with
+	// an OpenAI `user_id`, so a bare numeric identifier is always treated as
+	// an exact user_id match (preventing `use 2` from selecting user_id "10"
+	// when the store contains user_ids like "1", "2", "10").
+	if strings.HasPrefix(identifier, "#") {
+		idx, err := strconv.Atoi(strings.TrimPrefix(identifier, "#"))
+		if err != nil || idx < 1 || idx > len(sortedKeys) {
+			return nil, "", fmt.Errorf("row index %q out of range (1..%d)", identifier, len(sortedKeys))
+		}
+		userID := sortedKeys[idx-1]
+		return copyAccountData(store[userID]), userID, nil
+	}
+
+	for _, userID := range sortedKeys {
+		if userID == identifier {
+			return copyAccountData(store[userID]), userID, nil
+		}
+	}
+
+	normalized := strings.ToLower(identifier)
+	for _, userID := range sortedKeys {
+		account := store[userID]
+		email, _ := account["email"].(string)
+		if strings.ToLower(strings.TrimSpace(email)) == normalized {
+			return copyAccountData(account), userID, nil
+		}
+	}
+
+	return nil, "", fmt.Errorf("no saved account matched identifier %q (use exact user_id, email, or #<row-index> from `accounts`/`list`)", identifier)
 }
 
 func formatResetDisplay(resetAt *int64, now time.Time) string {
@@ -349,6 +441,17 @@ func accountWithUsage(account map[string]any, usage usageWindow) map[string]any 
 		accountWithUsage["resetAt"] = *usage.ResetAt
 	} else {
 		delete(accountWithUsage, "resetAt")
+	}
+
+	if usage.SecondaryUsedPercent != "" {
+		accountWithUsage["secondaryUsedPercent"] = usage.SecondaryUsedPercent
+	} else {
+		delete(accountWithUsage, "secondaryUsedPercent")
+	}
+	if usage.SecondaryResetAt != nil {
+		accountWithUsage["secondaryResetAt"] = *usage.SecondaryResetAt
+	} else {
+		delete(accountWithUsage, "secondaryResetAt")
 	}
 
 	if usedPercentAtOrAboveThreshold(usage.UsedPercent, usageRotationThreshold) {
@@ -676,24 +779,53 @@ func extractUsageWindow(payload map[string]any) (usageWindow, error) {
 		}
 	}
 
-	resetAt, err := extractResetAt(primaryWindow)
+	resetAt, err := extractResetAt(primaryWindow, "rate_limit.primary_window.reset_at")
 	if err != nil {
 		return usageWindow{}, err
 	}
 	window.ResetAt = resetAt
 
+	if secondaryRaw, hasSecondary := rateLimit["secondary_window"]; hasSecondary {
+		// If the field is present at all, treat it as required: it must be a
+		// proper object with a usable `used_percent`. Silently ignoring a
+		// wrong-shape value would hide upstream contract changes.
+		if secondaryRaw == nil {
+			return usageWindow{}, errors.New(`usage JSON key "rate_limit.secondary_window" must not be null`)
+		}
+		secondaryWindow, ok := secondaryRaw.(map[string]any)
+		if !ok {
+			return usageWindow{}, fmt.Errorf(`usage JSON key "rate_limit.secondary_window" must be an object, got %T`, secondaryRaw)
+		}
+
+		usedRaw, hasUsed := secondaryWindow["used_percent"]
+		if !hasUsed || usedRaw == nil {
+			return usageWindow{}, errors.New(`usage JSON missing key "rate_limit.secondary_window.used_percent"`)
+		}
+		secondaryUsed, err := valueToString(usedRaw)
+		if err != nil {
+			return usageWindow{}, fmt.Errorf("usage JSON key \"rate_limit.secondary_window.used_percent\": %w", err)
+		}
+		window.SecondaryUsedPercent = secondaryUsed
+
+		secondaryReset, resetErr := extractResetAt(secondaryWindow, "rate_limit.secondary_window.reset_at")
+		if resetErr != nil {
+			return usageWindow{}, resetErr
+		}
+		window.SecondaryResetAt = secondaryReset
+	}
+
 	return window, nil
 }
 
-func extractResetAt(primaryWindow map[string]any) (*int64, error) {
-	rawResetAt, ok := primaryWindow["reset_at"]
+func extractResetAt(window map[string]any, fieldName string) (*int64, error) {
+	rawResetAt, ok := window["reset_at"]
 	if !ok || rawResetAt == nil {
 		return nil, nil
 	}
 
 	parsed, ok := valueToInt64(rawResetAt)
 	if !ok {
-		return nil, fmt.Errorf("usage JSON key \"rate_limit.primary_window.reset_at\" has unsupported type %T", rawResetAt)
+		return nil, fmt.Errorf("usage JSON key %q has unsupported type %T", fieldName, rawResetAt)
 	}
 
 	return &parsed, nil
@@ -817,6 +949,11 @@ func updateOpenAIAuthFile(authFile string, account map[string]any) error {
 	payload["openai.access"] = access
 	if hasAccountID {
 		payload["openai.accountId"] = accountID
+	} else {
+		// Selected account lacks an accountId: clear any stale value from the
+		// previous active account so downstream readers do not see a leftover
+		// workspace id.
+		delete(payload, "openai.accountId")
 	}
 
 	rawOpenAI, hasNested := payload["openai"]
@@ -825,6 +962,8 @@ func updateOpenAIAuthFile(authFile string, account map[string]any) error {
 			openAIMap["access"] = access
 			if hasAccountID {
 				openAIMap["accountId"] = accountID
+			} else {
+				delete(openAIMap, "accountId")
 			}
 			payload["openai"] = openAIMap
 		}
