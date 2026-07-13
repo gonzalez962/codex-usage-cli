@@ -17,13 +17,14 @@ import (
 )
 
 const defaultUsageURL = "https://chatgpt.com/backend-api/wham/usage"
-const usageRotationThreshold = 80.0
 
-// secondaryUsageRotationThreshold gates the weekly/secondary window. When the
-// active account's weekly usage reaches (or exceeds) this percentage, the
-// default command considers it exhausted and attempts to rotate to a saved
-// alternate. Mirrors usageRotationThreshold for the primary window.
-const secondaryUsageRotationThreshold = 98.0
+// usageRotationThreshold gates the only window the ChatGPT usage endpoint
+// exposes now: `rate_limit.primary_window`, which is the WEEKLY usage window.
+// The old 5-hour window is gone and `rate_limit.secondary_window` is reported
+// as `null`, so there is no second window to track. When the active account's
+// weekly usage reaches (or exceeds) this percentage, the default command
+// considers it exhausted and attempts to rotate to a saved alternate.
+const usageRotationThreshold = 98.0
 
 type config struct {
 	AuthFile     string
@@ -34,12 +35,10 @@ type config struct {
 }
 
 type usageWindow struct {
-	UsedPercent          string
-	SecondaryUsedPercent string
-	ResetAt              *int64
-	SecondaryResetAt     *int64
-	UserID               string
-	Email                string
+	UsedPercent string
+	ResetAt     *int64
+	UserID      string
+	Email       string
 }
 
 func main() {
@@ -130,17 +129,15 @@ func runDefaultCommand(ctx context.Context, cfg config, stdout io.Writer) error 
 		return err
 	}
 
-	primaryExhausted := usedPercentAtOrAboveThreshold(usage.UsedPercent, usageRotationThreshold)
-	secondaryExhausted := usage.SecondaryUsedPercent != "" &&
-		usedPercentAtOrAboveThreshold(usage.SecondaryUsedPercent, secondaryUsageRotationThreshold)
+	weeklyExhausted := usedPercentAtOrAboveThreshold(usage.UsedPercent, usageRotationThreshold)
 
-	if primaryExhausted || secondaryExhausted {
+	if weeklyExhausted {
 		store, err := readAccountsStore(cfg.AccountsFile)
 		if err != nil {
 			return err
 		}
 
-		if nextAccount, ok := selectEligibleAlternateAccount(store, usage.UserID, time.Now().Unix()); ok {
+		if nextAccount, ok := selectEligibleAlternateAccount(store, usage.UserID, cfg.Now().Unix()); ok {
 			if err := updateOpenAIAuthFile(cfg.AuthFile, nextAccount); err != nil {
 				return err
 			}
@@ -152,15 +149,13 @@ func runDefaultCommand(ctx context.Context, cfg config, stdout io.Writer) error 
 }
 
 type accountUsageRow struct {
-	Current               bool
-	Index                 int
-	UserID                string
-	Email                 string
-	UsedPercent           string
-	SecondaryUsedPercent  string
-	ResetDisplay          string
-	SecondaryResetDisplay string
-	Err                   error
+	Current      bool
+	Index        int
+	UserID       string
+	Email        string
+	UsedPercent  string
+	ResetDisplay string
+	Err          error
 }
 
 func runAccountsCommand(ctx context.Context, cfg config, stdout io.Writer) error {
@@ -211,8 +206,6 @@ func runAccountsCommand(ctx context.Context, cfg config, stdout io.Writer) error
 			row.Email = accountEmailFallback(account, row.UserID)
 			row.UsedPercent = "ERR"
 			row.ResetDisplay = "-"
-			row.SecondaryUsedPercent = "-"
-			row.SecondaryResetDisplay = "-"
 			row.Err = errors.New("missing access token")
 			rows = append(rows, row)
 			continue
@@ -223,8 +216,6 @@ func runAccountsCommand(ctx context.Context, cfg config, stdout io.Writer) error
 			row.Email = accountEmailFallback(account, row.UserID)
 			row.UsedPercent = "ERR"
 			row.ResetDisplay = "-"
-			row.SecondaryUsedPercent = "-"
-			row.SecondaryResetDisplay = "-"
 			row.Err = fetchErr
 			rows = append(rows, row)
 			continue
@@ -236,8 +227,6 @@ func runAccountsCommand(ctx context.Context, cfg config, stdout io.Writer) error
 		row.Email = usageEmailOrFallback(usage.Email, row.UserID)
 		row.UsedPercent = usage.UsedPercent
 		row.ResetDisplay = formatResetDisplay(usage.ResetAt, cfg.Now())
-		row.SecondaryUsedPercent = usage.SecondaryUsedPercent
-		row.SecondaryResetDisplay = formatResetDisplay(usage.SecondaryResetAt, cfg.Now())
 		if current {
 			currentUserID = row.UserID
 		}
@@ -272,7 +261,11 @@ func runAccountsCommand(ctx context.Context, cfg config, stdout io.Writer) error
 }
 
 func printAccountsTable(stdout io.Writer, rows []accountUsageRow) error {
-	headers := []string{"ID", "CURRENT", "EMAIL", "USED%", "WEEK%", "RESET", "WEEK-RESET"}
+	// The endpoint now reports `rate_limit.primary_window` as the WEEKLY
+	// usage window; `secondary_window` is null and unused. The single pair
+	// of columns is therefore labeled `WEEK%` / `WEEK-RESET` to keep the
+	// table unambiguous for humans.
+	headers := []string{"ID", "CURRENT", "EMAIL", "WEEK%", "WEEK-RESET"}
 
 	widths := make([]int, len(headers))
 	for i, h := range headers {
@@ -286,23 +279,12 @@ func printAccountsTable(stdout io.Writer, rows []accountUsageRow) error {
 			marker = "*"
 		}
 
-		secondaryUsed := row.SecondaryUsedPercent
-		if secondaryUsed == "" {
-			secondaryUsed = "-"
-		}
-		secondaryReset := row.SecondaryResetDisplay
-		if secondaryReset == "" {
-			secondaryReset = "-"
-		}
-
 		cells := []string{
 			strconv.Itoa(row.Index),
 			marker,
 			row.Email,
 			row.UsedPercent,
-			secondaryUsed,
 			row.ResetDisplay,
-			secondaryReset,
 		}
 		for c, value := range cells {
 			if n := len(value); n > widths[c] {
@@ -504,38 +486,15 @@ func accountWithUsage(account map[string]any, usage usageWindow) map[string]any 
 		delete(accountWithUsage, "resetAt")
 	}
 
-	if usage.SecondaryUsedPercent != "" {
-		accountWithUsage["secondaryUsedPercent"] = usage.SecondaryUsedPercent
-	} else {
-		delete(accountWithUsage, "secondaryUsedPercent")
-	}
-	if usage.SecondaryResetAt != nil {
-		accountWithUsage["secondaryResetAt"] = *usage.SecondaryResetAt
-	} else {
-		delete(accountWithUsage, "secondaryResetAt")
-	}
+	// Strip any stale weekly-secondary fields persisted by older runs so the
+	// store file matches the current contract.
+	delete(accountWithUsage, "secondaryUsedPercent")
+	delete(accountWithUsage, "secondaryResetAt")
 
-	primaryCooldown := usedPercentAtOrAboveThreshold(usage.UsedPercent, usageRotationThreshold) && usage.ResetAt != nil
-	secondaryCooldown := usage.SecondaryUsedPercent != "" &&
-		usedPercentAtOrAboveThreshold(usage.SecondaryUsedPercent, secondaryUsageRotationThreshold) &&
-		usage.SecondaryResetAt != nil
-
-	// When both windows are over threshold we keep the LATER reset so the
-	// account stays out of rotation until the slower window recovers. Missing
-	// secondary data does not set a cooldown (mirrors the conservative
-	// selection rule: we never block on absent data).
-	switch {
-	case primaryCooldown && secondaryCooldown:
-		if *usage.ResetAt >= *usage.SecondaryResetAt {
-			accountWithUsage["cooldownUntil"] = *usage.ResetAt
-		} else {
-			accountWithUsage["cooldownUntil"] = *usage.SecondaryResetAt
-		}
-	case primaryCooldown:
+	weeklyCooldown := usedPercentAtOrAboveThreshold(usage.UsedPercent, usageRotationThreshold) && usage.ResetAt != nil
+	if weeklyCooldown {
 		accountWithUsage["cooldownUntil"] = *usage.ResetAt
-	case secondaryCooldown:
-		accountWithUsage["cooldownUntil"] = *usage.SecondaryResetAt
-	default:
+	} else {
 		delete(accountWithUsage, "cooldownUntil")
 	}
 
@@ -862,34 +821,11 @@ func extractUsageWindow(payload map[string]any) (usageWindow, error) {
 	}
 	window.ResetAt = resetAt
 
-	if secondaryRaw, hasSecondary := rateLimit["secondary_window"]; hasSecondary {
-		// If the field is present at all, treat it as required: it must be a
-		// proper object with a usable `used_percent`. Silently ignoring a
-		// wrong-shape value would hide upstream contract changes.
-		if secondaryRaw == nil {
-			return usageWindow{}, errors.New(`usage JSON key "rate_limit.secondary_window" must not be null`)
-		}
-		secondaryWindow, ok := secondaryRaw.(map[string]any)
-		if !ok {
-			return usageWindow{}, fmt.Errorf(`usage JSON key "rate_limit.secondary_window" must be an object, got %T`, secondaryRaw)
-		}
-
-		usedRaw, hasUsed := secondaryWindow["used_percent"]
-		if !hasUsed || usedRaw == nil {
-			return usageWindow{}, errors.New(`usage JSON missing key "rate_limit.secondary_window.used_percent"`)
-		}
-		secondaryUsed, err := valueToString(usedRaw)
-		if err != nil {
-			return usageWindow{}, fmt.Errorf("usage JSON key \"rate_limit.secondary_window.used_percent\": %w", err)
-		}
-		window.SecondaryUsedPercent = secondaryUsed
-
-		secondaryReset, resetErr := extractResetAt(secondaryWindow, "rate_limit.secondary_window.reset_at")
-		if resetErr != nil {
-			return usageWindow{}, resetErr
-		}
-		window.SecondaryResetAt = secondaryReset
-	}
+	// `secondary_window` is reported as `null` by the current ChatGPT usage
+	// endpoint. The 5-hour window it used to expose is gone, so we no longer
+	// read it for usage, rotation, cooldown, display, or eligibility. Any
+	// shape it shows up in (null, missing, or a legacy object) is ignored.
+	_ = rateLimit["secondary_window"]
 
 	return window, nil
 }
@@ -975,29 +911,17 @@ func selectEligibleAlternateAccount(store map[string]map[string]any, currentUser
 			continue
 		}
 
-		// Skip candidates whose primary window is already exhausted, when the
-		// store has FRESH data for it. "Fresh" means we have BOTH a usedPercent
-		// above threshold AND a reset_at in the future. Stored high usage with
-		// an expired or missing reset is treated as stale: the account has had
-		// time to recover, so it must remain eligible. Missing values are
-		// treated as "unknown" and the candidate is not blocked (conservative:
-		// we never skip on missing data, matching how `cooldownUntil` is only
-		// honored when set).
+		// Skip candidates whose primary (now weekly) window is already
+		// exhausted, when the store has FRESH data for it. "Fresh" means we
+		// have BOTH a usedPercent above threshold AND a reset_at in the
+		// future. Stored high usage with an expired or missing reset is
+		// treated as stale: the account has had time to recover, so it must
+		// remain eligible. Missing values are treated as "unknown" and the
+		// candidate is not blocked (conservative: we never skip on missing
+		// data, matching how `cooldownUntil` is only honored when set).
 		if used, ok := account["usedPercent"].(string); ok && strings.TrimSpace(used) != "" {
 			if usedPercentAtOrAboveThreshold(used, usageRotationThreshold) {
 				if resetAt, hasReset := extractStoredResetAt(account, "resetAt"); hasReset && resetAt > nowUnix {
-					continue
-				}
-			}
-		}
-
-		// Same conservative rule for the weekly/secondary window: only block
-		// when the store explicitly reports weekly usage at/above the rotation
-		// threshold AND a secondary reset is recorded in the future. A
-		// candidate with no recorded weekly data is still eligible.
-		if used, ok := account["secondaryUsedPercent"].(string); ok && strings.TrimSpace(used) != "" {
-			if usedPercentAtOrAboveThreshold(used, secondaryUsageRotationThreshold) {
-				if resetAt, hasReset := extractStoredResetAt(account, "secondaryResetAt"); hasReset && resetAt > nowUnix {
 					continue
 				}
 			}

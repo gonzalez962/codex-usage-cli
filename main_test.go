@@ -507,7 +507,7 @@ func TestRunPersistsCooldownWhenThresholdReached(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte(`{"user_id":"user-current","rate_limit":{"primary_window":{"used_percent":80,"reset_at":` + strconv.FormatInt(resetAt, 10) + `}}}`))
+		_, _ = w.Write([]byte(`{"user_id":"user-current","rate_limit":{"primary_window":{"used_percent":98,"reset_at":` + strconv.FormatInt(resetAt, 10) + `}}}`))
 	}))
 	defer server.Close()
 
@@ -530,14 +530,14 @@ func TestRunPersistsCooldownWhenThresholdReached(t *testing.T) {
 		t.Fatalf("run returned error: %v", err)
 	}
 
-	if out.String() != "80" {
+	if out.String() != "98" {
 		t.Fatalf("expected only used_percent value, got %q", out.String())
 	}
 
 	store := mustReadStore(t, accountsFile)
 	acct := store["user-current"]
-	if got, _ := acct["usedPercent"].(string); got != "80" {
-		t.Fatalf("expected usedPercent 80, got %v", acct["usedPercent"])
+	if got, _ := acct["usedPercent"].(string); got != "98" {
+		t.Fatalf("expected usedPercent 98, got %v", acct["usedPercent"])
 	}
 
 	if got, ok := valueToInt64(acct["resetAt"]); !ok || got != resetAt {
@@ -691,10 +691,11 @@ func TestRunRotatesToEligibleAlternateAccount(t *testing.T) {
 	t.Parallel()
 
 	now := time.Now().Unix()
+	// Current weekly window exhausted (>= 98) so rotation is required.
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte(`{"user_id":"user-current","rate_limit":{"primary_window":{"used_percent":95,"reset_at":` + strconv.FormatInt(now+7200, 10) + `}}}`))
+		_, _ = w.Write([]byte(`{"user_id":"user-current","rate_limit":{"primary_window":{"used_percent":99,"reset_at":` + strconv.FormatInt(now+7200, 10) + `}}}`))
 	}))
 	defer server.Close()
 
@@ -743,7 +744,7 @@ func TestRunRotatesToEligibleAlternateAccount(t *testing.T) {
 		t.Fatalf("run returned error: %v", err)
 	}
 
-	if out.String() != "95" {
+	if out.String() != "99" {
 		t.Fatalf("expected only used_percent output, got %q", out.String())
 	}
 
@@ -770,10 +771,11 @@ func TestRunRotatesAndRegistersCurrentAccountWhenMissingFromStore(t *testing.T) 
 
 	now := time.Now().Unix()
 	resetAt := now + 3600
+	// Current weekly window exhausted (>= 98) so rotation is required.
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte(`{"user_id":"user-current","rate_limit":{"primary_window":{"used_percent":95,"reset_at":` + strconv.FormatInt(resetAt, 10) + `}}}`))
+		_, _ = w.Write([]byte(`{"user_id":"user-current","rate_limit":{"primary_window":{"used_percent":99,"reset_at":` + strconv.FormatInt(resetAt, 10) + `}}}`))
 	}))
 	defer server.Close()
 
@@ -811,7 +813,7 @@ func TestRunRotatesAndRegistersCurrentAccountWhenMissingFromStore(t *testing.T) 
 		t.Fatalf("run returned error: %v", err)
 	}
 
-	if out.String() != "95" {
+	if out.String() != "99" {
 		t.Fatalf("expected only used_percent output, got %q", out.String())
 	}
 
@@ -922,8 +924,6 @@ func TestRunWithArgsAccountsListsUsageHighlightsCurrentAndPersistsByUserID(t *te
 	fixedNow := time.Unix(1_700_000_000, 0)
 	currentReset := fixedNow.Unix() + (2 * 60 * 60) + (15 * 60)
 	otherReset := fixedNow.Unix() + (24 * 60 * 60) + (3 * 60 * 60)
-	currentWeeklyReset := fixedNow.Unix() + (5 * 24 * 60 * 60) + (12 * 60 * 60)
-	otherWeeklyReset := fixedNow.Unix() + (3 * 24 * 60 * 60) + (4 * 60 * 60)
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		auth := r.Header.Get("Authorization")
@@ -931,10 +931,12 @@ func TestRunWithArgsAccountsListsUsageHighlightsCurrentAndPersistsByUserID(t *te
 		switch auth {
 		case "Bearer current-token":
 			w.WriteHeader(http.StatusOK)
-			_, _ = w.Write([]byte(`{"user_id":"user-current","email":"current@example.com","rate_limit":{"primary_window":{"used_percent":22.5,"reset_at":` + strconv.FormatInt(currentReset, 10) + `},"secondary_window":{"used_percent":2.5,"reset_at":` + strconv.FormatInt(currentWeeklyReset, 10) + `}}}`))
+			// Current endpoint: primary_window IS the weekly window;
+			// secondary_window is null and ignored entirely.
+			_, _ = w.Write([]byte(`{"user_id":"user-current","email":"current@example.com","rate_limit":{"primary_window":{"used_percent":22.5,"reset_at":` + strconv.FormatInt(currentReset, 10) + `},"secondary_window":null}}`))
 		case "Bearer other-token":
 			w.WriteHeader(http.StatusOK)
-			_, _ = w.Write([]byte(`{"user_id":"user-other","email":"other@example.com","rate_limit":{"primary_window":{"used_percent":88,"reset_at":` + strconv.FormatInt(otherReset, 10) + `},"secondary_window":{"used_percent":12,"reset_at":` + strconv.FormatInt(otherWeeklyReset, 10) + `}}}`))
+			_, _ = w.Write([]byte(`{"user_id":"user-other","email":"other@example.com","rate_limit":{"primary_window":{"used_percent":88,"reset_at":` + strconv.FormatInt(otherReset, 10) + `}}}`))
 		default:
 			w.WriteHeader(http.StatusUnauthorized)
 			_, _ = w.Write([]byte("unauthorized"))
@@ -981,10 +983,14 @@ func TestRunWithArgsAccountsListsUsageHighlightsCurrentAndPersistsByUserID(t *te
 
 	printed := out.String()
 	if !strings.Contains(printed, "| ID |") || !strings.Contains(printed, "CURRENT") ||
-		!strings.Contains(printed, "EMAIL") || !strings.Contains(printed, "USED%") ||
-		!strings.Contains(printed, "WEEK%") || !strings.Contains(printed, "RESET") ||
+		!strings.Contains(printed, "EMAIL") || !strings.Contains(printed, "WEEK%") ||
 		!strings.Contains(printed, "WEEK-RESET") {
-		t.Fatalf("expected Markdown-style table header with all columns, got %q", printed)
+		t.Fatalf("expected Markdown-style table header with WEEK columns, got %q", printed)
+	}
+	// Old USED%/RESET pair was the 5-hour window and must no longer appear
+	// as a separate column: primary_window is now the weekly window.
+	if strings.Contains(printed, "| USED% |") || strings.Contains(printed, "| RESET |") {
+		t.Fatalf("expected no separate USED%%/RESET columns (primary is now weekly), got %q", printed)
 	}
 	// Header separator must use `-` characters and `|` boundaries.
 	if !strings.Contains(printed, "| -- |") && !strings.Contains(printed, "|---") {
@@ -997,28 +1003,16 @@ func TestRunWithArgsAccountsListsUsageHighlightsCurrentAndPersistsByUserID(t *te
 		t.Fatalf("expected other account email in output, got %q", printed)
 	}
 	if !strings.Contains(printed, "22.5") || !strings.Contains(printed, "88") {
-		t.Fatalf("expected primary used_percent values in output, got %q", printed)
-	}
-	if !strings.Contains(printed, "2.5") || !strings.Contains(printed, "12") {
-		t.Fatalf("expected secondary used_percent values in output, got %q", printed)
+		t.Fatalf("expected weekly used_percent values in output, got %q", printed)
 	}
 	if !strings.Contains(printed, "2h 15m") {
-		t.Fatalf("expected primary remaining duration 2h 15m in output, got %q", printed)
+		t.Fatalf("expected remaining duration 2h 15m in output, got %q", printed)
 	}
 	if !strings.Contains(printed, "1d 3h") {
-		t.Fatalf("expected primary remaining duration 1d 3h in output, got %q", printed)
-	}
-	if !strings.Contains(printed, "5d 12h") {
-		t.Fatalf("expected weekly remaining duration 5d 12h in output, got %q", printed)
-	}
-	if !strings.Contains(printed, "3d 4h") {
-		t.Fatalf("expected weekly remaining duration 3d 4h in output, got %q", printed)
+		t.Fatalf("expected remaining duration 1d 3h in output, got %q", printed)
 	}
 	if strings.Contains(printed, strconv.FormatInt(currentReset, 10)) || strings.Contains(printed, strconv.FormatInt(otherReset, 10)) {
 		t.Fatalf("did not expect reset unix timestamps in output, got %q", printed)
-	}
-	if strings.Contains(printed, strconv.FormatInt(currentWeeklyReset, 10)) || strings.Contains(printed, strconv.FormatInt(otherWeeklyReset, 10)) {
-		t.Fatalf("did not expect weekly reset unix timestamps in output, got %q", printed)
 	}
 	if strings.Contains(printed, "202") {
 		t.Fatalf("did not expect formatted date/time in output, got %q", printed)
@@ -1061,11 +1055,11 @@ func TestRunWithArgsAccountsListsUsageHighlightsCurrentAndPersistsByUserID(t *te
 	if got, ok := valueToInt64(currentEntry["resetAt"]); !ok || got != currentReset {
 		t.Fatalf("expected persisted resetAt %d, got %v", currentReset, currentEntry["resetAt"])
 	}
-	if got, _ := currentEntry["secondaryUsedPercent"].(string); got != "2.5" {
-		t.Fatalf("expected persisted secondaryUsedPercent 2.5, got %v", currentEntry["secondaryUsedPercent"])
+	if _, hasSecondary := currentEntry["secondaryUsedPercent"]; hasSecondary {
+		t.Fatalf("expected secondaryUsedPercent to be stripped, got %v", currentEntry["secondaryUsedPercent"])
 	}
-	if got, ok := valueToInt64(currentEntry["secondaryResetAt"]); !ok || got != currentWeeklyReset {
-		t.Fatalf("expected persisted secondaryResetAt %d, got %v", currentWeeklyReset, currentEntry["secondaryResetAt"])
+	if _, hasSecondary := currentEntry["secondaryResetAt"]; hasSecondary {
+		t.Fatalf("expected secondaryResetAt to be stripped, got %v", currentEntry["secondaryResetAt"])
 	}
 }
 
@@ -1074,22 +1068,18 @@ func TestPrintAccountsTableRendersMarkdownStyleWithSeparator(t *testing.T) {
 
 	rows := []accountUsageRow{
 		{
-			Current:               true,
-			Index:                 1,
-			Email:                 "current@example.com",
-			UsedPercent:           "22.5",
-			SecondaryUsedPercent:  "2.5",
-			ResetDisplay:          "2h 15m",
-			SecondaryResetDisplay: "5d 12h",
+			Current:      true,
+			Index:        1,
+			Email:        "current@example.com",
+			UsedPercent:  "22.5",
+			ResetDisplay: "2h 15m",
 		},
 		{
-			Current:               false,
-			Index:                 2,
-			Email:                 "other@example.com",
-			UsedPercent:           "88",
-			SecondaryUsedPercent:  "12",
-			ResetDisplay:          "1d 3h",
-			SecondaryResetDisplay: "3d 4h",
+			Current:      false,
+			Index:        2,
+			Email:        "other@example.com",
+			UsedPercent:  "88",
+			ResetDisplay: "1d 3h",
 		},
 	}
 
@@ -1100,12 +1090,17 @@ func TestPrintAccountsTableRendersMarkdownStyleWithSeparator(t *testing.T) {
 
 	printed := out.String()
 
-	// Header row: `|` boundaries around each column.
+	// Header row: `|` boundaries around each column. The single usage pair
+	// is now labeled WEEK% / WEEK-RESET because primary_window is the weekly
+	// window in the current endpoint contract.
 	if !strings.Contains(printed, "| ID |") {
 		t.Fatalf("expected header to start with `| ID |`, got %q", printed)
 	}
 	if !strings.Contains(printed, "| WEEK-RESET |") {
 		t.Fatalf("expected header to end with `| WEEK-RESET |`, got %q", printed)
+	}
+	if strings.Contains(printed, "| USED% |") || strings.Contains(printed, "| RESET |") {
+		t.Fatalf("expected no separate USED%%/RESET columns (primary is now weekly), got %q", printed)
 	}
 
 	// Separator line: a row made of `-` and `|`.
@@ -1159,13 +1154,9 @@ func TestPrintAccountsTableRendersMarkdownStyleWithSeparator(t *testing.T) {
 		t.Fatalf("expected non-current row to NOT contain `*`, got %q", otherLine)
 	}
 
-	// Sanity: used_percent and weekly values are present and no longer joined
-	// to the header with double spaces (which the old format produced).
+	// Sanity: weekly used_percent values are present.
 	if !strings.Contains(printed, "22.5") || !strings.Contains(printed, "88") {
-		t.Fatalf("expected primary used_percent values in output, got %q", printed)
-	}
-	if !strings.Contains(printed, "2.5") || !strings.Contains(printed, "12") {
-		t.Fatalf("expected secondary used_percent values in output, got %q", printed)
+		t.Fatalf("expected weekly used_percent values in output, got %q", printed)
 	}
 }
 
@@ -1197,11 +1188,13 @@ func TestPrintAccountsTablePreservesErrorSuffix(t *testing.T) {
 	}
 }
 
-func TestRunRotatesWhenSecondaryUsageExhausted(t *testing.T) {
+func TestRunRotatesWhenWeeklyUsageExhausted(t *testing.T) {
 	t.Parallel()
 
+	// The ChatGPT endpoint now reports `primary_window` as the weekly
+	// window; rotating at >= 98% on primary matches the previous weekly
+	// behavior. The 5-hour secondary window is gone.
 	now := time.Now().Unix()
-	primaryReset := now + 3600
 	weeklyReset := now + (5 * 24 * 60 * 60)
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1209,12 +1202,11 @@ func TestRunRotatesWhenSecondaryUsageExhausted(t *testing.T) {
 		w.Header().Set("Content-Type", "application/json")
 		switch auth {
 		case "Bearer current-token":
-			// Primary window is healthy but the weekly window is exhausted.
 			w.WriteHeader(http.StatusOK)
-			_, _ = w.Write([]byte(`{"user_id":"user-current","rate_limit":{"primary_window":{"used_percent":35,"reset_at":` + strconv.FormatInt(primaryReset, 10) + `},"secondary_window":{"used_percent":98.5,"reset_at":` + strconv.FormatInt(weeklyReset, 10) + `}}}`))
+			_, _ = w.Write([]byte(`{"user_id":"user-current","rate_limit":{"primary_window":{"used_percent":98.5,"reset_at":` + strconv.FormatInt(weeklyReset, 10) + `},"secondary_window":null}}`))
 		case "Bearer other-token":
 			w.WriteHeader(http.StatusOK)
-			_, _ = w.Write([]byte(`{"user_id":"user-other","rate_limit":{"primary_window":{"used_percent":40,"reset_at":` + strconv.FormatInt(now+7200, 10) + `},"secondary_window":{"used_percent":10,"reset_at":` + strconv.FormatInt(now+7*24*60*60, 10) + `}}}`))
+			_, _ = w.Write([]byte(`{"user_id":"user-other","rate_limit":{"primary_window":{"used_percent":40,"reset_at":` + strconv.FormatInt(now+7200, 10) + `}}}`))
 		default:
 			w.WriteHeader(http.StatusUnauthorized)
 			_, _ = w.Write([]byte("unauthorized"))
@@ -1260,9 +1252,10 @@ func TestRunRotatesWhenSecondaryUsageExhausted(t *testing.T) {
 		t.Fatalf("run returned error: %v", err)
 	}
 
-	// Default stdout contract is preserved: only primary used_percent.
-	if out.String() != "35" {
-		t.Fatalf("expected only used_percent value 35, got %q", out.String())
+	// Default stdout contract is preserved: only used_percent of primary
+	// (the weekly window now).
+	if out.String() != "98.5" {
+		t.Fatalf("expected only used_percent value 98.5, got %q", out.String())
 	}
 
 	data, err := os.ReadFile(authFile)
@@ -1281,13 +1274,14 @@ func TestRunRotatesWhenSecondaryUsageExhausted(t *testing.T) {
 	}
 }
 
-func TestRunDoesNotRotateWhenSecondaryBelowThreshold(t *testing.T) {
+func TestRunDoesNotRotateWhenWeeklyBelowThreshold(t *testing.T) {
 	t.Parallel()
 
+	// Anything below 98% must not trigger rotation, regardless of reset.
 	now := time.Now().Unix()
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte(`{"user_id":"user-current","rate_limit":{"primary_window":{"used_percent":30,"reset_at":` + strconv.FormatInt(now+3600, 10) + `},"secondary_window":{"used_percent":50,"reset_at":` + strconv.FormatInt(now+5*24*60*60, 10) + `}}}`))
+		_, _ = w.Write([]byte(`{"user_id":"user-current","rate_limit":{"primary_window":{"used_percent":30,"reset_at":` + strconv.FormatInt(now+3600, 10) + `}}}`))
 	}))
 	defer server.Close()
 
@@ -1337,11 +1331,11 @@ func TestRunDoesNotRotateWhenSecondaryBelowThreshold(t *testing.T) {
 		t.Fatalf("read auth file: %v", err)
 	}
 	if string(authAfter) != original {
-		t.Fatalf("expected auth unchanged when neither window is exhausted, got %s", string(authAfter))
+		t.Fatalf("expected auth unchanged when below threshold, got %s", string(authAfter))
 	}
 }
 
-func TestSelectEligibleAlternateAccountSkipsPrimaryAndSecondaryExhausted(t *testing.T) {
+func TestSelectEligibleAlternateAccountSkipsWeeklyExhausted(t *testing.T) {
 	t.Parallel()
 
 	now := time.Now().Unix()
@@ -1351,21 +1345,14 @@ func TestSelectEligibleAlternateAccountSkipsPrimaryAndSecondaryExhausted(t *test
 			"accountId": "acct-current",
 			"access":    "current-token",
 		},
-		"user-primary-hot": {
-			"user_id":       "user-primary-hot",
-			"accountId":     "acct-primary-hot",
-			"access":        "primary-hot-token",
-			"usedPercent":   "85",
+		// FRESH weekly exhaustion: usedPercent >= 98 AND resetAt in future.
+		"user-weekly-hot": {
+			"user_id":       "user-weekly-hot",
+			"accountId":     "acct-weekly-hot",
+			"access":        "weekly-hot-token",
+			"usedPercent":   "99",
 			"resetAt":       now + 3600,
 			"cooldownUntil": now + 3600,
-		},
-		"user-weekly-hot": {
-			"user_id":              "user-weekly-hot",
-			"accountId":            "acct-weekly-hot",
-			"access":               "weekly-hot-token",
-			"usedPercent":          "20",
-			"secondaryUsedPercent": "99",
-			"secondaryResetAt":     now + 3600,
 		},
 		"user-ready": {
 			"user_id":       "user-ready",
@@ -1381,36 +1368,7 @@ func TestSelectEligibleAlternateAccountSkipsPrimaryAndSecondaryExhausted(t *test
 		t.Fatalf("expected an eligible alternate account")
 	}
 	if got, _ := selected["user_id"].(string); got != "user-ready" {
-		t.Fatalf("expected user-ready (both hot candidates must be skipped), got %q", got)
-	}
-}
-
-func TestSelectEligibleAlternateAccountAllowsMissingSecondaryData(t *testing.T) {
-	t.Parallel()
-
-	now := time.Now().Unix()
-	store := map[string]map[string]any{
-		"user-current": {
-			"user_id":   "user-current",
-			"accountId": "acct-current",
-			"access":    "current-token",
-		},
-		// Candidate with NO secondaryUsedPercent recorded: must remain
-		// eligible (conservative: we never block on absent data).
-		"user-unknown-weekly": {
-			"user_id":     "user-unknown-weekly",
-			"accountId":   "acct-unknown-weekly",
-			"access":      "unknown-weekly-token",
-			"usedPercent": "20",
-		},
-	}
-
-	selected, ok := selectEligibleAlternateAccount(store, "user-current", now)
-	if !ok {
-		t.Fatalf("expected an eligible alternate account even with missing weekly data")
-	}
-	if got, _ := selected["user_id"].(string); got != "user-unknown-weekly" {
-		t.Fatalf("expected user-unknown-weekly, got %q", got)
+		t.Fatalf("expected user-ready (weekly-hot with future reset must be skipped), got %q", got)
 	}
 }
 
@@ -1424,9 +1382,9 @@ func TestSelectEligibleAlternateAccountEligibleAfterPrimaryResetExpires(t *testi
 			"accountId": "acct-current",
 			"access":    "current-token",
 		},
-		// Candidate with stale high primary usage: reset has already
-		// passed, so the account is eligible again. Without this check the
-		// account would stay out of rotation forever.
+		// Candidate with stale high usage: reset has already passed, so
+		// the account is eligible again. Without this check the account
+		// would stay out of rotation forever.
 		"user-recovered-primary": {
 			"user_id":     "user-recovered-primary",
 			"accountId":   "acct-recovered-primary",
@@ -1445,37 +1403,6 @@ func TestSelectEligibleAlternateAccountEligibleAfterPrimaryResetExpires(t *testi
 	}
 }
 
-func TestSelectEligibleAlternateAccountEligibleAfterWeeklyResetExpires(t *testing.T) {
-	t.Parallel()
-
-	now := time.Now().Unix()
-	store := map[string]map[string]any{
-		"user-current": {
-			"user_id":   "user-current",
-			"accountId": "acct-current",
-			"access":    "current-token",
-		},
-		// Candidate with stale high weekly usage: secondary reset has
-		// already passed, so the account is eligible again.
-		"user-recovered-weekly": {
-			"user_id":              "user-recovered-weekly",
-			"accountId":            "acct-recovered-weekly",
-			"access":               "recovered-weekly-token",
-			"usedPercent":          "20",
-			"secondaryUsedPercent": "99",
-			"secondaryResetAt":     now - 1,
-		},
-	}
-
-	selected, ok := selectEligibleAlternateAccount(store, "user-current", now)
-	if !ok {
-		t.Fatalf("expected candidate with expired weekly reset to be eligible")
-	}
-	if got, _ := selected["user_id"].(string); got != "user-recovered-weekly" {
-		t.Fatalf("expected user-recovered-weekly, got %q", got)
-	}
-}
-
 func TestSelectEligibleAlternateAccountEligibleWhenResetMissingEntirely(t *testing.T) {
 	t.Parallel()
 
@@ -1486,8 +1413,8 @@ func TestSelectEligibleAlternateAccountEligibleWhenResetMissingEntirely(t *testi
 			"accountId": "acct-current",
 			"access":    "current-token",
 		},
-		// Candidate with high primary usage and NO recorded reset at all.
-		// Mirrors the conservative "never block on missing data" rule used
+		// Candidate with high usage and NO recorded reset at all. Mirrors
+		// the conservative "never block on missing data" rule used
 		// elsewhere: the account is eligible.
 		"user-no-reset": {
 			"user_id":     "user-no-reset",
@@ -1506,7 +1433,7 @@ func TestSelectEligibleAlternateAccountEligibleWhenResetMissingEntirely(t *testi
 	}
 }
 
-func TestSelectEligibleAlternateAccountSkipsPrimaryHotWithFutureReset(t *testing.T) {
+func TestSelectEligibleAlternateAccountSkipsHotWithFutureReset(t *testing.T) {
 	t.Parallel()
 
 	now := time.Now().Unix()
@@ -1516,12 +1443,13 @@ func TestSelectEligibleAlternateAccountSkipsPrimaryHotWithFutureReset(t *testing
 			"accountId": "acct-current",
 			"access":    "current-token",
 		},
-		// Candidate with FRESH high primary usage: reset is in the future.
+		// Candidate with FRESH weekly exhaustion: usedPercent >= 98 AND
+		// reset is in the future.
 		"user-primary-hot": {
 			"user_id":     "user-primary-hot",
 			"accountId":   "acct-primary-hot",
 			"access":      "primary-hot-token",
-			"usedPercent": "85",
+			"usedPercent": "99",
 			"resetAt":     now + 3600,
 		},
 		"user-ready": {
@@ -1537,77 +1465,14 @@ func TestSelectEligibleAlternateAccountSkipsPrimaryHotWithFutureReset(t *testing
 		t.Fatalf("expected an eligible alternate account")
 	}
 	if got, _ := selected["user_id"].(string); got != "user-ready" {
-		t.Fatalf("expected user-ready (primary-hot with future reset must be skipped), got %q", got)
+		t.Fatalf("expected user-ready (hot with future reset must be skipped), got %q", got)
 	}
 }
 
-func TestSelectEligibleAlternateAccountSkipsWeeklyHotWithFutureReset(t *testing.T) {
-	t.Parallel()
-
-	now := time.Now().Unix()
-	store := map[string]map[string]any{
-		"user-current": {
-			"user_id":   "user-current",
-			"accountId": "acct-current",
-			"access":    "current-token",
-		},
-		// Candidate with FRESH high weekly usage: secondary reset is in
-		// the future.
-		"user-weekly-hot": {
-			"user_id":              "user-weekly-hot",
-			"accountId":            "acct-weekly-hot",
-			"access":               "weekly-hot-token",
-			"usedPercent":          "20",
-			"secondaryUsedPercent": "99",
-			"secondaryResetAt":     now + 3600,
-		},
-		"user-ready": {
-			"user_id":     "user-ready",
-			"accountId":   "acct-ready",
-			"access":      "ready-token",
-			"usedPercent": "15",
-		},
-	}
-
-	selected, ok := selectEligibleAlternateAccount(store, "user-current", now)
-	if !ok {
-		t.Fatalf("expected an eligible alternate account")
-	}
-	if got, _ := selected["user_id"].(string); got != "user-ready" {
-		t.Fatalf("expected user-ready (weekly-hot with future reset must be skipped), got %q", got)
-	}
-}
-
-func TestAccountWithUsagePersistsSecondaryCooldownWhenPrimaryHealthy(t *testing.T) {
+func TestAccountWithUsageSetsCooldownWhenWeeklyExhausted(t *testing.T) {
 	t.Parallel()
 
 	primaryReset := int64(1777014899)
-	secondaryReset := int64(1777619699)
-
-	account := map[string]any{
-		"user_id":   "user-secondary",
-		"accountId": "acct-secondary",
-		"access":    "secondary-token",
-	}
-
-	updated := accountWithUsage(account, usageWindow{
-		UsedPercent:          "35",
-		SecondaryUsedPercent: "98.5",
-		ResetAt:              int64Ptr(primaryReset),
-		SecondaryResetAt:     int64Ptr(secondaryReset),
-		UserID:               "user-secondary",
-	})
-
-	if got, ok := valueToInt64(updated["cooldownUntil"]); !ok || got != secondaryReset {
-		t.Fatalf("expected cooldownUntil to be the secondary reset %d (primary was healthy), got %v", secondaryReset, updated["cooldownUntil"])
-	}
-}
-
-func TestAccountWithUsageKeepsPrimaryCooldownWhenPrimaryExhausted(t *testing.T) {
-	t.Parallel()
-
-	primaryReset := int64(1777014899)
-	secondaryReset := int64(1777619699)
 
 	account := map[string]any{
 		"user_id":   "user-primary",
@@ -1616,19 +1481,23 @@ func TestAccountWithUsageKeepsPrimaryCooldownWhenPrimaryExhausted(t *testing.T) 
 	}
 
 	updated := accountWithUsage(account, usageWindow{
-		UsedPercent:          "85",
-		SecondaryUsedPercent: "50",
-		ResetAt:              int64Ptr(primaryReset),
-		SecondaryResetAt:     int64Ptr(secondaryReset),
-		UserID:               "user-primary",
+		UsedPercent: "99",
+		ResetAt:     int64Ptr(primaryReset),
+		UserID:      "user-primary",
 	})
 
 	if got, ok := valueToInt64(updated["cooldownUntil"]); !ok || got != primaryReset {
-		t.Fatalf("expected cooldownUntil to be the primary reset %d, got %v", primaryReset, updated["cooldownUntil"])
+		t.Fatalf("expected cooldownUntil to be the weekly reset %d, got %v", primaryReset, updated["cooldownUntil"])
+	}
+	if _, hasSecondary := updated["secondaryUsedPercent"]; hasSecondary {
+		t.Fatalf("expected secondaryUsedPercent to be stripped, got %v", updated["secondaryUsedPercent"])
+	}
+	if _, hasSecondary := updated["secondaryResetAt"]; hasSecondary {
+		t.Fatalf("expected secondaryResetAt to be stripped, got %v", updated["secondaryResetAt"])
 	}
 }
 
-func TestAccountWithUsageMissingSecondaryDoesNotSetCooldown(t *testing.T) {
+func TestAccountWithUsageClearsCooldownWhenBelowThreshold(t *testing.T) {
 	t.Parallel()
 
 	primaryReset := int64(1777014899)
@@ -1642,73 +1511,13 @@ func TestAccountWithUsageMissingSecondaryDoesNotSetCooldown(t *testing.T) {
 	}
 
 	updated := accountWithUsage(account, usageWindow{
-		UsedPercent:          "35",
-		ResetAt:              int64Ptr(primaryReset),
-		SecondaryUsedPercent: "",
-		UserID:               "user-no-secondary",
+		UsedPercent: "35",
+		ResetAt:     int64Ptr(primaryReset),
+		UserID:      "user-no-secondary",
 	})
 
 	if _, exists := updated["cooldownUntil"]; exists {
-		t.Fatalf("expected cooldownUntil to be cleared when both windows are healthy, got %v", updated["cooldownUntil"])
-	}
-}
-
-func TestAccountWithUsageKeepsLaterResetWhenBothWindowsExhausted(t *testing.T) {
-	t.Parallel()
-
-	account := map[string]any{
-		"user_id":   "user-both",
-		"accountId": "acct-both",
-		"access":    "both-token",
-	}
-
-	// Case 1: primary resets sooner, secondary is later — keep the later
-	// (secondary) reset.
-	earlierPrimary := int64(1777014899)
-	laterWeekly := int64(1777619699)
-
-	updated := accountWithUsage(account, usageWindow{
-		UsedPercent:          "85",
-		SecondaryUsedPercent: "98.5",
-		ResetAt:              int64Ptr(earlierPrimary),
-		SecondaryResetAt:     int64Ptr(laterWeekly),
-		UserID:               "user-both",
-	})
-
-	if got, ok := valueToInt64(updated["cooldownUntil"]); !ok || got != laterWeekly {
-		t.Fatalf("expected cooldownUntil to be the later (secondary) reset %d, got %v", laterWeekly, updated["cooldownUntil"])
-	}
-
-	// Case 2: secondary resets sooner, primary is later — keep the later
-	// (primary) reset.
-	earlierWeekly := int64(1777014899)
-	laterPrimary := int64(1777619699)
-
-	updated = accountWithUsage(account, usageWindow{
-		UsedPercent:          "85",
-		SecondaryUsedPercent: "98.5",
-		ResetAt:              int64Ptr(laterPrimary),
-		SecondaryResetAt:     int64Ptr(earlierWeekly),
-		UserID:               "user-both",
-	})
-
-	if got, ok := valueToInt64(updated["cooldownUntil"]); !ok || got != laterPrimary {
-		t.Fatalf("expected cooldownUntil to be the later (primary) reset %d, got %v", laterPrimary, updated["cooldownUntil"])
-	}
-
-	// Case 3: equal resets — must still record a single value (no
-	// ambiguity).
-	equalReset := int64(1777014899)
-	updated = accountWithUsage(account, usageWindow{
-		UsedPercent:          "85",
-		SecondaryUsedPercent: "98.5",
-		ResetAt:              int64Ptr(equalReset),
-		SecondaryResetAt:     int64Ptr(equalReset),
-		UserID:               "user-both",
-	})
-
-	if got, ok := valueToInt64(updated["cooldownUntil"]); !ok || got != equalReset {
-		t.Fatalf("expected cooldownUntil to be %d when both resets are equal, got %v", equalReset, updated["cooldownUntil"])
+		t.Fatalf("expected cooldownUntil to be cleared when usage is below threshold, got %v", updated["cooldownUntil"])
 	}
 }
 
@@ -1788,43 +1597,6 @@ func TestRunWithArgsListAliasWorks(t *testing.T) {
 	}
 }
 
-func TestExtractUsageWindowParsesSecondaryWindow(t *testing.T) {
-	t.Parallel()
-
-	payload := map[string]any{
-		"user_id": "user-secondary",
-		"email":   "secondary@example.com",
-		"rate_limit": map[string]any{
-			"primary_window": map[string]any{
-				"used_percent": json.Number("11.0"),
-				"reset_at":     json.Number("1777014899"),
-			},
-			"secondary_window": map[string]any{
-				"used_percent": json.Number("3.25"),
-				"reset_at":     json.Number("1777619699"),
-			},
-		},
-	}
-
-	window, err := extractUsageWindow(payload)
-	if err != nil {
-		t.Fatalf("extractUsageWindow returned error: %v", err)
-	}
-
-	if window.UsedPercent != "11.0" {
-		t.Fatalf("unexpected primary usedPercent: %q", window.UsedPercent)
-	}
-	if window.ResetAt == nil || *window.ResetAt != 1777014899 {
-		t.Fatalf("expected primary reset_at 1777014899, got %v", window.ResetAt)
-	}
-	if window.SecondaryUsedPercent != "3.25" {
-		t.Fatalf("unexpected secondary usedPercent: %q", window.SecondaryUsedPercent)
-	}
-	if window.SecondaryResetAt == nil || *window.SecondaryResetAt != 1777619699 {
-		t.Fatalf("expected secondary reset_at 1777619699, got %v", window.SecondaryResetAt)
-	}
-}
-
 func TestExtractUsageWindowAcceptsMissingSecondaryWindow(t *testing.T) {
 	t.Parallel()
 
@@ -1845,81 +1617,68 @@ func TestExtractUsageWindowAcceptsMissingSecondaryWindow(t *testing.T) {
 	if window.UsedPercent != "22.5" {
 		t.Fatalf("unexpected primary usedPercent: %q", window.UsedPercent)
 	}
-	if window.SecondaryUsedPercent != "" {
-		t.Fatalf("expected empty secondary usedPercent when absent, got %q", window.SecondaryUsedPercent)
+}
+
+func TestExtractUsageWindowAcceptsNullSecondaryWindow(t *testing.T) {
+	t.Parallel()
+
+	// The current ChatGPT endpoint reports `secondary_window: null` because
+	// the 5-hour window is gone. Extraction must succeed and ignore the
+	// null value rather than rejecting it.
+	payload := map[string]any{
+		"user_id": "user-null-secondary",
+		"rate_limit": map[string]any{
+			"primary_window": map[string]any{
+				"used_percent": json.Number("42.0"),
+				"reset_at":     json.Number("1777014899"),
+			},
+			"secondary_window": nil,
+		},
 	}
-	if window.SecondaryResetAt != nil {
-		t.Fatalf("expected nil secondary reset_at when absent, got %v", window.SecondaryResetAt)
+
+	window, err := extractUsageWindow(payload)
+	if err != nil {
+		t.Fatalf("extractUsageWindow returned error for null secondary_window: %v", err)
+	}
+
+	if window.UsedPercent != "42.0" {
+		t.Fatalf("unexpected primary usedPercent: %q", window.UsedPercent)
+	}
+	if window.ResetAt == nil || *window.ResetAt != 1777014899 {
+		t.Fatalf("expected primary reset_at 1777014899, got %v", window.ResetAt)
 	}
 }
 
-func TestExtractUsageWindowRejectsInvalidSecondaryUsedPercent(t *testing.T) {
+func TestExtractUsageWindowIgnoresPresentSecondaryWindow(t *testing.T) {
 	t.Parallel()
 
+	// Even if upstream sends an object-shaped secondary_window (e.g. an old
+	// cached response), the parser must accept it without using the value
+	// and without erroring.
 	payload := map[string]any{
-		"user_id": "user-bad-secondary",
+		"user_id": "user-legacy-secondary",
 		"rate_limit": map[string]any{
 			"primary_window": map[string]any{
-				"used_percent": json.Number("22.5"),
+				"used_percent": json.Number("11.0"),
+				"reset_at":     json.Number("1777014899"),
 			},
 			"secondary_window": map[string]any{
-				"used_percent": map[string]any{"not": "a number"},
+				"used_percent": json.Number("3.25"),
+				"reset_at":     json.Number("1777619699"),
 			},
 		},
 	}
 
-	_, err := extractUsageWindow(payload)
-	if err == nil {
-		t.Fatalf("expected error for unsupported secondary used_percent type")
-	}
-	if !strings.Contains(err.Error(), "secondary_window") {
-		t.Fatalf("expected error to mention secondary_window, got %v", err)
-	}
-}
-
-func TestExtractUsageWindowRejectsSecondaryWindowMissingUsedPercent(t *testing.T) {
-	t.Parallel()
-
-	payload := map[string]any{
-		"user_id": "user-no-secondary-pct",
-		"rate_limit": map[string]any{
-			"primary_window": map[string]any{
-				"used_percent": json.Number("22.5"),
-			},
-			"secondary_window": map[string]any{
-				"reset_at": json.Number("1777619699"),
-			},
-		},
+	window, err := extractUsageWindow(payload)
+	if err != nil {
+		t.Fatalf("extractUsageWindow returned error for present secondary_window: %v", err)
 	}
 
-	_, err := extractUsageWindow(payload)
-	if err == nil {
-		t.Fatalf("expected error for secondary_window missing used_percent")
+	if window.UsedPercent != "11.0" {
+		t.Fatalf("unexpected primary usedPercent: %q", window.UsedPercent)
 	}
-	if !strings.Contains(err.Error(), "secondary_window.used_percent") {
-		t.Fatalf("expected error to mention secondary_window.used_percent, got %v", err)
-	}
-}
-
-func TestExtractUsageWindowRejectsNonObjectSecondaryWindow(t *testing.T) {
-	t.Parallel()
-
-	payload := map[string]any{
-		"user_id": "user-string-secondary",
-		"rate_limit": map[string]any{
-			"primary_window": map[string]any{
-				"used_percent": json.Number("22.5"),
-			},
-			"secondary_window": "not-an-object",
-		},
-	}
-
-	_, err := extractUsageWindow(payload)
-	if err == nil {
-		t.Fatalf("expected error when secondary_window is not an object")
-	}
-	if !strings.Contains(err.Error(), "secondary_window") {
-		t.Fatalf("expected error to mention secondary_window, got %v", err)
+	if window.ResetAt == nil || *window.ResetAt != 1777014899 {
+		t.Fatalf("expected primary reset_at 1777014899, got %v", window.ResetAt)
 	}
 }
 

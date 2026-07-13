@@ -4,8 +4,8 @@
 CLI en Go para consultar el uso de OpenAI desde OpenCode.
 
 - Sin argumentos: muestra en `stdout` solo el porcentaje usado (`used_percent`) de la cuenta actual.
-- Si el uso supera el umbral interno (primario >= 80% o semanal >= 98%), puede rotar automáticamente a otra cuenta guardada.
-- `accounts` y `list`: muestran todas las cuentas guardadas en una tabla Markdown (`|` y `-`) con cuenta actual, email, `% usado` de la ventana primaria y semanal, y tiempo restante para reset.
+- Si el uso semanal supera el umbral interno (>= 98%), puede rotar automáticamente a otra cuenta guardada.
+- `accounts` y `list`: muestran todas las cuentas guardadas en una tabla Markdown (`|` y `-`) con cuenta actual, email, `% usado` semanal y tiempo restante para reset. La ventana única que expone el endpoint ahora es `rate_limit.primary_window` y representa el uso **semanal**; la vieja `secondary_window` se reporta como `null` y no se usa.
 - `use <selector>`: cambia la cuenta activa en OpenCode por una cuenta guardada (sin exponer tokens). El selector es el índice de la tabla con prefijo `#` (`#<n>`), el `user_id` exacto, o el email (case-insensitive).
 
 ## Requisitos
@@ -32,7 +32,7 @@ go install .
 Luego abre una nueva terminal.
 
 ## Uso básico
-Uso actual (solo `used_percent` de la ventana primaria):
+Uso actual (solo `used_percent` de la ventana semanal):
 
 ```powershell
 codex-usage-cli
@@ -51,10 +51,10 @@ codex-usage-cli list
 Salida de ejemplo:
 
 ```text
-| ID | CURRENT | EMAIL               | USED% | WEEK% | RESET  | WEEK-RESET |
-| -- | ------- | ------------------- | ----- | ----- | ------ | ---------- |
-| 1  | *       | current@example.com | 22.5  | 2.5   | 2h 15m | 5d 12h     |
-| 2  |         | other@example.com   | 88    | 12    | 1d 3h  | 3d 4h      |
+| ID | CURRENT | EMAIL               | WEEK% | WEEK-RESET |
+| -- | ------- | ------------------- | ----- | ---------- |
+| 1  | *       | current@example.com | 22.5  | 5d 12h     |
+| 2  |         | other@example.com   | 88    | 1d 3h      |
 ```
 
 La tabla usa formato Markdown con `|` como separador de columnas y `-` en la
@@ -99,33 +99,30 @@ la cuenta activa, pero **nunca** incluye el access token.
 
 ## Rotación automática de cuentas
 
-Cuando se ejecuta sin argumentos, la herramienta consulta el endpoint de uso y
-considera que la cuenta activa está agotada si **cualquiera** de las dos
-condiciones se cumple:
+Cuando se ejecuta sin argumentos, la herramienta consulta el endpoint de uso.
+El endpoint expone una sola ventana (`rate_limit.primary_window`) que
+corresponde al uso **semanal**. La herramienta considera que la cuenta activa
+está agotada cuando:
 
-- Ventana primaria (`rate_limit.primary_window.used_percent`) >= 80%.
-- Ventana semanal (`rate_limit.secondary_window.used_percent`) >= 98% (la
-  respuesta trae la ventana secundaria).
+- `rate_limit.primary_window.used_percent` >= 98%.
 
-En cualquiera de los dos casos, intenta rotar a una cuenta alternativa del store
-que:
+Si se cumple, intenta rotar a una cuenta alternativa del store que:
 
 - No esté en `cooldown` (`cooldownUntil` posterior al momento actual).
-- No tenga un `usedPercent` almacenado >= 80% (umbral primario) **y** un
+- No tenga un `usedPercent` almacenado >= 98% (umbral semanal) **y** un
   `resetAt` registrado en el futuro. Si el reset ya pasó o nunca se
   persistió, el uso alto se considera obsoleto y la cuenta vuelve a ser
   elegible.
-- No tenga un `secondaryUsedPercent` almacenado >= 98% (umbral semanal) **y**
-  un `secondaryResetAt` registrado en el futuro. Misma regla: reset vencido
-  o ausente → la cuenta es elegible de nuevo.
 
-Si el store no tiene un `secondaryUsedPercent` guardado para una cuenta
-candidata, esa cuenta sigue siendo elegible (decisión conservadora: nunca se
-bloquea por datos ausentes, igual que `cooldownUntil` solo bloquea cuando está
-presente).
+El endpoint ya no devuelve `rate_limit.secondary_window` (viene como `null`);
+esa ventana (la vieja ventana de 5 horas) ya no se usa ni se persiste, y no
+participa en la rotación automática, el cooldown, ni el listado de cuentas.
+Las cuentas persistidas por versiones anteriores del CLI se migran de forma
+transparente: cualquier `secondaryUsedPercent` / `secondaryResetAt` guardado
+se elimina al volver a registrar la cuenta.
 
 Si no hay candidatos elegibles, la cuenta activa no cambia y `stdout` sigue
-imprimiendo solo el `used_percent` de la ventana primaria.
+imprimiendo solo el `used_percent` de la ventana semanal.
 
 ## Variables de entorno
 - `OPENCODE_AUTH_FILE`: ruta del `auth.json` de OpenCode.

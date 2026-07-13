@@ -9,3 +9,4 @@ dist/
 
 # gentle-ai local artifacts (skill registry cache, etc.)
 /.atl/
+opencode.jsonc
