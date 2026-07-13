@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -979,8 +980,15 @@ func TestRunWithArgsAccountsListsUsageHighlightsCurrentAndPersistsByUserID(t *te
 	}
 
 	printed := out.String()
-	if !strings.Contains(printed, "ID  CURRENT  EMAIL  USED%  WEEK%  RESET  WEEK-RESET") {
-		t.Fatalf("expected accounts header, got %q", printed)
+	if !strings.Contains(printed, "| ID |") || !strings.Contains(printed, "CURRENT") ||
+		!strings.Contains(printed, "EMAIL") || !strings.Contains(printed, "USED%") ||
+		!strings.Contains(printed, "WEEK%") || !strings.Contains(printed, "RESET") ||
+		!strings.Contains(printed, "WEEK-RESET") {
+		t.Fatalf("expected Markdown-style table header with all columns, got %q", printed)
+	}
+	// Header separator must use `-` characters and `|` boundaries.
+	if !strings.Contains(printed, "| -- |") && !strings.Contains(printed, "|---") {
+		t.Fatalf("expected Markdown-style table separator with `-`, got %q", printed)
 	}
 	if !strings.Contains(printed, "current@example.com") {
 		t.Fatalf("expected current account email in output, got %q", printed)
@@ -1028,10 +1036,10 @@ func TestRunWithArgsAccountsListsUsageHighlightsCurrentAndPersistsByUserID(t *te
 	// Index column should match the stable alphabetical order of user_id.
 	currentIndexLine := strings.TrimSpace(lineContaining(printed, "current@example.com"))
 	otherIndexLine := strings.TrimSpace(lineContaining(printed, "other@example.com"))
-	if !strings.HasPrefix(currentIndexLine, "1 ") {
+	if !strings.HasPrefix(currentIndexLine, "| 1 ") {
 		t.Fatalf("expected current account to be listed first (index 1), got %q", currentIndexLine)
 	}
-	if !strings.HasPrefix(otherIndexLine, "2 ") {
+	if !strings.HasPrefix(otherIndexLine, "| 2 ") {
 		t.Fatalf("expected other account to be listed second (index 2), got %q", otherIndexLine)
 	}
 
@@ -1058,6 +1066,649 @@ func TestRunWithArgsAccountsListsUsageHighlightsCurrentAndPersistsByUserID(t *te
 	}
 	if got, ok := valueToInt64(currentEntry["secondaryResetAt"]); !ok || got != currentWeeklyReset {
 		t.Fatalf("expected persisted secondaryResetAt %d, got %v", currentWeeklyReset, currentEntry["secondaryResetAt"])
+	}
+}
+
+func TestPrintAccountsTableRendersMarkdownStyleWithSeparator(t *testing.T) {
+	t.Parallel()
+
+	rows := []accountUsageRow{
+		{
+			Current:               true,
+			Index:                 1,
+			Email:                 "current@example.com",
+			UsedPercent:           "22.5",
+			SecondaryUsedPercent:  "2.5",
+			ResetDisplay:          "2h 15m",
+			SecondaryResetDisplay: "5d 12h",
+		},
+		{
+			Current:               false,
+			Index:                 2,
+			Email:                 "other@example.com",
+			UsedPercent:           "88",
+			SecondaryUsedPercent:  "12",
+			ResetDisplay:          "1d 3h",
+			SecondaryResetDisplay: "3d 4h",
+		},
+	}
+
+	var out strings.Builder
+	if err := printAccountsTable(&out, rows); err != nil {
+		t.Fatalf("printAccountsTable returned error: %v", err)
+	}
+
+	printed := out.String()
+
+	// Header row: `|` boundaries around each column.
+	if !strings.Contains(printed, "| ID |") {
+		t.Fatalf("expected header to start with `| ID |`, got %q", printed)
+	}
+	if !strings.Contains(printed, "| WEEK-RESET |") {
+		t.Fatalf("expected header to end with `| WEEK-RESET |`, got %q", printed)
+	}
+
+	// Separator line: a row made of `-` and `|`.
+	lines := strings.Split(printed, "\n")
+	if len(lines) < 3 {
+		t.Fatalf("expected at least 3 lines (header, separator, data), got %d in %q", len(lines), printed)
+	}
+	separator := lines[1]
+	if !strings.HasPrefix(separator, "|") || !strings.HasSuffix(separator, "|") {
+		t.Fatalf("expected separator to start and end with `|`, got %q", separator)
+	}
+	if !strings.Contains(separator, "-") {
+		t.Fatalf("expected separator to contain at least one `-`, got %q", separator)
+	}
+	// Separator must only contain `|`, `-`, and spaces.
+	for _, r := range separator {
+		if r != '|' && r != '-' && r != ' ' {
+			t.Fatalf("separator must only contain `|`, `-`, and spaces, got %q (char %q)", separator, r)
+		}
+	}
+	// The header columns and separator must align cell-by-cell: every column
+	// in the header (a span between two `|`) must be the same width in the
+	// separator. The width of a column is the count of characters between
+	// `|` boundaries, including the visual padding.
+	headerWidths := tableColumnWidths(lines[0])
+	separatorWidths := tableColumnWidths(separator)
+	if len(headerWidths) != len(separatorWidths) {
+		t.Fatalf("header and separator cell counts differ: header=%d separator=%d (header=%q separator=%q)",
+			len(headerWidths), len(separatorWidths), lines[0], separator)
+	}
+	for i := range headerWidths {
+		if headerWidths[i] != separatorWidths[i] {
+			t.Fatalf("header column %d width %d does not match separator column %d width %d (header=%q separator=%q) — widths must align",
+				i, headerWidths[i], i, separatorWidths[i], lines[0], separator)
+		}
+	}
+
+	// Data rows keep the active marker and stable row IDs.
+	currentLine := lineContaining(printed, "current@example.com")
+	if !strings.HasPrefix(currentLine, "| 1 ") {
+		t.Fatalf("expected current row to start with `| 1 `, got %q", currentLine)
+	}
+	if !strings.Contains(currentLine, "*") {
+		t.Fatalf("expected current row to contain `*` marker, got %q", currentLine)
+	}
+	otherLine := lineContaining(printed, "other@example.com")
+	if !strings.HasPrefix(otherLine, "| 2 ") {
+		t.Fatalf("expected other row to start with `| 2 `, got %q", otherLine)
+	}
+	if strings.Contains(otherLine, "*") {
+		t.Fatalf("expected non-current row to NOT contain `*`, got %q", otherLine)
+	}
+
+	// Sanity: used_percent and weekly values are present and no longer joined
+	// to the header with double spaces (which the old format produced).
+	if !strings.Contains(printed, "22.5") || !strings.Contains(printed, "88") {
+		t.Fatalf("expected primary used_percent values in output, got %q", printed)
+	}
+	if !strings.Contains(printed, "2.5") || !strings.Contains(printed, "12") {
+		t.Fatalf("expected secondary used_percent values in output, got %q", printed)
+	}
+}
+
+func TestPrintAccountsTablePreservesErrorSuffix(t *testing.T) {
+	t.Parallel()
+
+	rows := []accountUsageRow{
+		{
+			Index:       1,
+			Email:       "broken@example.com",
+			UsedPercent: "ERR",
+			Err:         errors.New("missing access token"),
+		},
+	}
+
+	var out strings.Builder
+	if err := printAccountsTable(&out, rows); err != nil {
+		t.Fatalf("printAccountsTable returned error: %v", err)
+	}
+
+	printed := out.String()
+	if !strings.Contains(printed, "[ERR: missing access token]") {
+		t.Fatalf("expected error suffix to be preserved, got %q", printed)
+	}
+	// Error suffix must be on the same row as the data (right after the `|`).
+	rowLine := lineContaining(printed, "broken@example.com")
+	if !strings.HasSuffix(strings.TrimRight(rowLine, "\n"), "]") {
+		t.Fatalf("expected error suffix to live on the data row, got %q", rowLine)
+	}
+}
+
+func TestRunRotatesWhenSecondaryUsageExhausted(t *testing.T) {
+	t.Parallel()
+
+	now := time.Now().Unix()
+	primaryReset := now + 3600
+	weeklyReset := now + (5 * 24 * 60 * 60)
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		auth := r.Header.Get("Authorization")
+		w.Header().Set("Content-Type", "application/json")
+		switch auth {
+		case "Bearer current-token":
+			// Primary window is healthy but the weekly window is exhausted.
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"user_id":"user-current","rate_limit":{"primary_window":{"used_percent":35,"reset_at":` + strconv.FormatInt(primaryReset, 10) + `},"secondary_window":{"used_percent":98.5,"reset_at":` + strconv.FormatInt(weeklyReset, 10) + `}}}`))
+		case "Bearer other-token":
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"user_id":"user-other","rate_limit":{"primary_window":{"used_percent":40,"reset_at":` + strconv.FormatInt(now+7200, 10) + `},"secondary_window":{"used_percent":10,"reset_at":` + strconv.FormatInt(now+7*24*60*60, 10) + `}}}`))
+		default:
+			w.WriteHeader(http.StatusUnauthorized)
+			_, _ = w.Write([]byte("unauthorized"))
+		}
+	}))
+	defer server.Close()
+
+	dir := t.TempDir()
+	authFile := filepath.Join(dir, "auth.json")
+	if err := os.WriteFile(authFile, []byte(`{"openai.access":"current-token","openai.accountId":"acct-current"}`), 0o600); err != nil {
+		t.Fatalf("write auth file: %v", err)
+	}
+
+	accountsFile := filepath.Join(dir, "accounts.json")
+	initialStore := map[string]map[string]any{
+		"user-current": {
+			"user_id":   "user-current",
+			"accountId": "acct-current",
+			"access":    "current-token",
+		},
+		"user-other": {
+			"user_id":   "user-other",
+			"accountId": "acct-other",
+			"access":    "other-token",
+		},
+	}
+	encoded, err := json.Marshal(initialStore)
+	if err != nil {
+		t.Fatalf("marshal store: %v", err)
+	}
+	if err := os.WriteFile(accountsFile, encoded, 0o600); err != nil {
+		t.Fatalf("write accounts file: %v", err)
+	}
+
+	var out strings.Builder
+	err = run(context.Background(), config{
+		AuthFile:     authFile,
+		AccountsFile: accountsFile,
+		UsageURL:     server.URL,
+		HTTPClient:   server.Client(),
+	}, &out)
+	if err != nil {
+		t.Fatalf("run returned error: %v", err)
+	}
+
+	// Default stdout contract is preserved: only primary used_percent.
+	if out.String() != "35" {
+		t.Fatalf("expected only used_percent value 35, got %q", out.String())
+	}
+
+	data, err := os.ReadFile(authFile)
+	if err != nil {
+		t.Fatalf("read auth file: %v", err)
+	}
+	var authPayload map[string]any
+	if err := json.Unmarshal(data, &authPayload); err != nil {
+		t.Fatalf("parse auth JSON: %v", err)
+	}
+	if got, _ := authPayload["openai.access"].(string); got != "other-token" {
+		t.Fatalf("expected rotation to other-token, got %q", got)
+	}
+	if got, _ := authPayload["openai.accountId"].(string); got != "acct-other" {
+		t.Fatalf("expected rotation to acct-other, got %q", got)
+	}
+}
+
+func TestRunDoesNotRotateWhenSecondaryBelowThreshold(t *testing.T) {
+	t.Parallel()
+
+	now := time.Now().Unix()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"user_id":"user-current","rate_limit":{"primary_window":{"used_percent":30,"reset_at":` + strconv.FormatInt(now+3600, 10) + `},"secondary_window":{"used_percent":50,"reset_at":` + strconv.FormatInt(now+5*24*60*60, 10) + `}}}`))
+	}))
+	defer server.Close()
+
+	dir := t.TempDir()
+	authFile := filepath.Join(dir, "auth.json")
+	original := `{"openai.access":"current-token","openai.accountId":"acct-current"}`
+	if err := os.WriteFile(authFile, []byte(original), 0o600); err != nil {
+		t.Fatalf("write auth file: %v", err)
+	}
+	accountsFile := filepath.Join(dir, "accounts.json")
+	store := map[string]map[string]any{
+		"user-current": {
+			"user_id":   "user-current",
+			"accountId": "acct-current",
+			"access":    "current-token",
+		},
+		"user-other": {
+			"user_id":   "user-other",
+			"accountId": "acct-other",
+			"access":    "other-token",
+		},
+	}
+	encoded, err := json.Marshal(store)
+	if err != nil {
+		t.Fatalf("marshal store: %v", err)
+	}
+	if err := os.WriteFile(accountsFile, encoded, 0o600); err != nil {
+		t.Fatalf("write accounts file: %v", err)
+	}
+
+	var out strings.Builder
+	if err := run(context.Background(), config{
+		AuthFile:     authFile,
+		AccountsFile: accountsFile,
+		UsageURL:     server.URL,
+		HTTPClient:   server.Client(),
+	}, &out); err != nil {
+		t.Fatalf("run returned error: %v", err)
+	}
+
+	if out.String() != "30" {
+		t.Fatalf("expected only used_percent 30, got %q", out.String())
+	}
+
+	authAfter, err := os.ReadFile(authFile)
+	if err != nil {
+		t.Fatalf("read auth file: %v", err)
+	}
+	if string(authAfter) != original {
+		t.Fatalf("expected auth unchanged when neither window is exhausted, got %s", string(authAfter))
+	}
+}
+
+func TestSelectEligibleAlternateAccountSkipsPrimaryAndSecondaryExhausted(t *testing.T) {
+	t.Parallel()
+
+	now := time.Now().Unix()
+	store := map[string]map[string]any{
+		"user-current": {
+			"user_id":   "user-current",
+			"accountId": "acct-current",
+			"access":    "current-token",
+		},
+		"user-primary-hot": {
+			"user_id":       "user-primary-hot",
+			"accountId":     "acct-primary-hot",
+			"access":        "primary-hot-token",
+			"usedPercent":   "85",
+			"resetAt":       now + 3600,
+			"cooldownUntil": now + 3600,
+		},
+		"user-weekly-hot": {
+			"user_id":              "user-weekly-hot",
+			"accountId":            "acct-weekly-hot",
+			"access":               "weekly-hot-token",
+			"usedPercent":          "20",
+			"secondaryUsedPercent": "99",
+			"secondaryResetAt":     now + 3600,
+		},
+		"user-ready": {
+			"user_id":       "user-ready",
+			"accountId":     "acct-ready",
+			"access":        "ready-token",
+			"usedPercent":   "15",
+			"cooldownUntil": now - 1,
+		},
+	}
+
+	selected, ok := selectEligibleAlternateAccount(store, "user-current", now)
+	if !ok {
+		t.Fatalf("expected an eligible alternate account")
+	}
+	if got, _ := selected["user_id"].(string); got != "user-ready" {
+		t.Fatalf("expected user-ready (both hot candidates must be skipped), got %q", got)
+	}
+}
+
+func TestSelectEligibleAlternateAccountAllowsMissingSecondaryData(t *testing.T) {
+	t.Parallel()
+
+	now := time.Now().Unix()
+	store := map[string]map[string]any{
+		"user-current": {
+			"user_id":   "user-current",
+			"accountId": "acct-current",
+			"access":    "current-token",
+		},
+		// Candidate with NO secondaryUsedPercent recorded: must remain
+		// eligible (conservative: we never block on absent data).
+		"user-unknown-weekly": {
+			"user_id":     "user-unknown-weekly",
+			"accountId":   "acct-unknown-weekly",
+			"access":      "unknown-weekly-token",
+			"usedPercent": "20",
+		},
+	}
+
+	selected, ok := selectEligibleAlternateAccount(store, "user-current", now)
+	if !ok {
+		t.Fatalf("expected an eligible alternate account even with missing weekly data")
+	}
+	if got, _ := selected["user_id"].(string); got != "user-unknown-weekly" {
+		t.Fatalf("expected user-unknown-weekly, got %q", got)
+	}
+}
+
+func TestSelectEligibleAlternateAccountEligibleAfterPrimaryResetExpires(t *testing.T) {
+	t.Parallel()
+
+	now := time.Now().Unix()
+	store := map[string]map[string]any{
+		"user-current": {
+			"user_id":   "user-current",
+			"accountId": "acct-current",
+			"access":    "current-token",
+		},
+		// Candidate with stale high primary usage: reset has already
+		// passed, so the account is eligible again. Without this check the
+		// account would stay out of rotation forever.
+		"user-recovered-primary": {
+			"user_id":     "user-recovered-primary",
+			"accountId":   "acct-recovered-primary",
+			"access":      "recovered-primary-token",
+			"usedPercent": "85",
+			"resetAt":     now - 1,
+		},
+	}
+
+	selected, ok := selectEligibleAlternateAccount(store, "user-current", now)
+	if !ok {
+		t.Fatalf("expected candidate with expired reset to be eligible")
+	}
+	if got, _ := selected["user_id"].(string); got != "user-recovered-primary" {
+		t.Fatalf("expected user-recovered-primary, got %q", got)
+	}
+}
+
+func TestSelectEligibleAlternateAccountEligibleAfterWeeklyResetExpires(t *testing.T) {
+	t.Parallel()
+
+	now := time.Now().Unix()
+	store := map[string]map[string]any{
+		"user-current": {
+			"user_id":   "user-current",
+			"accountId": "acct-current",
+			"access":    "current-token",
+		},
+		// Candidate with stale high weekly usage: secondary reset has
+		// already passed, so the account is eligible again.
+		"user-recovered-weekly": {
+			"user_id":              "user-recovered-weekly",
+			"accountId":            "acct-recovered-weekly",
+			"access":               "recovered-weekly-token",
+			"usedPercent":          "20",
+			"secondaryUsedPercent": "99",
+			"secondaryResetAt":     now - 1,
+		},
+	}
+
+	selected, ok := selectEligibleAlternateAccount(store, "user-current", now)
+	if !ok {
+		t.Fatalf("expected candidate with expired weekly reset to be eligible")
+	}
+	if got, _ := selected["user_id"].(string); got != "user-recovered-weekly" {
+		t.Fatalf("expected user-recovered-weekly, got %q", got)
+	}
+}
+
+func TestSelectEligibleAlternateAccountEligibleWhenResetMissingEntirely(t *testing.T) {
+	t.Parallel()
+
+	now := time.Now().Unix()
+	store := map[string]map[string]any{
+		"user-current": {
+			"user_id":   "user-current",
+			"accountId": "acct-current",
+			"access":    "current-token",
+		},
+		// Candidate with high primary usage and NO recorded reset at all.
+		// Mirrors the conservative "never block on missing data" rule used
+		// elsewhere: the account is eligible.
+		"user-no-reset": {
+			"user_id":     "user-no-reset",
+			"accountId":   "acct-no-reset",
+			"access":      "no-reset-token",
+			"usedPercent": "85",
+		},
+	}
+
+	selected, ok := selectEligibleAlternateAccount(store, "user-current", now)
+	if !ok {
+		t.Fatalf("expected candidate with missing reset to be eligible")
+	}
+	if got, _ := selected["user_id"].(string); got != "user-no-reset" {
+		t.Fatalf("expected user-no-reset, got %q", got)
+	}
+}
+
+func TestSelectEligibleAlternateAccountSkipsPrimaryHotWithFutureReset(t *testing.T) {
+	t.Parallel()
+
+	now := time.Now().Unix()
+	store := map[string]map[string]any{
+		"user-current": {
+			"user_id":   "user-current",
+			"accountId": "acct-current",
+			"access":    "current-token",
+		},
+		// Candidate with FRESH high primary usage: reset is in the future.
+		"user-primary-hot": {
+			"user_id":     "user-primary-hot",
+			"accountId":   "acct-primary-hot",
+			"access":      "primary-hot-token",
+			"usedPercent": "85",
+			"resetAt":     now + 3600,
+		},
+		"user-ready": {
+			"user_id":     "user-ready",
+			"accountId":   "acct-ready",
+			"access":      "ready-token",
+			"usedPercent": "15",
+		},
+	}
+
+	selected, ok := selectEligibleAlternateAccount(store, "user-current", now)
+	if !ok {
+		t.Fatalf("expected an eligible alternate account")
+	}
+	if got, _ := selected["user_id"].(string); got != "user-ready" {
+		t.Fatalf("expected user-ready (primary-hot with future reset must be skipped), got %q", got)
+	}
+}
+
+func TestSelectEligibleAlternateAccountSkipsWeeklyHotWithFutureReset(t *testing.T) {
+	t.Parallel()
+
+	now := time.Now().Unix()
+	store := map[string]map[string]any{
+		"user-current": {
+			"user_id":   "user-current",
+			"accountId": "acct-current",
+			"access":    "current-token",
+		},
+		// Candidate with FRESH high weekly usage: secondary reset is in
+		// the future.
+		"user-weekly-hot": {
+			"user_id":              "user-weekly-hot",
+			"accountId":            "acct-weekly-hot",
+			"access":               "weekly-hot-token",
+			"usedPercent":          "20",
+			"secondaryUsedPercent": "99",
+			"secondaryResetAt":     now + 3600,
+		},
+		"user-ready": {
+			"user_id":     "user-ready",
+			"accountId":   "acct-ready",
+			"access":      "ready-token",
+			"usedPercent": "15",
+		},
+	}
+
+	selected, ok := selectEligibleAlternateAccount(store, "user-current", now)
+	if !ok {
+		t.Fatalf("expected an eligible alternate account")
+	}
+	if got, _ := selected["user_id"].(string); got != "user-ready" {
+		t.Fatalf("expected user-ready (weekly-hot with future reset must be skipped), got %q", got)
+	}
+}
+
+func TestAccountWithUsagePersistsSecondaryCooldownWhenPrimaryHealthy(t *testing.T) {
+	t.Parallel()
+
+	primaryReset := int64(1777014899)
+	secondaryReset := int64(1777619699)
+
+	account := map[string]any{
+		"user_id":   "user-secondary",
+		"accountId": "acct-secondary",
+		"access":    "secondary-token",
+	}
+
+	updated := accountWithUsage(account, usageWindow{
+		UsedPercent:          "35",
+		SecondaryUsedPercent: "98.5",
+		ResetAt:              int64Ptr(primaryReset),
+		SecondaryResetAt:     int64Ptr(secondaryReset),
+		UserID:               "user-secondary",
+	})
+
+	if got, ok := valueToInt64(updated["cooldownUntil"]); !ok || got != secondaryReset {
+		t.Fatalf("expected cooldownUntil to be the secondary reset %d (primary was healthy), got %v", secondaryReset, updated["cooldownUntil"])
+	}
+}
+
+func TestAccountWithUsageKeepsPrimaryCooldownWhenPrimaryExhausted(t *testing.T) {
+	t.Parallel()
+
+	primaryReset := int64(1777014899)
+	secondaryReset := int64(1777619699)
+
+	account := map[string]any{
+		"user_id":   "user-primary",
+		"accountId": "acct-primary",
+		"access":    "primary-token",
+	}
+
+	updated := accountWithUsage(account, usageWindow{
+		UsedPercent:          "85",
+		SecondaryUsedPercent: "50",
+		ResetAt:              int64Ptr(primaryReset),
+		SecondaryResetAt:     int64Ptr(secondaryReset),
+		UserID:               "user-primary",
+	})
+
+	if got, ok := valueToInt64(updated["cooldownUntil"]); !ok || got != primaryReset {
+		t.Fatalf("expected cooldownUntil to be the primary reset %d, got %v", primaryReset, updated["cooldownUntil"])
+	}
+}
+
+func TestAccountWithUsageMissingSecondaryDoesNotSetCooldown(t *testing.T) {
+	t.Parallel()
+
+	primaryReset := int64(1777014899)
+
+	account := map[string]any{
+		"user_id":   "user-no-secondary",
+		"accountId": "acct-no-secondary",
+		"access":    "token",
+		// Pretend the account is already in cooldown from a prior run.
+		"cooldownUntil": primaryReset,
+	}
+
+	updated := accountWithUsage(account, usageWindow{
+		UsedPercent:          "35",
+		ResetAt:              int64Ptr(primaryReset),
+		SecondaryUsedPercent: "",
+		UserID:               "user-no-secondary",
+	})
+
+	if _, exists := updated["cooldownUntil"]; exists {
+		t.Fatalf("expected cooldownUntil to be cleared when both windows are healthy, got %v", updated["cooldownUntil"])
+	}
+}
+
+func TestAccountWithUsageKeepsLaterResetWhenBothWindowsExhausted(t *testing.T) {
+	t.Parallel()
+
+	account := map[string]any{
+		"user_id":   "user-both",
+		"accountId": "acct-both",
+		"access":    "both-token",
+	}
+
+	// Case 1: primary resets sooner, secondary is later — keep the later
+	// (secondary) reset.
+	earlierPrimary := int64(1777014899)
+	laterWeekly := int64(1777619699)
+
+	updated := accountWithUsage(account, usageWindow{
+		UsedPercent:          "85",
+		SecondaryUsedPercent: "98.5",
+		ResetAt:              int64Ptr(earlierPrimary),
+		SecondaryResetAt:     int64Ptr(laterWeekly),
+		UserID:               "user-both",
+	})
+
+	if got, ok := valueToInt64(updated["cooldownUntil"]); !ok || got != laterWeekly {
+		t.Fatalf("expected cooldownUntil to be the later (secondary) reset %d, got %v", laterWeekly, updated["cooldownUntil"])
+	}
+
+	// Case 2: secondary resets sooner, primary is later — keep the later
+	// (primary) reset.
+	earlierWeekly := int64(1777014899)
+	laterPrimary := int64(1777619699)
+
+	updated = accountWithUsage(account, usageWindow{
+		UsedPercent:          "85",
+		SecondaryUsedPercent: "98.5",
+		ResetAt:              int64Ptr(laterPrimary),
+		SecondaryResetAt:     int64Ptr(earlierWeekly),
+		UserID:               "user-both",
+	})
+
+	if got, ok := valueToInt64(updated["cooldownUntil"]); !ok || got != laterPrimary {
+		t.Fatalf("expected cooldownUntil to be the later (primary) reset %d, got %v", laterPrimary, updated["cooldownUntil"])
+	}
+
+	// Case 3: equal resets — must still record a single value (no
+	// ambiguity).
+	equalReset := int64(1777014899)
+	updated = accountWithUsage(account, usageWindow{
+		UsedPercent:          "85",
+		SecondaryUsedPercent: "98.5",
+		ResetAt:              int64Ptr(equalReset),
+		SecondaryResetAt:     int64Ptr(equalReset),
+		UserID:               "user-both",
+	})
+
+	if got, ok := valueToInt64(updated["cooldownUntil"]); !ok || got != equalReset {
+		t.Fatalf("expected cooldownUntil to be %d when both resets are equal, got %v", equalReset, updated["cooldownUntil"])
 	}
 }
 
@@ -1672,6 +2323,41 @@ func lineContaining(text, needle string) string {
 		}
 	}
 	return ""
+}
+
+// splitTableRow splits a Markdown-style table row (`| a | b | c |`) into the
+// trimmed cell values. Leading/trailing pipes are required.
+func splitTableRow(row string) []string {
+	trimmed := strings.TrimSpace(row)
+	if !strings.HasPrefix(trimmed, "|") || !strings.HasSuffix(trimmed, "|") {
+		return nil
+	}
+	inner := trimmed[1 : len(trimmed)-1]
+	parts := strings.Split(inner, "|")
+	cells := make([]string, len(parts))
+	for i, p := range parts {
+		cells[i] = strings.TrimSpace(p)
+	}
+	return cells
+}
+
+// tableColumnWidths returns the visual width of each column in a Markdown-style
+// table row, measured as the number of characters between the `|` boundaries
+// (including the single space of padding on each side). For
+// `"| EMAIL               |"` it returns 19, matching the 5 chars of "EMAIL"
+// plus the 14 spaces of right-padding required to align with the data cells.
+func tableColumnWidths(row string) []int {
+	trimmed := strings.TrimSpace(row)
+	if !strings.HasPrefix(trimmed, "|") || !strings.HasSuffix(trimmed, "|") {
+		return nil
+	}
+	inner := trimmed[1 : len(trimmed)-1]
+	parts := strings.Split(inner, "|")
+	widths := make([]int, len(parts))
+	for i, p := range parts {
+		widths[i] = len(p)
+	}
+	return widths
 }
 
 func mustReadStore(t *testing.T, accountsFile string) map[string]map[string]any {

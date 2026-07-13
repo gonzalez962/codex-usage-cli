@@ -19,6 +19,12 @@ import (
 const defaultUsageURL = "https://chatgpt.com/backend-api/wham/usage"
 const usageRotationThreshold = 80.0
 
+// secondaryUsageRotationThreshold gates the weekly/secondary window. When the
+// active account's weekly usage reaches (or exceeds) this percentage, the
+// default command considers it exhausted and attempts to rotate to a saved
+// alternate. Mirrors usageRotationThreshold for the primary window.
+const secondaryUsageRotationThreshold = 98.0
+
 type config struct {
 	AuthFile     string
 	AccountsFile string
@@ -124,7 +130,11 @@ func runDefaultCommand(ctx context.Context, cfg config, stdout io.Writer) error 
 		return err
 	}
 
-	if usedPercentAtOrAboveThreshold(usage.UsedPercent, usageRotationThreshold) {
+	primaryExhausted := usedPercentAtOrAboveThreshold(usage.UsedPercent, usageRotationThreshold)
+	secondaryExhausted := usage.SecondaryUsedPercent != "" &&
+		usedPercentAtOrAboveThreshold(usage.SecondaryUsedPercent, secondaryUsageRotationThreshold)
+
+	if primaryExhausted || secondaryExhausted {
 		store, err := readAccountsStore(cfg.AccountsFile)
 		if err != nil {
 			return err
@@ -262,11 +272,15 @@ func runAccountsCommand(ctx context.Context, cfg config, stdout io.Writer) error
 }
 
 func printAccountsTable(stdout io.Writer, rows []accountUsageRow) error {
-	if _, err := fmt.Fprintln(stdout, "ID  CURRENT  EMAIL  USED%  WEEK%  RESET  WEEK-RESET"); err != nil {
-		return err
+	headers := []string{"ID", "CURRENT", "EMAIL", "USED%", "WEEK%", "RESET", "WEEK-RESET"}
+
+	widths := make([]int, len(headers))
+	for i, h := range headers {
+		widths[i] = len(h)
 	}
 
-	for _, row := range rows {
+	prepared := make([][]string, len(rows))
+	for i, row := range rows {
 		marker := ""
 		if row.Current {
 			marker = "*"
@@ -281,13 +295,60 @@ func printAccountsTable(stdout io.Writer, rows []accountUsageRow) error {
 			secondaryReset = "-"
 		}
 
-		line := fmt.Sprintf("%-3d  %-7s  %s  %-6s  %-6s  %-8s  %-10s",
-			row.Index, marker, row.Email, row.UsedPercent, secondaryUsed, row.ResetDisplay, secondaryReset)
-		if row.Err != nil {
-			line += "  [ERR: " + row.Err.Error() + "]"
+		cells := []string{
+			strconv.Itoa(row.Index),
+			marker,
+			row.Email,
+			row.UsedPercent,
+			secondaryUsed,
+			row.ResetDisplay,
+			secondaryReset,
 		}
+		for c, value := range cells {
+			if n := len(value); n > widths[c] {
+				widths[c] = n
+			}
+		}
+		prepared[i] = cells
+	}
 
-		if _, err := fmt.Fprintln(stdout, line); err != nil {
+	writeSeparator := func() error {
+		parts := make([]string, len(widths))
+		for i, w := range widths {
+			parts[i] = strings.Repeat("-", w)
+		}
+		_, err := fmt.Fprintf(stdout, "| %s |\n", strings.Join(parts, " | "))
+		return err
+	}
+
+	writeRow := func(cells []string) error {
+		parts := make([]string, len(widths))
+		for i, w := range widths {
+			parts[i] = fmt.Sprintf("%-*s", w, cells[i])
+		}
+		_, err := fmt.Fprintf(stdout, "| %s |", strings.Join(parts, " | "))
+		return err
+	}
+
+	if err := writeRow(headers); err != nil {
+		return err
+	}
+	if _, err := fmt.Fprintln(stdout); err != nil {
+		return err
+	}
+	if err := writeSeparator(); err != nil {
+		return err
+	}
+	for i, cells := range prepared {
+		if err := writeRow(cells); err != nil {
+			return err
+		}
+		if rowErr := rows[i].Err; rowErr != nil {
+			if _, err := fmt.Fprintf(stdout, "  [ERR: %s]", rowErr.Error()); err != nil {
+				return err
+			}
+		}
+		if _, err := fmt.Fprintln(stdout); err != nil {
 			return err
 		}
 	}
@@ -454,11 +515,27 @@ func accountWithUsage(account map[string]any, usage usageWindow) map[string]any 
 		delete(accountWithUsage, "secondaryResetAt")
 	}
 
-	if usedPercentAtOrAboveThreshold(usage.UsedPercent, usageRotationThreshold) {
-		if usage.ResetAt != nil {
+	primaryCooldown := usedPercentAtOrAboveThreshold(usage.UsedPercent, usageRotationThreshold) && usage.ResetAt != nil
+	secondaryCooldown := usage.SecondaryUsedPercent != "" &&
+		usedPercentAtOrAboveThreshold(usage.SecondaryUsedPercent, secondaryUsageRotationThreshold) &&
+		usage.SecondaryResetAt != nil
+
+	// When both windows are over threshold we keep the LATER reset so the
+	// account stays out of rotation until the slower window recovers. Missing
+	// secondary data does not set a cooldown (mirrors the conservative
+	// selection rule: we never block on absent data).
+	switch {
+	case primaryCooldown && secondaryCooldown:
+		if *usage.ResetAt >= *usage.SecondaryResetAt {
 			accountWithUsage["cooldownUntil"] = *usage.ResetAt
+		} else {
+			accountWithUsage["cooldownUntil"] = *usage.SecondaryResetAt
 		}
-	} else {
+	case primaryCooldown:
+		accountWithUsage["cooldownUntil"] = *usage.ResetAt
+	case secondaryCooldown:
+		accountWithUsage["cooldownUntil"] = *usage.SecondaryResetAt
+	default:
 		delete(accountWithUsage, "cooldownUntil")
 	}
 
@@ -898,6 +975,34 @@ func selectEligibleAlternateAccount(store map[string]map[string]any, currentUser
 			continue
 		}
 
+		// Skip candidates whose primary window is already exhausted, when the
+		// store has FRESH data for it. "Fresh" means we have BOTH a usedPercent
+		// above threshold AND a reset_at in the future. Stored high usage with
+		// an expired or missing reset is treated as stale: the account has had
+		// time to recover, so it must remain eligible. Missing values are
+		// treated as "unknown" and the candidate is not blocked (conservative:
+		// we never skip on missing data, matching how `cooldownUntil` is only
+		// honored when set).
+		if used, ok := account["usedPercent"].(string); ok && strings.TrimSpace(used) != "" {
+			if usedPercentAtOrAboveThreshold(used, usageRotationThreshold) {
+				if resetAt, hasReset := extractStoredResetAt(account, "resetAt"); hasReset && resetAt > nowUnix {
+					continue
+				}
+			}
+		}
+
+		// Same conservative rule for the weekly/secondary window: only block
+		// when the store explicitly reports weekly usage at/above the rotation
+		// threshold AND a secondary reset is recorded in the future. A
+		// candidate with no recorded weekly data is still eligible.
+		if used, ok := account["secondaryUsedPercent"].(string); ok && strings.TrimSpace(used) != "" {
+			if usedPercentAtOrAboveThreshold(used, secondaryUsageRotationThreshold) {
+				if resetAt, hasReset := extractStoredResetAt(account, "secondaryResetAt"); hasReset && resetAt > nowUnix {
+					continue
+				}
+			}
+		}
+
 		if cooldownUntil, hasCooldown := extractCooldownUntil(account); hasCooldown && cooldownUntil > nowUnix {
 			continue
 		}
@@ -910,8 +1015,12 @@ func selectEligibleAlternateAccount(store map[string]map[string]any, currentUser
 	return nil, false
 }
 
-func extractCooldownUntil(account map[string]any) (int64, bool) {
-	raw, ok := account["cooldownUntil"]
+// extractStoredResetAt returns the int64 stored under fieldName in account.
+// Used both to read the persisted cooldownUntil marker and to validate
+// candidate eligibility (threshold usage only blocks while the recorded
+// reset window is still in the future).
+func extractStoredResetAt(account map[string]any, fieldName string) (int64, bool) {
+	raw, ok := account[fieldName]
 	if !ok || raw == nil {
 		return 0, false
 	}
@@ -922,6 +1031,10 @@ func extractCooldownUntil(account map[string]any) (int64, bool) {
 	}
 
 	return parsed, true
+}
+
+func extractCooldownUntil(account map[string]any) (int64, bool) {
+	return extractStoredResetAt(account, "cooldownUntil")
 }
 
 func updateOpenAIAuthFile(authFile string, account map[string]any) error {

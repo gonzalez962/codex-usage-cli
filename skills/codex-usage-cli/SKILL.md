@@ -24,14 +24,14 @@ metadata:
 - No leas ni imprimas tokens manualmente: usa el CLI.
 - Sin argumentos, el CLI imprime **solo** el `used_percent` de la ventana primaria de la cuenta activa.
 - Para reportes humanos, usa `accounts` o `list`.
-- La cuenta activa se marca con `*` en la columna `CURRENT` de `accounts`/`list`.
+- `accounts`/`list` rinden una tabla Markdown con `|` como separador de columnas y `-` en la fila separadora debajo del header. La cuenta activa se marca con `*` en la columna `CURRENT`.
 - El store de cuentas usa `user_id` como identidad real, no `accountId`.
 - `accountId` es metadata de workspace y no debe usarse para deduplicar cuentas.
 - El reset se muestra como tiempo restante, no como timestamp.
 - La ventana secundaria (`rate_limit.secondary_window`) es la ventana semanal; se muestra en las columnas `WEEK%` y `WEEK-RESET` de `accounts`/`list`.
 - Las filas de `accounts`/`list` se ordenan por `user_id` alfabéticamente. La columna `ID` es estable y se puede pasar a `use #<id>` (requiere el prefijo `#` para evitar colisiones con `user_id` numéricos como `1`/`2`/`10`).
 - Para cambiar la cuenta activa en OpenCode, usa `use <selector>` con el índice de `accounts`/`list` como `#<n>`, el `user_id` exacto, o el email (case-insensitive).
-- Si el uso de la cuenta activa supera el umbral configurado por la herramienta, el CLI puede rotar a otra cuenta elegible.
+- La rotación automática de la cuenta activa se dispara si la ventana primaria está >= 80% **o** si la ventana semanal está >= 98%. Los candidatos a rotar se filtran para omitir cuentas con `usedPercent` >= 80% o `secondaryUsedPercent` >= 98% (solo cuando esos valores están registrados en el store; un candidato sin datos semanales se considera elegible, decisión conservadora para no bloquear por ausencia de información).
 - Nunca expongas `openai.access`, bearer tokens ni contenido completo de `auth.json` en respuestas al usuario. `use` no imprime tokens; solo confirma email y `user_id`.
 
 ## Commands
@@ -72,9 +72,10 @@ colisiones con `user_id` numéricos. No expone el access token en `stdout`.
 Ejemplo de `codex-usage-cli accounts`:
 
 ```text
-ID  CURRENT  EMAIL                USED%  WEEK%  RESET    WEEK-RESET
-1   *        current@example.com  22.5   2.5    2h 15m   5d 12h
-2            other@example.com    88     12     1d 3h    3d 4h
+| ID | CURRENT | EMAIL               | USED% | WEEK% | RESET  | WEEK-RESET |
+| -- | ------- | ------------------- | ----- | ----- | ------ | ---------- |
+| 1  | *       | current@example.com | 22.5  | 2.5   | 2h 15m | 5d 12h     |
+| 2  |         | other@example.com   | 88    | 12    | 1d 3h  | 3d 4h      |
 ```
 
 | Columna | Significado |
@@ -103,8 +104,8 @@ $env:CODEX_USAGE_ACCOUNTS_FILE="C:\ruta\openai-accounts.json"; codex-usage-cli a
 
 1. Para una respuesta automática o scriptable, ejecuta `codex-usage-cli` y trata stdout como un número.
 2. Para una respuesta al usuario sobre varias cuentas, ejecuta `codex-usage-cli accounts`.
-3. Resume la tabla sin incluir tokens ni rutas sensibles.
-4. Si la cuenta activa aparece con uso alto, menciona el tiempo restante de reset (primario y semanal) y si hay otras cuentas disponibles según la tabla.
+3. Resume la tabla Markdown sin incluir tokens ni rutas sensibles.
+4. Si la cuenta activa aparece con uso alto, menciona el tiempo restante de reset (primario y semanal) y si hay otras cuentas disponibles según la tabla. Recuerda que la rotación automática se dispara cuando la ventana primaria >= 80% o la semanal >= 98%.
 5. Si el usuario quiere rotar manualmente a otra cuenta, ejecuta `codex-usage-cli use <selector>` usando `#<ID>`, el `user_id` o el email de la tabla. Confirma el cambio sin imprimir tokens.
 6. Si el comando falla por falta de cuentas guardadas, indica que primero debe ejecutarse el CLI con cada cuenta configurada en OpenCode para registrarla.
 
