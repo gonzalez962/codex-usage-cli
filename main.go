@@ -7,6 +7,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
+	"math/big"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -33,6 +35,7 @@ const usageFiveHourThreshold = 80.0
 
 type config struct {
 	AuthFile        string
+	PiAuthFile      string
 	AccountsFile    string
 	ConfigFile      string
 	FiveHourEnabled bool
@@ -105,10 +108,12 @@ func defaultConfig() config {
 	authFile := filepath.Join(".local", "share", "opencode", "auth.json")
 	accountsFile := filepath.Join(".local", "share", "codex-usage-cli", "openai-accounts.json")
 	configFile := filepath.Join(".local", "share", "codex-usage-cli", "config.json")
+	piAuthFile := filepath.Join(".pi", "agent", "auth.json")
 	if err == nil {
 		authFile = filepath.Join(home, ".local", "share", "opencode", "auth.json")
 		accountsFile = filepath.Join(home, ".local", "share", "codex-usage-cli", "openai-accounts.json")
 		configFile = filepath.Join(home, ".local", "share", "codex-usage-cli", "config.json")
+		piAuthFile = filepath.Join(home, ".pi", "agent", "auth.json")
 	}
 
 	if envAuth := strings.TrimSpace(os.Getenv("OPENCODE_AUTH_FILE")); envAuth != "" {
@@ -120,9 +125,19 @@ func defaultConfig() config {
 	if envConfig := strings.TrimSpace(os.Getenv("CODEX_USAGE_CONFIG_FILE")); envConfig != "" {
 		configFile = envConfig
 	}
+	if envPiDir := strings.TrimSpace(os.Getenv("PI_CODING_AGENT_DIR")); envPiDir != "" {
+		// PI_CODING_AGENT_DIR is a directory override; append "auth.json" to get
+		// the canonical Pi auth file. The directory may use a leading "~" to
+		// reference the user's home (matching Pi semantics); expand it before
+		// joining so PiAuthFile is absolute when HOME is set.
+		if expanded, expandErr := expandTildePath(envPiDir); expandErr == nil {
+			piAuthFile = filepath.Join(expanded, "auth.json")
+		}
+	}
 
 	return config{
 		AuthFile:     authFile,
+		PiAuthFile:   piAuthFile,
 		AccountsFile: accountsFile,
 		ConfigFile:   configFile,
 		UsageURL:     defaultUsageURL,
@@ -234,7 +249,7 @@ func runDefaultCommand(ctx context.Context, cfg config, stdout io.Writer) error 
 		}
 
 		if nextAccount, ok := selectEligibleAlternateAccount(store, usage.UserID, cfg.Now().Unix(), fiveHourMode); ok {
-			if err := updateOpenAIAuthFile(cfg.AuthFile, nextAccount); err != nil {
+			if err := activateAccount(cfg, nextAccount); err != nil {
 				return err
 			}
 		}
@@ -563,7 +578,7 @@ func runUseCommand(cfg config, stdout io.Writer, identifier string) error {
 		return err
 	}
 
-	if err := updateOpenAIAuthFile(cfg.AuthFile, target); err != nil {
+	if err := activateAccount(cfg, target); err != nil {
 		return err
 	}
 
@@ -1510,14 +1525,36 @@ func extractCooldownUntil(account map[string]any) (int64, bool) {
 	return extractStoredResetAt(account, "cooldownUntil")
 }
 
+// updateOpenAIAuthFile keeps OpenCode's `auth.json` OAuth tuple in sync with the
+// selected account. Every source field present in the account is propagated to
+// BOTH the supported flat `openai.*` representation AND the nested `openai`
+// object when those representations already exist; fields absent from the
+// source are removed from both representations so a previous active account's
+// stale values never survive a switch. Auth providers other than `openai` and
+// any non-OAuth fields under `openai` (such as custom workspace metadata) are
+// preserved untouched.
+//
+// The OpenCode auth.json is intentionally written WITHOUT the proper-lockfile
+// protocol Pi uses: OpenCode is the source of truth the CLI reads on every
+// invocation, and the activation flow is the only writer here. Co-activation
+// with Pi is handled by activateAccount, which validates the full OAuth
+// metadata before either file is modified so a successful run produces one
+// coherent selected account across both stores.
 func updateOpenAIAuthFile(authFile string, account map[string]any) error {
 	access, ok := account["access"].(string)
 	if !ok || strings.TrimSpace(access) == "" {
 		return errors.New("account data missing non-empty access token")
 	}
 
-	accountID, hasAccountID := account["accountId"].(string)
-	hasAccountID = hasAccountID && strings.TrimSpace(accountID) != ""
+	accountID, hasAccountID := stringField(account, "accountId")
+	refresh, hasRefresh := stringField(account, "refresh")
+	typ, hasType := stringField(account, "type")
+	hasType = hasType && strings.TrimSpace(typ) != ""
+
+	expires, hasExpires, expiresErr := int64FieldExact(account, "expires")
+	if expiresErr != nil {
+		return fmt.Errorf("account expires: %w", expiresErr)
+	}
 
 	data, err := os.ReadFile(authFile)
 	if err != nil {
@@ -1532,25 +1569,37 @@ func updateOpenAIAuthFile(authFile string, account map[string]any) error {
 		return fmt.Errorf("parsing auth file JSON: %w", err)
 	}
 
+	// Flat representation: openai.access / openai.accountId / openai.refresh /
+	// openai.expires / openai.type. Each is assigned when the source has the
+	// field; deleted otherwise so stale values from a previous switch are
+	// removed.
 	payload["openai.access"] = access
-	if hasAccountID {
-		payload["openai.accountId"] = accountID
+	writeOptionalString(payload, "openai.accountId", accountID, hasAccountID)
+	writeOptionalString(payload, "openai.refresh", refresh, hasRefresh)
+	if hasExpires {
+		// Preserve the integer literal by writing through json.Number; this
+		// keeps `expires` as a JSON number of milliseconds with no truncation.
+		payload["openai.expires"] = json.Number(strconv.FormatInt(expires, 10))
 	} else {
-		// Selected account lacks an accountId: clear any stale value from the
-		// previous active account so downstream readers do not see a leftover
-		// workspace id.
-		delete(payload, "openai.accountId")
+		delete(payload, "openai.expires")
 	}
+	writeOptionalString(payload, "openai.type", typ, hasType)
 
-	rawOpenAI, hasNested := payload["openai"]
-	if hasNested {
+	// Nested representation: openai.{access,accountId,refresh,expires,type}.
+	// Only updated when the nested object already exists; creating a new
+	// nested object from scratch would silently invent a second representation
+	// the rest of the codebase does not expect.
+	if rawOpenAI, hasNested := payload["openai"]; hasNested {
 		if openAIMap, ok := rawOpenAI.(map[string]any); ok {
 			openAIMap["access"] = access
-			if hasAccountID {
-				openAIMap["accountId"] = accountID
+			writeOptionalString(openAIMap, "accountId", accountID, hasAccountID)
+			writeOptionalString(openAIMap, "refresh", refresh, hasRefresh)
+			if hasExpires {
+				openAIMap["expires"] = json.Number(strconv.FormatInt(expires, 10))
 			} else {
-				delete(openAIMap, "accountId")
+				delete(openAIMap, "expires")
 			}
+			writeOptionalString(openAIMap, "type", typ, hasType)
 			payload["openai"] = openAIMap
 		}
 	}
@@ -1562,6 +1611,540 @@ func updateOpenAIAuthFile(authFile string, account map[string]any) error {
 
 	if err := os.WriteFile(authFile, encoded, 0o600); err != nil {
 		return fmt.Errorf("writing auth file: %w", err)
+	}
+
+	return nil
+}
+
+// stringField returns account[key] coerced to a string, reporting presence
+// independently of trim semantics so the caller can decide whether an empty
+// value still counts as "the source claims this field". Returns "", false when
+// the field is missing or not a string.
+func stringField(account map[string]any, key string) (string, bool) {
+	raw, ok := account[key]
+	if !ok || raw == nil {
+		return "", false
+	}
+	s, ok := raw.(string)
+	if !ok {
+		return "", false
+	}
+	return s, true
+}
+
+// int64FieldExact returns account[key] coerced to an int64 via parseExactInt64.
+// It reports presence when the key exists AND parses cleanly; an unparseable
+// value (fraction, overflow, wrong type) is surfaced as an error so the caller
+// can refuse the activation rather than silently dropping the field.
+func int64FieldExact(account map[string]any, key string) (int64, bool, error) {
+	raw, ok := account[key]
+	if !ok || raw == nil {
+		return 0, false, nil
+	}
+	n, err := parseExactInt64(raw)
+	if err != nil {
+		return 0, false, err
+	}
+	return n, true, nil
+}
+
+// writeOptionalString assigns target[key] = value when hasValue is true; when
+// false, the key is deleted so a stale value from a previous switch does not
+// survive into the next account. Centralized so the flat and nested
+// representations stay symmetric.
+func writeOptionalString(target map[string]any, key, value string, hasValue bool) {
+	if hasValue {
+		target[key] = value
+		return
+	}
+	delete(target, key)
+}
+
+// -----------------------------------------------------------------------------
+// Pi auth synchronization.
+// -----------------------------------------------------------------------------
+
+// expandTildePath expands a leading "~" or "~/" segment to the user's home
+// directory so directory overrides like PI_CODING_AGENT_DIR=~/my-pi match Pi's
+// own path semantics. Returns the input unchanged when it does not start with
+// "~" or when the user home directory cannot be resolved (callers fall back to
+// their home-based default in that case).
+func expandTildePath(path string) (string, error) {
+	if path == "" || path[0] != '~' {
+		return path, nil
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", err
+	}
+	if path == "~" {
+		return home, nil
+	}
+	if path[1] == '/' || path[1] == filepath.Separator {
+		return filepath.Join(home, path[2:]), nil
+	}
+	// "~user/..." is not supported by Pi; return the input unchanged.
+	return path, nil
+}
+
+// PiAuthEntry is the openai-codex credential shape stored in Pi's auth.json.
+// It contains ONLY the OAuth fields Pi cares about: usage metadata
+// (usedPercent, resetAt, secondary*, cooldownUntil), account identity
+// (user_id, email), and unrelated account fields must never appear here.
+//
+// `type` is always serialized (no `omitempty`) so the JSON shape is
+// unambiguous: a legacy source account that omits `type` is normalized to
+// `"oauth"` by buildPiCredential rather than being written as a JSON object
+// without a `type` field. Pi treats a missing `type` as an authentication
+// error, so the projection must never emit one.
+type PiAuthEntry struct {
+	Type      string `json:"type"`
+	Access    string `json:"access"`
+	Refresh   string `json:"refresh"`
+	Expires   int64  `json:"expires"`
+	AccountID string `json:"accountId,omitempty"`
+}
+
+// parseExactInt64 parses value as a finite integer exactly representable as
+// int64. It is the entry point used by the Pi projection to interpret the
+// source account's `expires` value, which Pi treats as an integer number of
+// milliseconds since epoch and refuses as fractional or truncated.
+//
+// Accepted inputs (all preserving the integer value exactly):
+//
+//   - json.Number with an integral decimal literal, including scientific
+//     notation (`1e3`) and `.0` forms (`100.0`). Decoded via math/big so the
+//     literal's full precision is checked before any int64 conversion.
+//   - float64 / float32 values that are mathematically integral and within
+//     int64 range; NaN and ±Inf are rejected.
+//   - int, int8/16/32/64 and uint, uint8/16/32/64 within int64 range.
+//
+// Rejected (no truncation, no rounding) with a value-free error:
+//
+//   - Fractions (1.5, 0.1, "100.5").
+//   - NaN, +Inf, -Inf.
+//   - Values outside [math.MinInt64, math.MaxInt64].
+//   - Nonnumeric types (strings, booleans, nil, maps, slices, structs).
+//
+// Errors do not include the offending value: callers surface them to the
+// user and must not echo credential material.
+func parseExactInt64(value any) (int64, error) {
+	switch v := value.(type) {
+	case json.Number:
+		literal := v.String()
+		if !json.Valid([]byte(literal)) {
+			return 0, errors.New("invalid number literal")
+		}
+		rational, ok := new(big.Rat).SetString(literal)
+		if !ok {
+			return 0, errors.New("invalid number literal")
+		}
+		if !rational.IsInt() {
+			return 0, errors.New("number literal is not an integer")
+		}
+		integer := rational.Num()
+		if !integer.IsInt64() {
+			return 0, errors.New("number literal out of int64 range")
+		}
+		return integer.Int64(), nil
+	case float64:
+		if math.IsNaN(v) || math.IsInf(v, 0) {
+			return 0, errors.New("integer value must be finite")
+		}
+		// float64 cannot represent every int64 exactly. The round-trip check
+		// (convert to int64 and back) catches fractions (truncation differs),
+		// NaN/Inf (already filtered above), and values past the int64 range
+		// (where int64() returns an implementation-defined sentinel whose
+		// float64 back-conversion does not match the source).
+		n := int64(v)
+		if float64(n) != v {
+			return 0, errors.New("integer value not representable as int64 (fractional or out of range)")
+		}
+		return n, nil
+	case float32:
+		return parseExactInt64(float64(v))
+	case int:
+		return int64(v), nil
+	case int8:
+		return int64(v), nil
+	case int16:
+		return int64(v), nil
+	case int32:
+		return int64(v), nil
+	case int64:
+		return v, nil
+	case uint:
+		if uint64(v) > math.MaxInt64 {
+			return 0, errors.New("unsigned integer out of int64 range")
+		}
+		return int64(v), nil
+	case uint8:
+		return int64(v), nil
+	case uint16:
+		return int64(v), nil
+	case uint32:
+		return int64(v), nil
+	case uint64:
+		if v > uint64(math.MaxInt64) {
+			return 0, errors.New("unsigned integer out of int64 range")
+		}
+		return int64(v), nil
+	default:
+		return 0, fmt.Errorf("unsupported type %T", value)
+	}
+}
+
+// validatePiAccountFields reports the Pi OAuth fields missing from account.
+// The error names field NAMES but NEVER the values: callers surface it directly
+// to the user and must not include credential material in summaries. Used as a
+// pre-flight check before either auth file is modified so a manual/automatic
+// account activation that lacks Pi OAuth metadata leaves both files unchanged.
+func validatePiAccountFields(account map[string]any) error {
+	if account == nil {
+		return errors.New("selected account is empty")
+	}
+
+	var missing []string
+
+	if access, _ := account["access"].(string); strings.TrimSpace(access) == "" {
+		missing = append(missing, "access")
+	}
+	if refresh, _ := account["refresh"].(string); strings.TrimSpace(refresh) == "" {
+		missing = append(missing, "refresh")
+	}
+
+	if _, ok := account["expires"]; !ok {
+		missing = append(missing, "expires")
+	} else if _, err := parseExactInt64(account["expires"]); err != nil {
+		return fmt.Errorf("invalid expires field (must be an integer number of milliseconds since epoch): %w", err)
+	}
+
+	if len(missing) > 0 {
+		return fmt.Errorf("selected account missing required Pi OAuth fields: %s", strings.Join(missing, ", "))
+	}
+
+	// Type, when present, must be a string and OAuth-compatible. A missing or
+	// empty type is tolerated so buildPiCredential can normalize it to "oauth".
+	// Errors identify the field without echoing credential values.
+	if rawType, ok := account["type"]; ok && rawType != nil {
+		t, isString := rawType.(string)
+		if !isString || (strings.TrimSpace(t) != "" && t != "oauth") {
+			return errors.New("unsupported account type field (Pi requires \"oauth\")")
+		}
+	}
+
+	return nil
+}
+
+// buildPiCredential projects a selected account into the openai-codex
+// credential shape Pi expects. It runs validatePiAccountFields first so any
+// error here means the caller must NOT touch either auth file. The returned
+// struct intentionally exposes no Pi-irrelevant fields: usage metadata
+// (usedPercent, resetAt, secondary*, cooldownUntil), identity metadata
+// (user_id, email), and arbitrary custom fields on the source account are
+// never projected.
+//
+// `type` is normalized to "oauth" when the source account omits it (legacy
+// records written before Pi required an explicit type). validatePiAccountFields
+// guarantees that any present non-empty value is already "oauth", so the
+// override below only fills in the legacy default.
+func buildPiCredential(account map[string]any) (PiAuthEntry, error) {
+	if err := validatePiAccountFields(account); err != nil {
+		return PiAuthEntry{}, err
+	}
+
+	access, _ := account["access"].(string)
+	refresh, _ := account["refresh"].(string)
+	// parseExactInt64 is guaranteed to succeed here: validatePiAccountFields
+	// already rejected fractional/out-of-range/typed-wrong values.
+	expiresMs, _ := parseExactInt64(account["expires"])
+
+	cred := PiAuthEntry{
+		Type:    "oauth",
+		Access:  access,
+		Refresh: refresh,
+		Expires: expiresMs,
+	}
+
+	if rawType, ok := account["type"]; ok {
+		if t, _ := rawType.(string); strings.TrimSpace(t) != "" {
+			cred.Type = t
+		}
+	}
+
+	if rawAccountID, ok := account["accountId"]; ok {
+		if id, _ := rawAccountID.(string); strings.TrimSpace(id) != "" {
+			cred.AccountID = id
+		}
+	}
+
+	return cred, nil
+}
+
+// Pi auth synchronization lock semantics.
+//
+// The lock is `${auth.json}.lock` created as an ATOMIC DIRECTORY (matching
+// Pi's proper-lockfile-based sync path). Acquiring the lock means `os.Mkdir`
+// succeeded; releasing it means `os.Remove` ran. The directory approach is
+// intentional: POSIX mkdir is atomic, so concurrent writers cannot both
+// observe "lock acquired".
+//
+// We retry a bounded number of times (10 attempts × 20ms = 200ms total) and
+// then give up with a clear error. We NEVER delete a stale lock we did not
+// create: a stale directory is treated as a concurrent writer that owns the
+// file, and the activation surfaces an error rather than racing ahead.
+//
+// Release failures are NOT silently swallowed: a stuck lock directory will
+// block subsequent activations, so the error is propagated and surfaced.
+const (
+	piLockMaxAttempts = 10
+	piLockRetryDelay  = 20 * time.Millisecond
+	piAuthDirPerm     = 0o700
+	piAuthFilePerm    = 0o600
+	piAuthLockDirPerm = 0o700
+)
+
+// acquirePiLock atomically creates lockPath as a directory matching Pi's
+// proper-lockfile sync path. It returns nil on success; on failure it returns
+// an error that names the lock path and the number of attempts so the caller
+// can surface a clear "Pi auth is busy" message without touching the auth
+// file. The lock is NEVER deleted speculatively: an existing lock directory
+// means another writer owns the file, and that ownership is respected.
+func acquirePiLock(lockPath string) error {
+	for attempt := 1; attempt <= piLockMaxAttempts; attempt++ {
+		err := os.Mkdir(lockPath, piAuthLockDirPerm)
+		if err == nil {
+			return nil
+		}
+		if !errors.Is(err, os.ErrExist) {
+			return fmt.Errorf("acquiring Pi auth lock at %s: %w", lockPath, err)
+		}
+		time.Sleep(piLockRetryDelay)
+	}
+	return fmt.Errorf("could not acquire Pi auth lock at %s after %d attempts (%dms each)",
+		lockPath, piLockMaxAttempts, piLockRetryDelay/time.Millisecond)
+}
+
+// releasePiLock removes the lock directory created by acquirePiLock. The
+// caller decides how to surface the error (typically by returning it from
+// updatePiAuthFile): a leftover lock directory will block subsequent
+// activations, so the failure is reported rather than hidden.
+func releasePiLock(lockPath string) error {
+	if err := os.Remove(lockPath); err != nil {
+		return fmt.Errorf("releasing Pi auth lock at %s: %w", lockPath, err)
+	}
+	return nil
+}
+
+func combinePiAuthWriteAndReleaseErrors(writeErr, releaseErr error) error {
+	return errors.Join(writeErr, releaseErr)
+}
+
+// updatePiAuthFile replaces ONLY the top-level "openai-codex" entry in Pi's
+// auth.json, preserving every other provider and their nested values. The
+// file is created with restrictive permissions (parent dir 0700 when freshly
+// created, file 0600); on POSIX an existing file is tightened to 0600 BEFORE
+// the write so a permission failure aborts the update without mutating
+// credentials.
+//
+// Concurrency is handled with the proper-lockfile protocol (see acquirePiLock):
+// the parent directory and a missing `{}` file are prepared BEFORE the lock
+// attempt, then the lock is held across read/modify/write and released on
+// return. Write and release failures are joined so neither credential-write
+// failures nor compromised lock ownership are hidden.
+func updatePiAuthFile(piAuthFile string, cred PiAuthEntry) error {
+	if err := ensurePiAuthParent(filepath.Dir(piAuthFile)); err != nil {
+		return err
+	}
+	if err := ensurePiAuthFile(piAuthFile); err != nil {
+		return err
+	}
+
+	lockPath := piAuthFile + ".lock"
+	if err := acquirePiLock(lockPath); err != nil {
+		return err
+	}
+
+	writeErr := writePiAuthFileUnderLock(piAuthFile, cred)
+	releaseErr := releasePiLock(lockPath)
+	return combinePiAuthWriteAndReleaseErrors(writeErr, releaseErr)
+}
+
+// writePiAuthFileUnderLock performs the read/modify/write cycle while the
+// proper-lockfile lock is held. Splitting this from updatePiAuthFile keeps the
+// lock acquisition/release and the I/O boundaries easy to read at a glance.
+func writePiAuthFileUnderLock(piAuthFile string, cred PiAuthEntry) error {
+	payload, originalBytes, err := loadPiAuthFile(piAuthFile)
+	if err != nil {
+		return err
+	}
+
+	payload["openai-codex"] = cred
+
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		return fmt.Errorf("encoding Pi auth JSON: %w", err)
+	}
+
+	// Tighten permissions on POSIX BEFORE writing. A chmod failure (e.g. an
+	// immutable file, a path we cannot stat) aborts the update so the
+	// credential content is never written under looser permissions than the
+	// documented 0600 contract.
+	if runtime.GOOS != "windows" {
+		if err := os.Chmod(piAuthFile, piAuthFilePerm); err != nil {
+			return fmt.Errorf("tightening Pi auth file permissions: %w", err)
+		}
+	}
+
+	if err := os.WriteFile(piAuthFile, encoded, piAuthFilePerm); err != nil {
+		// Best-effort restore of the original content so a write failure does
+		// not leave the file truncated or empty.
+		if originalBytes != nil {
+			_ = os.WriteFile(piAuthFile, originalBytes, piAuthFilePerm)
+		}
+		return fmt.Errorf("writing Pi auth file: %w", err)
+	}
+
+	return nil
+}
+
+// ensurePiAuthParent creates the Pi auth parent directory with 0700 if it
+// does not already exist. An EXISTING parent directory is left untouched: we
+// do not claim to tighten a directory we did not create, both to avoid
+// surprise-mode changes on shared paths and because tightening a pre-existing
+// directory's permissions could break unrelated tools sharing it.
+func ensurePiAuthParent(parentDir string) error {
+	if parentDir == "" {
+		return errors.New("Pi auth file path has no parent directory")
+	}
+	info, err := os.Stat(parentDir)
+	if err == nil {
+		if !info.IsDir() {
+			return fmt.Errorf("Pi auth parent path is not a directory: %s", parentDir)
+		}
+		return nil
+	}
+	if !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("checking Pi auth parent directory: %w", err)
+	}
+	if err := os.MkdirAll(parentDir, piAuthDirPerm); err != nil {
+		return fmt.Errorf("creating Pi auth directory: %w", err)
+	}
+	return nil
+}
+
+// ensurePiAuthFile ensures piAuthFile exists as a regular file before the lock
+// is acquired. A missing file is initialized to `{}` with 0600 via
+// O_CREATE|O_EXCL so a concurrent writer cannot clobber an existing file with
+// an empty body. An EEXIST race against another creator is treated as success:
+// whichever writer created the file owns the contents and the lock held later
+// in the update cycle still guarantees read/modify/write consistency. An
+// existing file is left as-is (the chmod-before-write tightening happens
+// under the lock).
+func ensurePiAuthFile(piAuthFile string) error {
+	info, err := os.Stat(piAuthFile)
+	if err == nil {
+		if info.IsDir() {
+			return fmt.Errorf("Pi auth path is a directory: %s", piAuthFile)
+		}
+		return nil
+	}
+	if !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("checking Pi auth file: %w", err)
+	}
+	f, err := os.OpenFile(piAuthFile, os.O_CREATE|os.O_EXCL|os.O_WRONLY, piAuthFilePerm)
+	if err != nil {
+		if errors.Is(err, os.ErrExist) {
+			return nil
+		}
+		return fmt.Errorf("initializing Pi auth file: %w", err)
+	}
+	if _, err := f.Write([]byte("{}")); err != nil {
+		_ = f.Close()
+		return fmt.Errorf("initializing Pi auth file: %w", err)
+	}
+	if err := f.Close(); err != nil {
+		return fmt.Errorf("closing Pi auth file: %w", err)
+	}
+	return nil
+}
+
+// loadPiAuthFile reads piAuthFile as a JSON object. A missing file yields an
+// empty object (the caller is expected to have called ensurePiAuthFile first,
+// but we still tolerate the race because the lock guarantees correctness on
+// the read/modify/write cycle). An empty file is rejected as malformed
+// (matches Pi's JSON.parse behavior). Trailing JSON values or content after
+// the first top-level object are also rejected (e.g. "{} {}", "{\"a\":1} junk")
+// to keep the file unambiguously a single JSON object. The original bytes are
+// returned so the caller can restore them on a later write failure.
+//
+// The file is decoded with json.Decoder.UseNumber so unrelated providers can
+// carry large integers beyond float64's exact integer range (~2^53) and still
+// be remarshaled with their original numeric value preserved.
+func loadPiAuthFile(piAuthFile string) (map[string]any, []byte, error) {
+	data, err := os.ReadFile(piAuthFile)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return map[string]any{}, nil, nil
+		}
+		return nil, nil, fmt.Errorf("reading Pi auth file: %w", err)
+	}
+
+	if len(bytes.TrimSpace(data)) == 0 {
+		return nil, data, errors.New("Pi auth file is empty (malformed JSON)")
+	}
+
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.UseNumber()
+
+	var payload map[string]any
+	if err := decoder.Decode(&payload); err != nil {
+		return nil, data, fmt.Errorf("parsing Pi auth JSON: %w", err)
+	}
+	if payload == nil {
+		return nil, data, errors.New("Pi auth file must be a JSON object")
+	}
+
+	var extra any
+	if err := decoder.Decode(&extra); err != io.EOF {
+		return nil, data, errors.New("Pi auth file must contain a single JSON object")
+	}
+	return payload, data, nil
+}
+
+// activateAccount centralizes the account-activation side effects: it updates
+// OpenCode's auth.json and Pi's auth.json (when Pi sync is enabled) for the
+// selected account. Registration/listing paths MUST NOT call this; it is only
+// invoked from the rotation pipeline and from `use`.
+//
+// Validation runs before either file is modified so a manual/automatic account
+// activation that lacks Pi OAuth metadata leaves both auth files unchanged. A
+// successful OpenCode update followed by a failed Pi write surfaces as a clear
+// partial-sync error that names both stores but never the credential values.
+//
+// Pi sync is opt-in via cfg.PiAuthFile: an explicitly empty string skips Pi
+// sync so existing unit tests that pre-date Pi sync stay isolated from the
+// real ~/.pi/agent/auth.json.
+func activateAccount(cfg config, account map[string]any) error {
+	piSyncEnabled := strings.TrimSpace(cfg.PiAuthFile) != ""
+
+	if piSyncEnabled {
+		if _, err := buildPiCredential(account); err != nil {
+			return err
+		}
+	}
+
+	if err := updateOpenAIAuthFile(cfg.AuthFile, account); err != nil {
+		return err
+	}
+
+	if !piSyncEnabled {
+		return nil
+	}
+
+	cred, _ := buildPiCredential(account) // already validated above
+	if err := updatePiAuthFile(cfg.PiAuthFile, cred); err != nil {
+		return fmt.Errorf("OpenCode auth updated but Pi auth sync failed: %w", err)
 	}
 
 	return nil

@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -3421,4 +3423,611 @@ func TestPersistOpenAIAccountDeletesStaleDerivedFields(t *testing.T) {
 			t.Fatalf("expected stale secondaryResetAt to be deleted, got %v", entry["secondaryResetAt"])
 		}
 	})
+}
+
+// Pi auth synchronization: selected account is mirrored into Pi's auth.json on
+// switch (manual `use` or automatic rotation). Registration, listing and the
+// default no-rotation run are read-only w.r.t. both auth files. Pi sync is
+// opt-in via cfg.PiAuthFile.
+
+func fixturePiAccount() map[string]any {
+	return map[string]any{"user_id": "user-1", "accountId": "acct-1",
+		"access": "fixture-access-token", "refresh": "fixture-refresh-token",
+		"expires": int64(1777014899000), "type": "oauth", "email": "fixture@example.com"}
+}
+
+func seedAuthFile(t *testing.T, path, content string) {
+	t.Helper()
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatalf("seed %s: %v", path, err)
+	}
+}
+
+func readJSONObject(t *testing.T, path string) map[string]any {
+	t.Helper()
+	data, _ := os.ReadFile(path)
+	dec := json.NewDecoder(strings.NewReader(string(data)))
+	dec.UseNumber()
+	var payload map[string]any
+	if err := dec.Decode(&payload); err != nil {
+		t.Fatalf("parse %s: %v", path, err)
+	}
+	return payload
+}
+
+func assertPiCodex(t *testing.T, payload map[string]any, access, refresh string, expires int64, accountID string) {
+	t.Helper()
+	c, ok := payload["openai-codex"].(map[string]any)
+	if !ok || c["type"] != "oauth" || c["access"] != access || c["refresh"] != refresh {
+		t.Fatalf("openai-codex mismatch: %#v", payload["openai-codex"])
+	}
+	switch v := c["expires"].(type) {
+	case json.Number:
+		if v.String() != fmt.Sprintf("%d", expires) {
+			t.Fatalf("expires: want %d, got %s", expires, v.String())
+		}
+	case float64:
+		if int64(v) != expires {
+			t.Fatalf("expires: want %d, got %v", expires, v)
+		}
+	default:
+		t.Fatalf("expires type %T", c["expires"])
+	}
+	if accountID == "" {
+		if _, present := c["accountId"]; present {
+			t.Fatalf("accountId must be omitted")
+		}
+	} else if c["accountId"] != accountID {
+		t.Fatalf("accountId: want %q, got %#v", accountID, c["accountId"])
+	}
+}
+
+func piSyncFixture(t *testing.T) (oc, pi, acc string) {
+	d := t.TempDir()
+	return filepath.Join(d, "opencode.json"), filepath.Join(d, "pi.json"), filepath.Join(d, "accounts.json")
+}
+
+func containsAny(v any, needle string) bool {
+	switch val := v.(type) {
+	case string:
+		return strings.Contains(val, needle)
+	case map[string]any:
+		for k, item := range val {
+			if strings.Contains(k, needle) || containsAny(item, needle) {
+				return true
+			}
+		}
+	case []any:
+		for _, item := range val {
+			if containsAny(item, needle) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func writeStore(t *testing.T, accounts string, entries ...map[string]any) {
+	t.Helper()
+	store := map[string]map[string]any{}
+	for _, e := range entries {
+		store[e["user_id"].(string)] = e
+	}
+	encoded, _ := json.Marshal(store)
+	if err := os.WriteFile(accounts, encoded, 0o600); err != nil {
+		t.Fatalf("write accounts: %v", err)
+	}
+}
+
+func TestParseExactInt64(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name    string
+		value   any
+		want    int64
+		wantErr bool
+	}{
+		// Accepted: mathematically integral, in int64 range.
+		{"json.Number integer", json.Number("1777014899000"), 1777014899000, false},
+		{"json.Number exponent", json.Number("1e3"), 1000, false},
+		{"json.Number .0 form", json.Number("100.0"), 100, false},
+		{"json.Number int64 max", json.Number("9223372036854775807"), math.MaxInt64, false},
+		{"float64 exact integer", float64(1777014899000), 1777014899000, false},
+		{"int64", int64(math.MaxInt64), math.MaxInt64, false},
+		{"uint64 in range", uint64(1777014899000), 1777014899000, false},
+		// Rejected: no truncation, no rounding.
+		{"json.Number fraction", json.Number("1.5"), 0, true},
+		{"json.Number high precision fraction", json.Number("1." + strings.Repeat("0", 200) + "1"), 0, true},
+		{"json.Number overflow", json.Number("9223372036854775808"), 0, true},
+		{"json.Number negative overflow", json.Number("-9223372036854775809"), 0, true},
+		{"float64 fraction", 1.5, 0, true},
+		{"float64 NaN", math.NaN(), 0, true},
+		{"float64 +Inf", math.Inf(1), 0, true},
+		{"float64 overflow", math.MaxInt64 + 1.0, 0, true},
+		{"string rejected", "x", 0, true},
+		{"nil rejected", nil, 0, true},
+	}
+	for _, tt := range cases {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			got, err := parseExactInt64(tt.value)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatalf("parseExactInt64(%v): expected error", tt.value)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("parseExactInt64(%v): %v", tt.value, err)
+			}
+			if got != tt.want {
+				t.Fatalf("parseExactInt64(%v) = %d, want %d", tt.value, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestBuildPiCredential(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name    string
+		mutate  func(map[string]any)
+		wantErr string
+	}{
+		{"legacy missing type normalized to oauth", func(a map[string]any) { delete(a, "type") }, ""},
+		{"non-oauth type rejected", func(a map[string]any) { a["type"] = "api_key" }, "type"},
+		{"non-string type rejected", func(a map[string]any) { a["type"] = 42 }, "type"},
+		{"missing access named (no value leak)", func(a map[string]any) { delete(a, "access") }, "access"},
+		{"missing refresh named", func(a map[string]any) { delete(a, "refresh") }, "refresh"},
+		{"missing expires named", func(a map[string]any) { delete(a, "expires") }, "expires"},
+		{"fractional expires rejected", func(a map[string]any) { a["expires"] = 1.5 }, "expires"},
+		{"string expires rejected", func(a map[string]any) { a["expires"] = "x" }, "expires"},
+		{"json.Number integer expires parses", func(a map[string]any) { a["expires"] = json.Number("1777014899000") }, ""},
+		{"empty accountId omitted", func(a map[string]any) { a["accountId"] = "" }, ""},
+	}
+	for _, tt := range cases {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			acct := fixturePiAccount()
+			if tt.mutate != nil {
+				tt.mutate(acct)
+			}
+			cred, err := buildPiCredential(acct)
+			if tt.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+					t.Fatalf("expected error containing %q, got %v", tt.wantErr, err)
+				}
+				for _, leak := range []string{"fixture-access-token", "fixture-refresh-token", "acct-1", "fixture@example.com"} {
+					if strings.Contains(err.Error(), leak) {
+						t.Fatalf("error leaked %q: %v", leak, err)
+					}
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if cred.Type != "oauth" || cred.Access == "" || cred.Refresh == "" || cred.Expires == 0 {
+				t.Fatalf("incomplete credential: %+v", cred)
+			}
+		})
+	}
+}
+
+func TestUpdatePiAuthFile(t *testing.T) {
+	t.Parallel()
+	cred := PiAuthEntry{Type: "oauth", Access: "new-access", Refresh: "new-refresh", Expires: int64(1777014899000), AccountID: "new-acct"}
+
+	t.Run("missing file initializes to {}; ensurePiAuthFile does not clobber existing (O_EXCL)", func(t *testing.T) {
+		t.Parallel()
+		missing := filepath.Join(t.TempDir(), "auth.json")
+		if err := updatePiAuthFile(missing, cred); err != nil {
+			t.Fatalf("updatePiAuthFile: %v", err)
+		}
+		assertPiCodex(t, readJSONObject(t, missing), "new-access", "new-refresh", 1777014899000, "new-acct")
+		existing := filepath.Join(t.TempDir(), "auth.json")
+		keep := `{"keep":"original"}`
+		seedAuthFile(t, existing, keep)
+		if err := ensurePiAuthFile(existing); err != nil {
+			t.Fatalf("ensurePiAuthFile: %v", err)
+		}
+		if data, _ := os.ReadFile(existing); string(data) != keep {
+			t.Fatalf("ensurePiAuthFile clobbered existing file: %q", string(data))
+		}
+	})
+
+	t.Run("replaces codex and preserves unrelated providers", func(t *testing.T) {
+		t.Parallel()
+		piFile := filepath.Join(t.TempDir(), "auth.json")
+		seedAuthFile(t, piFile, `{"openai-codex":{"type":"oauth","access":"old","refresh":"old","expires":100,"accountId":"old"},`+
+			`"anthropic":{"access":"anth","refresh":"anth-r"},"google":{"nested":{"deep":"value"},"list":["a","b"]}}`)
+		if err := updatePiAuthFile(piFile, cred); err != nil {
+			t.Fatalf("updatePiAuthFile: %v", err)
+		}
+		if data, _ := os.ReadFile(piFile); strings.Contains(string(data), `"old"`) || strings.Contains(string(data), `"old-acct"`) {
+			t.Fatalf("old openai-codex value leaked: %s", string(data))
+		}
+		payload := readJSONObject(t, piFile)
+		assertPiCodex(t, payload, "new-access", "new-refresh", 1777014899000, "new-acct")
+		if anth := payload["anthropic"].(map[string]any); anth["access"] != "anth" || anth["refresh"] != "anth-r" {
+			t.Fatalf("anthropic altered: %v", anth)
+		}
+		if !containsAny(payload["google"], "deep") || !containsAny(payload["google"], "list") {
+			t.Fatalf("google provider altered: %v", payload["google"])
+		}
+	})
+
+	t.Run("malformed/empty/non-object/trailing Pi JSON is rejected without overwrite", func(t *testing.T) {
+		t.Parallel()
+		seeds := map[string]string{
+			"malformed": "{not valid json", "empty": "", "non-object": `[{"openai-codex":{}}]`,
+			"trailing": `{} {}`, "trailing2": `{"a":1} junk`,
+		}
+		for name, seed := range seeds {
+			name, seed := name, seed
+			t.Run(name, func(t *testing.T) {
+				t.Parallel()
+				piFile := filepath.Join(t.TempDir(), "auth.json")
+				seedAuthFile(t, piFile, seed)
+				if err := updatePiAuthFile(piFile, cred); err == nil {
+					t.Fatalf("expected error for %s file", name)
+				}
+				if data, _ := os.ReadFile(piFile); string(data) != seed {
+					t.Fatalf("%s file overwritten: %q", name, string(data))
+				}
+			})
+		}
+	})
+
+	t.Run("large provider integers survive round-trip via UseNumber", func(t *testing.T) {
+		t.Parallel()
+		piFile := filepath.Join(t.TempDir(), "auth.json")
+		seedAuthFile(t, piFile, `{"bigint":{"id":9223372036854775807,"neg":-9223372036854775808,"list":[9223372036854775806,9223372036854775807]}}`)
+		if err := updatePiAuthFile(piFile, cred); err != nil {
+			t.Fatalf("updatePiAuthFile: %v", err)
+		}
+		data, _ := os.ReadFile(piFile)
+		for _, want := range []string{"9223372036854775807", "-9223372036854775808", "9223372036854775806"} {
+			if !strings.Contains(string(data), want) {
+				t.Fatalf("bigint literal %s lost on round-trip: %s", want, string(data))
+			}
+		}
+	})
+
+	if runtime.GOOS != "windows" {
+		t.Run("created parent dir is 0700 on POSIX", func(t *testing.T) {
+			t.Parallel()
+			nested := filepath.Join(t.TempDir(), "nested", "auth.json")
+			if err := updatePiAuthFile(nested, cred); err != nil {
+				t.Fatalf("updatePiAuthFile: %v", err)
+			}
+			if info, _ := os.Stat(filepath.Dir(nested)); info.Mode().Perm() != 0o700 {
+				t.Fatalf("created dir perm: got %o, want 0700", info.Mode().Perm())
+			}
+		})
+	}
+
+	t.Run("legacy source missing type produces type:oauth; empty accountId omitted", func(t *testing.T) {
+		t.Parallel()
+		piFile := filepath.Join(t.TempDir(), "auth.json")
+		acct := fixturePiAccount()
+		delete(acct, "accountId")
+		c, err := buildPiCredential(acct)
+		if err != nil {
+			t.Fatalf("buildPiCredential: %v", err)
+		}
+		if err := updatePiAuthFile(piFile, c); err != nil {
+			t.Fatalf("updatePiAuthFile: %v", err)
+		}
+		js := string(mustReadFile(t, piFile))
+		if !strings.Contains(js, `"type":"oauth"`) || strings.Contains(js, `"accountId"`) {
+			t.Fatalf("type/oauth or accountId leak: %s", js)
+		}
+	})
+}
+
+func TestPiAuthLockSemantics(t *testing.T) {
+	t.Parallel()
+	t.Run("pre-existing lock blocks update; lock not deleted", func(t *testing.T) {
+		t.Parallel()
+		piFile := filepath.Join(t.TempDir(), "auth.json")
+		seedAuthFile(t, piFile, `{"keep":"original"}`)
+		lockPath := piFile + ".lock"
+		if err := os.Mkdir(lockPath, 0o700); err != nil {
+			t.Fatalf("seed lock dir: %v", err)
+		}
+		err := updatePiAuthFile(piFile, PiAuthEntry{Type: "oauth", Access: "new", Refresh: "r", Expires: 1})
+		if err == nil || !strings.Contains(err.Error(), "lock") {
+			t.Fatalf("expected lock error, got %v", err)
+		}
+		if _, statErr := os.Stat(lockPath); statErr != nil {
+			t.Fatalf("lock dir was deleted speculatively: %v", statErr)
+		}
+		if data, _ := os.ReadFile(piFile); string(data) != `{"keep":"original"}` {
+			t.Fatalf("auth file changed despite lock: %q", string(data))
+		}
+	})
+	t.Run("successful update removes its own lock directory", func(t *testing.T) {
+		t.Parallel()
+		piFile := filepath.Join(t.TempDir(), "auth.json")
+		seedAuthFile(t, piFile, `{}`)
+		if err := updatePiAuthFile(piFile, PiAuthEntry{Type: "oauth", Access: "a", Refresh: "r", Expires: 1}); err != nil {
+			t.Fatalf("updatePiAuthFile: %v", err)
+		}
+		if _, err := os.Stat(piFile + ".lock"); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("lock dir not removed after success: %v", err)
+		}
+	})
+	t.Run("release ownership loss and combined failures are surfaced", func(t *testing.T) {
+		t.Parallel()
+		if err := releasePiLock(filepath.Join(t.TempDir(), "missing.lock")); err == nil {
+			t.Fatal("expected missing lock release to fail")
+		}
+		writeErr := errors.New("write failed")
+		releaseErr := errors.New("release failed")
+		combined := combinePiAuthWriteAndReleaseErrors(writeErr, releaseErr)
+		if !errors.Is(combined, writeErr) || !errors.Is(combined, releaseErr) {
+			t.Fatalf("combined error must retain both causes: %v", combined)
+		}
+	})
+}
+
+func TestUpdateOpenAIAuthFile(t *testing.T) {
+	t.Parallel()
+	fullOAuth := func(access, refresh string, expires int64) map[string]any {
+		return map[string]any{"access": access, "accountId": access + "-acct", "refresh": refresh, "expires": expires, "type": "oauth"}
+	}
+	cases := []struct {
+		name       string
+		seed       string
+		account    map[string]any
+		keep       []string
+		wantFlat   map[string]any
+		wantNested map[string]any
+	}{
+		{
+			name:       "flat and nested tuples updated for full OAuth source",
+			seed:       `{"openai.access":"old","openai.accountId":"old-acct","openai.refresh":"old-r","openai.expires":1,"openai.type":"oauth","openai":{"access":"old","accountId":"old-acct","refresh":"old-r","expires":1,"type":"oauth"},"anthropic":{"k":"v"}}`,
+			account:    fullOAuth("new", "new-r", 1777014899000),
+			keep:       []string{"anthropic"},
+			wantFlat:   map[string]any{"openai.access": "new", "openai.accountId": "new-acct", "openai.refresh": "new-r", "openai.expires": json.Number("1777014899000"), "openai.type": "oauth"},
+			wantNested: map[string]any{"access": "new", "accountId": "new-acct", "refresh": "new-r", "expires": json.Number("1777014899000"), "type": "oauth"},
+		},
+		{
+			name:     "nested object absent from file is not invented; absent source fields are removed",
+			seed:     `{"openai.access":"old","openai.accountId":"old-acct","openai.refresh":"old-r","openai.expires":1,"openai.type":"oauth","other":"keep"}`,
+			account:  map[string]any{"access": "new"},
+			keep:     []string{"other"},
+			wantFlat: map[string]any{"openai.access": "new"},
+		},
+		{
+			name:       "unrelated providers and custom openai.* keys are preserved",
+			seed:       `{"openai.access":"old","openai.workspaceId":"ws-1","openai.notes":"keep","openai":{"access":"old","workspaceId":"ws-1"},"anthropic":{"k":"v"}}`,
+			account:    fullOAuth("new", "new-r", 3),
+			keep:       []string{"anthropic", "openai.workspaceId", "openai.notes", "ws-1"},
+			wantFlat:   map[string]any{"openai.access": "new", "openai.accountId": "new-acct", "openai.refresh": "new-r", "openai.expires": json.Number("3"), "openai.type": "oauth"},
+			wantNested: map[string]any{"access": "new", "accountId": "new-acct", "refresh": "new-r", "expires": json.Number("3"), "type": "oauth"},
+		},
+	}
+	for _, tt := range cases {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			authFile := filepath.Join(t.TempDir(), "auth.json")
+			seedAuthFile(t, authFile, tt.seed)
+			if err := updateOpenAIAuthFile(authFile, tt.account); err != nil {
+				t.Fatalf("updateOpenAIAuthFile: %v", err)
+			}
+			payload := readJSONObject(t, authFile)
+			for _, k := range tt.keep {
+				if !containsAny(payload, k) {
+					t.Fatalf("key/value %q dropped: %v", k, payload)
+				}
+			}
+			for k, want := range tt.wantFlat {
+				if got := payload[k]; got != want {
+					t.Fatalf("flat %s: got %#v, want %#v", k, got, want)
+				}
+			}
+			if tt.wantNested != nil {
+				nested, ok := payload["openai"].(map[string]any)
+				if !ok {
+					t.Fatalf("nested openai map missing")
+				}
+				for k, want := range tt.wantNested {
+					if got := nested[k]; got != want {
+						t.Fatalf("nested %s: got %#v, want %#v", k, got, want)
+					}
+				}
+			}
+		})
+	}
+}
+
+func TestActivateAccountAndRuntimeFlow(t *testing.T) {
+	t.Parallel()
+	expiry := int64(1777014899000)
+
+	t.Run("validation failure leaves both auth files unchanged", func(t *testing.T) {
+		t.Parallel()
+		oc, pi, _ := piSyncFixture(t)
+		ocSeed := `{"openai.access":"keep-opencode","other":"keep"}`
+		piSeed := `{"openai-codex":{"access":"keep-pi"},"anthropic":{"k":"v"}}`
+		seedAuthFile(t, oc, ocSeed)
+		seedAuthFile(t, pi, piSeed)
+		err := activateAccount(config{AuthFile: oc, PiAuthFile: pi}, map[string]any{"user_id": "user-1", "accountId": "acct-1", "access": "x"})
+		if err == nil {
+			t.Fatalf("expected validation error")
+		}
+		for _, want := range []string{"refresh", "expires"} {
+			if !strings.Contains(err.Error(), want) {
+				t.Fatalf("error should name %q, got %v", want, err)
+			}
+		}
+		for _, leak := range []string{"keep-opencode", "keep-pi", "fixture"} {
+			if strings.Contains(err.Error(), leak) {
+				t.Fatalf("error leaked %q: %v", leak, err)
+			}
+		}
+		for _, p := range []struct{ path, seed string }{{oc, ocSeed}, {pi, piSeed}} {
+			if data, _ := os.ReadFile(p.path); string(data) != p.seed {
+				t.Fatalf("%s altered: %s", p.path, string(data))
+			}
+		}
+	})
+
+	t.Run("successful activation updates both auth files coherently", func(t *testing.T) {
+		t.Parallel()
+		oc, pi, _ := piSyncFixture(t)
+		seedAuthFile(t, oc, `{"other":"keep"}`)
+		seedAuthFile(t, pi, `{"anthropic":{"access":"anth"}}`)
+		if err := activateAccount(config{AuthFile: oc, PiAuthFile: pi}, fixturePiAccount()); err != nil {
+			t.Fatalf("activateAccount: %v", err)
+		}
+		ocP := readJSONObject(t, oc)
+		if ocP["openai.access"] != "fixture-access-token" || ocP["openai.expires"] != json.Number("1777014899000") || ocP["openai.type"] != "oauth" {
+			t.Fatalf("OpenCode tuple not updated: %v", ocP)
+		}
+		assertPiCodex(t, readJSONObject(t, pi), "fixture-access-token", "fixture-refresh-token", 1777014899000, "acct-1")
+	})
+
+	t.Run("empty PiAuthFile skips Pi sync; partial-sync error names both stores", func(t *testing.T) {
+		t.Parallel()
+		oc, pi, _ := piSyncFixture(t)
+		piSeed := `{"openai-codex":{"access":"keep-pi"}}`
+		seedAuthFile(t, oc, `{}`)
+		seedAuthFile(t, pi, piSeed)
+		if err := activateAccount(config{AuthFile: oc, PiAuthFile: ""}, fixturePiAccount()); err != nil {
+			t.Fatalf("activateAccount: %v", err)
+		}
+		if data, _ := os.ReadFile(pi); string(data) != piSeed {
+			t.Fatalf("Pi altered despite empty PiAuthFile: %s", string(data))
+		}
+		piAsDir := filepath.Join(filepath.Dir(oc), "pi-as-dir")
+		_ = os.MkdirAll(piAsDir, 0o700)
+		seedAuthFile(t, oc, `{}`)
+		err := activateAccount(config{AuthFile: oc, PiAuthFile: piAsDir}, fixturePiAccount())
+		if err == nil {
+			t.Fatalf("expected partial-sync error")
+		}
+		for _, want := range []string{"OpenCode", "Pi"} {
+			if !strings.Contains(err.Error(), want) {
+				t.Fatalf("partial-sync error should mention %q, got %v", want, err)
+			}
+		}
+		for _, leak := range []string{"fixture-access-token", "fixture-refresh-token", "acct-1"} {
+			if strings.Contains(err.Error(), leak) {
+				t.Fatalf("partial-sync error leaked %q: %v", leak, err)
+			}
+		}
+	})
+
+	t.Run("`use` rotates both auth files; manual change preserves unrelated providers", func(t *testing.T) {
+		t.Parallel()
+		oc, pi, accounts := piSyncFixture(t)
+		seedAuthFile(t, oc, `{"openai.access":"active-access","openai.accountId":"active-acct","other":"keep"}`)
+		seedAuthFile(t, pi, `{"anthropic":{"access":"anth"}}`)
+		writeStore(t, accounts,
+			map[string]any{"user_id": "user-active", "accountId": "active-acct", "access": "active-access", "refresh": "active-refresh", "expires": expiry, "type": "oauth", "email": "active@example.com"},
+			map[string]any{"user_id": "user-other", "accountId": "other-acct", "access": "other-access", "refresh": "other-refresh", "expires": expiry, "type": "oauth", "email": "other@example.com"},
+		)
+		var out strings.Builder
+		err := runWithArgs(context.Background(), config{
+			AuthFile: oc, PiAuthFile: pi, AccountsFile: accounts,
+			UsageURL: "http://unused.local", HTTPClient: http.DefaultClient,
+		}, &out, []string{"use", "other@example.com"})
+		if err != nil {
+			t.Fatalf("use: %v", err)
+		}
+		if strings.Contains(out.String(), "other-access") || strings.Contains(out.String(), "other-refresh") {
+			t.Fatalf("stdout leaked credential: %q", out.String())
+		}
+		ocP := readJSONObject(t, oc)
+		if ocP["openai.access"] != "other-access" || ocP["other"] != "keep" {
+			t.Fatalf("OpenCode not rotated: %v", ocP)
+		}
+		assertPiCodex(t, readJSONObject(t, pi), "other-access", "other-refresh", expiry, "other-acct")
+	})
+
+	t.Run("automatic rotation syncs the rotated account to Pi", func(t *testing.T) {
+		t.Parallel()
+		body := fmt.Sprintf(`{"user_id":"user-current","rate_limit":{"primary_window":{"used_percent":99,"reset_at":%d}}}`, time.Now().Unix()+86400*5)
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte(body)) }))
+		defer server.Close()
+		oc, pi, accounts := piSyncFixture(t)
+		seedAuthFile(t, oc, `{"openai.access":"current-access","openai.accountId":"current-acct"}`)
+		seedAuthFile(t, pi, `{"anthropic":{"k":"v"}}`)
+		writeStore(t, accounts,
+			map[string]any{"user_id": "user-current", "access": "current-access", "accountId": "current-acct"},
+			map[string]any{"user_id": "user-other", "access": "other-access", "accountId": "other-acct", "refresh": "other-refresh", "expires": expiry, "type": "oauth", "email": "other@example.com"},
+		)
+		var out strings.Builder
+		if err := runWithArgs(context.Background(), config{
+			AuthFile: oc, PiAuthFile: pi, AccountsFile: accounts,
+			UsageURL: server.URL, HTTPClient: server.Client(),
+		}, &out, nil); err != nil {
+			t.Fatalf("runWithArgs: %v", err)
+		}
+		if !strings.Contains(out.String(), "99") {
+			t.Fatalf("expected stdout 99, got %q", out.String())
+		}
+		piP := readJSONObject(t, pi)
+		assertPiCodex(t, piP, "other-access", "other-refresh", expiry, "other-acct")
+		if _, present := piP["anthropic"]; !present {
+			t.Fatalf("Pi unrelated provider dropped after rotation")
+		}
+	})
+
+	t.Run("registration and listing leave both auth files untouched", func(t *testing.T) {
+		t.Parallel()
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			_, _ = w.Write([]byte(`{"user_id":"user-1","email":"u@example.com","rate_limit":{"primary_window":{"used_percent":50,"reset_at":1777014899}}}`))
+		}))
+		defer server.Close()
+		oc, pi, accounts := piSyncFixture(t)
+		seedAuthFile(t, oc, `{"openai.access":"active-access","openai.refresh":"active-refresh","openai.expires":1777014899000,"openai.accountId":"active-acct"}`)
+		piSeed := `{"openai-codex":{"access":"keep-pi","refresh":"keep-pi-r","expires":100,"accountId":"keep-pi-acct"},"anthropic":{"k":"v"}}`
+		seedAuthFile(t, pi, piSeed)
+		cfg := config{AuthFile: oc, PiAuthFile: pi, AccountsFile: accounts, UsageURL: server.URL, HTTPClient: server.Client()}
+		for _, sub := range []struct {
+			name string
+			args []string
+		}{{"registration", nil}, {"listing", []string{"accounts"}}} {
+			var out strings.Builder
+			if err := runWithArgs(context.Background(), cfg, &out, sub.args); err != nil {
+				t.Fatalf("runWithArgs %s: %v", sub.name, err)
+			}
+			if data, _ := os.ReadFile(pi); string(data) != piSeed {
+				t.Fatalf("Pi altered during %s: %s", sub.name, string(data))
+			}
+		}
+	})
+}
+
+func TestDefaultConfigResolvesPiAuthFile(t *testing.T) {
+	fakeHome := t.TempDir()
+	customDir := t.TempDir()
+	cases := []struct {
+		name string
+		env  string
+		want string
+	}{
+		{"default home expands to ~/.pi/agent/auth.json", "", filepath.Join(fakeHome, ".pi", "agent", "auth.json")},
+		{"PI_CODING_AGENT_DIR overrides directory and appends auth.json", customDir, filepath.Join(customDir, "auth.json")},
+		{"tilde (separator form) expands to home directory", "~" + string(filepath.Separator) + "my-pi", filepath.Join(fakeHome, "my-pi", "auth.json")},
+		{"bare tilde expands to home and still appends auth.json", "~", filepath.Join(fakeHome, "auth.json")},
+	}
+	for _, tt := range cases {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv("PI_CODING_AGENT_DIR", tt.env)
+			t.Setenv("HOME", fakeHome)
+			t.Setenv("USERPROFILE", fakeHome)
+			if cfg := defaultConfig(); cfg.PiAuthFile != tt.want {
+				t.Fatalf("expected PiAuthFile %q, got %q", tt.want, cfg.PiAuthFile)
+			}
+		})
+	}
 }

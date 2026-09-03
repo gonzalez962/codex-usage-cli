@@ -204,8 +204,98 @@ se bloquea por ausencia de datos).
 Si no hay candidatos elegibles, la cuenta activa no cambia y `stdout` sigue
 imprimiendo solo el `used_percent` de la ventana relevante.
 
+## Sincronización con Pi (`auth.json`)
+
+Además de actualizar el `auth.json` de OpenCode, la CLI sincroniza la cuenta
+activa al `auth.json` de Pi (por defecto `%USERPROFILE%\\.pi\\agent\\auth.json`,
+o `~/.pi/agent/auth.json` en Unix). La sincronización ocurre **únicamente**
+cuando la cuenta activa cambia:
+
+- `use <selector>` (cambio manual): sincroniza la cuenta seleccionada a Pi.
+- Rotación automática sin argumentos: sincroniza la cuenta alternativa elegida.
+
+El comando sin argumentos cuando la cuenta activa **no** cambia, `accounts`/`list`
+y la registración de la cuenta actual en el store **no** tocan ninguno de los
+dos archivos de auth.
+
+Cuando el cambio ocurre, la CLI actualiza ambos archivos de forma coherente:
+los campos OAuth de la cuenta seleccionada (`access`, `accountId`, `refresh`,
+`expires`, `type`) se propagan al `auth.json` de OpenCode en la
+representación plana `openai.*` (siempre) y en la anidada `openai` (solo
+si esa representación ya existía), y simultáneamente se construye la
+credencial de Pi que se describe abajo. Antes de tocar **ninguno** de los
+dos archivos, la CLI valida que la cuenta seleccionada traiga los campos
+OAuth requeridos; si falta alguno, ambos archivos quedan intactos y se
+devuelve un error que nombra los campos pero nunca sus valores.
+
+La entrada sincronizada vive bajo la clave de primer nivel `openai-codex` y se
+construye únicamente con los campos OAuth de la cuenta seleccionada:
+
+```json
+{
+  "openai-codex": {
+    "type": "oauth",
+    "access": "...",
+    "refresh": "...",
+    "expires": 1777014899000,
+    "accountId": "..."
+  }
+}
+```
+
+- `expires` se expresa en milisegundos desde epoch.
+- `type` **siempre** se serializa como `"oauth"`. Si la cuenta fuente omite
+  `type` (registro legado anterior a que Pi lo exigiera) la CLI lo normaliza
+  a `"oauth"` antes de escribir; una cuenta que declare un `type` distinto
+  de `"oauth"` rechaza el cambio con un error que nombra el campo pero
+  **nunca** sus valores.
+- `accountId` se incluye solo si está presente y no está vacío.
+- Metadatos de uso (`usedPercent`, `resetAt`, `secondaryUsedPercent`,
+  `secondaryResetAt`, `cooldownUntil`) y de identidad (`user_id`, `email`)
+  nunca se copian a la credencial de Pi.
+
+La actualización reemplaza **únicamente** la entrada `openai-codex` preservando
+las claves y valores de cualquier otro provider (por ejemplo `anthropic`,
+`google`, etc.) y sus valores anidados. El formateo del archivo
+(espacios, orden de claves) puede variar porque la CLI lo re-marshala, pero
+las claves, los valores escalares y la estructura se conservan exactamente.
+Para números grandes más allá del rango entero exacto de `float64`
+(> 2⁵³) el archivo se decodifica con `UseNumber`, así que la proyección
+nunca trunca ni redondea identificadores enteros de otros providers.
+
+El archivo se crea con permisos `0600` y, cuando la CLI tiene que crearlo
+desde cero, el directorio padre se crea con `0700`. Un archivo POSIX
+existente se ajusta a `0600` **antes** de escribirlo (si el `chmod` falla
+la escritura se aborta sin tocar el contenido). Si el JSON está malformado,
+si el archivo está vacío (rechazado igual que `JSON.parse` de Pi) o si el
+contenido de primer nivel no es un objeto, la CLI aborta sin sobrescribir.
+
+La CLI adquiere el lock `${auth.json}.lock` como un directorio atómico
+(protocolo `proper-lockfile` de Pi), reintentando hasta 10 veces con
+esperas de 20 ms; nunca borra un lock que no creó. El lock cubre la
+secuencia completa de lectura/modificación/escritura y se libera al
+retornar, incluso en error.
+
+### Cuándo falla la sincronización
+
+La sincronización valida la cuenta seleccionada **antes** de modificar
+cualquier archivo de auth. Si la cuenta no trae los campos OAuth requeridos
+(`access`, `refresh`, `expires` como entero de milisegundos, y `type` igual a
+`"oauth"` cuando está presente), la CLI devuelve un error claro que nombra
+los campos faltantes pero **nunca** sus valores, y deja ambos archivos de auth
+intactos.
+
+Si la actualización de OpenCode tiene éxito pero la escritura a Pi falla, la
+CLI devuelve un error explícito de sincronización parcial que nombra ambos
+stores y tampoco filtra credenciales.
+
 ## Variables de entorno
 - `OPENCODE_AUTH_FILE`: ruta del `auth.json` de OpenCode.
+- `PI_CODING_AGENT_DIR`: ruta del directorio donde Pi guarda su `auth.json`. Si
+  está definida y no está vacía, la CLI la usa como override de directorio y
+  le anexa `auth.json`. Se admite el prefijo `~` (Pi semantics), que se
+  expande al directorio home del usuario. Por defecto se usa
+  `%USERPROFILE%\\.pi\\agent\\auth.json` (o `~/.pi/agent/auth.json` en Unix).
 - `CODEX_USAGE_ACCOUNTS_FILE`: ruta del archivo de cuentas persistidas.
 - `CODEX_USAGE_CONFIG_FILE`: ruta del archivo de configuración del toggle de 5 horas.
 
@@ -216,12 +306,30 @@ $env:OPENCODE_AUTH_FILE="C:\\ruta\\auth.json"
 ```
 
 ```powershell
+$env:PI_CODING_AGENT_DIR="C:\\ruta\\pi" # la CLI usará C:\\ruta\\pi\\auth.json
+```
+
+```powershell
+$env:PI_CODING_AGENT_DIR="~/mi-pi" # la CLI expande ~ al home del usuario
+```
+
+```powershell
 $env:CODEX_USAGE_ACCOUNTS_FILE="C:\\ruta\\openai-accounts.json"
 ```
 
 ```powershell
 $env:CODEX_USAGE_CONFIG_FILE="C:\\ruta\\config.json"
 ```
+
+## Seguridad
+
+La CLI nunca imprime `openai.access`, refresh tokens ni el contenido completo
+de los `auth.json` (OpenCode o Pi) en respuestas, logs o mensajes de error.
+Los errores de validación o sincronización parcial nombran los campos
+afectados pero **nunca** sus valores. La salida de `use` confirma el email y
+`user_id` de la cuenta activa y omite el access token. Los archivos de auth
+se crean y mantienen con permisos `0600` en POSIX para evitar filtraciones
+laterales.
 
 ## Tests
 ```powershell

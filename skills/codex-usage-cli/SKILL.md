@@ -34,6 +34,11 @@ metadata:
 - Con el toggle **desactivado**, la CLI ignora por completo la ventana de 5 horas (independiente de lo que el endpoint devuelva). Si la respuesta trae `secondary_window`, su valor semanal se **promueve** a la primaria canónica (UsedPercent/ResetAt) y los campos secundarios se limpian antes de persistir, rotar, calcular cooldown o imprimir. Si `secondary_window` está ausente o es `null`, se conserva `primary_window` como fallback semanal. El endpoint no cambia: la CLI reinterpreta la respuesta según el toggle.
 - Las filas de `accounts`/`list` se ordenan por `user_id` alfabéticamente. La columna `ID` es estable y se puede pasar a `use #<id>` (requiere el prefijo `#` para evitar colisiones con `user_id` numéricos como `1`/`2`/`10`).
 - Para cambiar la cuenta activa en OpenCode, usa `use <selector>` con el índice de `accounts`/`list` como `#<n>`, el `user_id` exacto, o el email (case-insensitive).
+- Adicionalmente al `auth.json` de OpenCode, la CLI sincroniza la cuenta activa al `auth.json` de Pi (clave de primer nivel `openai-codex`) cuando la cuenta activa **cambia**: `use <selector>` y la rotación automática. El comando sin argumentos sin rotación, `accounts`/`list` y la registración de la cuenta actual en el store **no** tocan ninguno de los dos `auth.json`. Por defecto el archivo es `%USERPROFILE%\.pi\agent\auth.json` (o `~/.pi/agent/auth.json` en Unix). La variable `PI_CODING_AGENT_DIR` sobreescribe el directorio y le anexa `auth.json`; acepta el prefijo `~` (semántica Pi).
+- Cuando hay cambio, la CLI propaga los campos OAuth de la cuenta seleccionada (`access`, `accountId`, `refresh`, `expires`, `type`) al `auth.json` de OpenCode tanto en la representación plana `openai.*` como en la anidada `openai` (si esta última ya existía), preservando cualquier otro provider y los campos personalizados bajo `openai.*`. Los campos que la cuenta fuente no trae se eliminan de ambas representaciones para que no sobreviva valor obsoleto de la cuenta anterior.
+- La credencial sincronizada a Pi se construye **solo** con los campos OAuth de la cuenta seleccionada: `type` (siempre `"oauth"`; la CLI normaliza registros legados que omiten `type`), `access`, `refresh`, `expires` (entero de milisegundos desde epoch, validado sin truncar) y `accountId` (omitido si está ausente o vacío). Metadatos de uso (`usedPercent`, `resetAt`, `secondaryUsedPercent`, `secondaryResetAt`, `cooldownUntil`) y de identidad (`user_id`, `email`) **nunca** se copian a Pi.
+- La actualización a Pi reemplaza únicamente la entrada `openai-codex`, preservando las claves y valores de cualquier otro provider (`anthropic`, `google`, etc.) y sus valores anidados. El formateo del archivo (espacios, orden de claves) puede variar porque la CLI lo re-marshala; el archivo se decodifica con `UseNumber` para que números grandes de otros providers (>2⁵³) sobrevivan la lectura/modificación/escritura sin redondeo. El archivo se crea con `0600` y, cuando hay que crearlo, el directorio padre se crea con `0700`; en POSIX un archivo existente se ajusta a `0600` **antes** de escribir. Si la CLI no puede ajustar permisos, aborta sin tocar credenciales. Un archivo vacío se rechaza como malformado (mismo comportamiento que `JSON.parse` de Pi). La CLI adquiere el lock `${auth.json}.lock` como directorio atómico (protocolo `proper-lockfile` de Pi), 10 intentos × 20 ms, y nunca borra locks que no creó.
+- Si la cuenta seleccionada no trae los campos OAuth requeridos, la CLI falla con un error claro que **nombra** los campos faltantes pero **nunca** sus valores, y deja ambos `auth.json` intactos. Si OpenCode se actualiza pero la escritura a Pi falla, la CLI devuelve un error de sincronización parcial que nombra ambos stores y tampoco filtra credenciales.
 - Umbrales de rotación y cooldown:
   - Toggle **activado**: 5 horas agotada al **80%**, semanal al **98%**. Si ambas ventanas están agotadas, el cooldown persiste hasta el reset más tardío.
   - Toggle **desactivado**: semanal al **98%**, cooldown hasta el reset de esa ventana.
@@ -47,7 +52,7 @@ metadata:
   | desactivado | semanal pura | 98% con `resetAt` futuro | n/a | se respeta |
 
   Si el reset ya pasó o nunca se persistió, el uso alto se considera obsoleto y la cuenta vuelve a ser elegible. Bajo toggle **desactivado** con candidato `dual`, los datos semanales faltantes se tratan como desconocidos y el candidato queda elegible (regla conservadora).
-- Nunca expongas `openai.access`, bearer tokens ni contenido completo de `auth.json` en respuestas al usuario. `use` no imprime tokens; solo confirma email y `user_id`. El comando `config 5h` nunca toca auth ni cuentas guardadas, así que puede ejecutarse incluso antes de registrar cuentas.
+- Nunca expongas `openai.access`, bearer tokens ni contenido completo de los `auth.json` (OpenCode o Pi) en respuestas al usuario. Los errores de validación o de sincronización parcial nombran los campos afectados pero **nunca** sus valores. `use` no imprime tokens; solo confirma email y `user_id`. El comando `config 5h` nunca toca auth ni cuentas guardadas, así que puede ejecutarse incluso antes de registrar cuentas.
 
 ## Commands
 
@@ -147,15 +152,25 @@ $env:CODEX_USAGE_ACCOUNTS_FILE="C:\ruta\openai-accounts.json"; codex-usage-cli a
 $env:CODEX_USAGE_CONFIG_FILE="C:\ruta\config.json"; codex-usage-cli config 5h
 ```
 
+```powershell
+$env:PI_CODING_AGENT_DIR="C:\ruta\pi"; codex-usage-cli use #2
+# También acepta el prefijo ~ para apuntar al home del usuario.
+```
+
+`PI_CODING_AGENT_DIR` es un override de **directorio**; la CLI le anexa
+`auth.json`. Por defecto se usa `%USERPROFILE%\.pi\agent\auth.json`
+(`~/.pi/agent/auth.json` en Unix).
+
 ## Agent Workflow
 
 1. Para una respuesta automática o scriptable, ejecuta `codex-usage-cli` y trata stdout como un número (ventana 5h con toggle activado y doble ventana disponible; semanal en cualquier otro caso).
 2. Para una respuesta al usuario sobre varias cuentas, ejecuta `codex-usage-cli accounts`.
 3. Resume la tabla Markdown sin incluir tokens ni rutas sensibles. Recuerda que las columnas cambian según el toggle (`USED%/WEEK%` vs solo `WEEK%`).
 4. Si la cuenta activa aparece con uso alto, menciona el tiempo restante de reset (5h o semanal según corresponda) y si hay otras cuentas disponibles según la tabla.
-5. Si el usuario quiere rotar manualmente a otra cuenta, ejecuta `codex-usage-cli use <selector>` usando `#<ID>`, el `user_id` o el email de la tabla. Confirma el cambio sin imprimir tokens.
+5. Si el usuario quiere rotar manualmente a otra cuenta, ejecuta `codex-usage-cli use <selector>` usando `#<ID>`, el `user_id` o el email de la tabla. Confirma el cambio sin imprimir tokens. El cambio manual también sincroniza la cuenta seleccionada al `auth.json` de Pi bajo la clave `openai-codex`.
 6. Si necesitas consultar o cambiar el toggle de 5 horas, ejecuta `codex-usage-cli config 5h` (lee), `config 5h on` o `config 5h off` (escribe). No requiere auth ni cuentas.
 7. Si el comando falla por falta de cuentas guardadas, indica que primero debe ejecutarse el CLI con cada cuenta configurada en OpenCode para registrarla.
+8. Si la sincronización a Pi falla (validación o escritura), el error nombra los stores y los campos afectados pero nunca valores de credenciales. Repórtalo al usuario sin incluir rutas sensibles (`~/.pi/agent/auth.json`).
 
 ## Installation Check
 
