@@ -10,3 +10,5 @@ dist/
 # gentle-ai local artifacts (skill registry cache, etc.)
 /.atl/
 opencode.jsonc
+# Local Pi runtime state
+.atl/

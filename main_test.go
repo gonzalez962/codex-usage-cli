@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"testing"
@@ -581,7 +582,7 @@ func TestSelectEligibleAlternateAccountSkipsCoolingDown(t *testing.T) {
 		},
 	}
 
-	selected, ok := selectEligibleAlternateAccount(store, "user-current", now)
+	selected, ok := selectEligibleAlternateAccount(store, "user-current", now, false)
 	if !ok {
 		t.Fatalf("expected an eligible alternate account")
 	}
@@ -1363,7 +1364,7 @@ func TestSelectEligibleAlternateAccountSkipsWeeklyExhausted(t *testing.T) {
 		},
 	}
 
-	selected, ok := selectEligibleAlternateAccount(store, "user-current", now)
+	selected, ok := selectEligibleAlternateAccount(store, "user-current", now, false)
 	if !ok {
 		t.Fatalf("expected an eligible alternate account")
 	}
@@ -1394,7 +1395,7 @@ func TestSelectEligibleAlternateAccountEligibleAfterPrimaryResetExpires(t *testi
 		},
 	}
 
-	selected, ok := selectEligibleAlternateAccount(store, "user-current", now)
+	selected, ok := selectEligibleAlternateAccount(store, "user-current", now, false)
 	if !ok {
 		t.Fatalf("expected candidate with expired reset to be eligible")
 	}
@@ -1424,7 +1425,7 @@ func TestSelectEligibleAlternateAccountEligibleWhenResetMissingEntirely(t *testi
 		},
 	}
 
-	selected, ok := selectEligibleAlternateAccount(store, "user-current", now)
+	selected, ok := selectEligibleAlternateAccount(store, "user-current", now, false)
 	if !ok {
 		t.Fatalf("expected candidate with missing reset to be eligible")
 	}
@@ -1460,7 +1461,7 @@ func TestSelectEligibleAlternateAccountSkipsHotWithFutureReset(t *testing.T) {
 		},
 	}
 
-	selected, ok := selectEligibleAlternateAccount(store, "user-current", now)
+	selected, ok := selectEligibleAlternateAccount(store, "user-current", now, false)
 	if !ok {
 		t.Fatalf("expected an eligible alternate account")
 	}
@@ -1484,7 +1485,7 @@ func TestAccountWithUsageSetsCooldownWhenWeeklyExhausted(t *testing.T) {
 		UsedPercent: "99",
 		ResetAt:     int64Ptr(primaryReset),
 		UserID:      "user-primary",
-	})
+	}, false)
 
 	if got, ok := valueToInt64(updated["cooldownUntil"]); !ok || got != primaryReset {
 		t.Fatalf("expected cooldownUntil to be the weekly reset %d, got %v", primaryReset, updated["cooldownUntil"])
@@ -1514,7 +1515,7 @@ func TestAccountWithUsageClearsCooldownWhenBelowThreshold(t *testing.T) {
 		UsedPercent: "35",
 		ResetAt:     int64Ptr(primaryReset),
 		UserID:      "user-no-secondary",
-	})
+	}, false)
 
 	if _, exists := updated["cooldownUntil"]; exists {
 		t.Fatalf("expected cooldownUntil to be cleared when usage is below threshold, got %v", updated["cooldownUntil"])
@@ -1649,12 +1650,11 @@ func TestExtractUsageWindowAcceptsNullSecondaryWindow(t *testing.T) {
 	}
 }
 
-func TestExtractUsageWindowIgnoresPresentSecondaryWindow(t *testing.T) {
+func TestExtractUsageWindowPopulatesSecondaryWindow(t *testing.T) {
 	t.Parallel()
 
-	// Even if upstream sends an object-shaped secondary_window (e.g. an old
-	// cached response), the parser must accept it without using the value
-	// and without erroring.
+	// When the API exposes an object-shaped secondary_window, the parser
+	// must extract both `used_percent` and `reset_at` without erroring.
 	payload := map[string]any{
 		"user_id": "user-legacy-secondary",
 		"rate_limit": map[string]any{
@@ -1671,7 +1671,7 @@ func TestExtractUsageWindowIgnoresPresentSecondaryWindow(t *testing.T) {
 
 	window, err := extractUsageWindow(payload)
 	if err != nil {
-		t.Fatalf("extractUsageWindow returned error for present secondary_window: %v", err)
+		t.Fatalf("extractUsageWindow returned error: %v", err)
 	}
 
 	if window.UsedPercent != "11.0" {
@@ -1679,6 +1679,105 @@ func TestExtractUsageWindowIgnoresPresentSecondaryWindow(t *testing.T) {
 	}
 	if window.ResetAt == nil || *window.ResetAt != 1777014899 {
 		t.Fatalf("expected primary reset_at 1777014899, got %v", window.ResetAt)
+	}
+	if window.SecondaryUsedPercent != "3.25" {
+		t.Fatalf("expected secondary used_percent 3.25, got %q", window.SecondaryUsedPercent)
+	}
+	if window.SecondaryResetAt == nil || *window.SecondaryResetAt != 1777619699 {
+		t.Fatalf("expected secondary reset_at 1777619699, got %v", window.SecondaryResetAt)
+	}
+}
+
+// TestExtractUsageWindowSecondaryWindowErrors pins the malformed-secondary
+// contract: a non-null `secondary_window` that is not an object, that is
+// missing/null `used_percent`, or that has a malformed `used_percent`/`reset_at`,
+// must surface as an API error rather than silently fall back (and risk
+// interpreting the 5h primary as the weekly window). Missing/null
+// `secondary_window` itself remains the only valid fallback.
+func TestExtractUsageWindowSecondaryWindowErrors(t *testing.T) {
+	t.Parallel()
+
+	primaryWindow := map[string]any{
+		"used_percent": json.Number("11.0"),
+		"reset_at":     json.Number("1777014899"),
+	}
+
+	cases := []struct {
+		name     string
+		seconday any
+		wantErr  string // substring expected in the error; empty means no error
+	}{
+		{
+			name:     "non-object string secondary_window is an error",
+			seconday: "garbage",
+			wantErr:  "must be an object",
+		},
+		{
+			name:     "non-object numeric secondary_window is an error",
+			seconday: json.Number("42"),
+			wantErr:  "must be an object",
+		},
+		{
+			name: "malformed used_percent is an error",
+			seconday: map[string]any{
+				"used_percent": map[string]any{"nested": true},
+			},
+			wantErr: "used_percent",
+		},
+		{
+			name: "malformed reset_at is an error",
+			seconday: map[string]any{
+				"used_percent": json.Number("50"),
+				"reset_at":     []any{1, 2, 3},
+			},
+			wantErr: "reset_at",
+		},
+		{
+			name:     "empty object (no used_percent) is an error",
+			seconday: map[string]any{},
+			wantErr:  "used_percent",
+		},
+		{
+			name: "missing used_percent key is an error",
+			seconday: map[string]any{
+				"reset_at": json.Number("1777619699"),
+			},
+			wantErr: "used_percent",
+		},
+		{
+			name: "null used_percent is an error",
+			seconday: map[string]any{
+				"used_percent": nil,
+				"reset_at":     json.Number("1777619699"),
+			},
+			wantErr: "used_percent",
+		},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			payload := map[string]any{
+				"user_id": "user-mixed",
+				"rate_limit": map[string]any{
+					"primary_window":   primaryWindow,
+					"secondary_window": tc.seconday,
+				},
+			}
+			_, err := extractUsageWindow(payload)
+			if tc.wantErr == "" {
+				if err != nil {
+					t.Fatalf("expected no error for %q, got %v", tc.name, err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("expected error for %q, got nil", tc.name)
+			}
+			if !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("expected error to mention %q, got %v", tc.wantErr, err)
+			}
+		})
 	}
 }
 
@@ -2137,4 +2236,1189 @@ func mustReadStore(t *testing.T, accountsFile string) map[string]map[string]any 
 
 func int64Ptr(v int64) *int64 {
 	return &v
+}
+
+// mustReadFile reads content from path; used by the 5h toggle tests for
+// assertions on the persisted config file.
+func mustReadFile(t *testing.T, path string) []byte {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read %s: %v", path, err)
+	}
+	return data
+}
+
+// writeConfigFile writes content to the given path. Production save paths use
+// 0o600; tests share the helper for both pre-seeded files and follow-up reads.
+func writeConfigFile(t *testing.T, path, content string) {
+	t.Helper()
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatalf("write config file: %v", err)
+	}
+}
+
+// -----------------------------------------------------------------------------
+// 5h toggle contract: load/save, normalization, dual response mapping, and the
+// `config` subcommand. These tests pin the small surface the CLI exposes for
+// toggling 5h mode and document the OFF-promotes-weekly contract.
+// -----------------------------------------------------------------------------
+
+// TestLoadFiveHourConfig is the contract for the loader: missing file, missing
+// key, on/off string reads, boolean reads, invalid values, malformed JSON, and
+// the empty-path (the no-config-at-all runtime contract) all default to ON.
+func TestLoadFiveHourConfig(t *testing.T) {
+	t.Parallel()
+
+	type want struct {
+		enabled bool
+		err     bool
+	}
+	tests := []struct {
+		name    string
+		setup   func(t *testing.T) string
+		content string
+		want    want
+	}{
+		{name: "empty path defaults to ON", setup: func(t *testing.T) string { return "" }, want: want{enabled: true}},
+		{name: "missing file defaults to ON", setup: func(t *testing.T) string { return filepath.Join(t.TempDir(), "missing.json") }, want: want{enabled: true}},
+		{name: "missing key defaults to ON", setup: func(t *testing.T) string { return filepath.Join(t.TempDir(), "config.json") }, content: `{"other":"kept"}`, want: want{enabled: true}},
+		{name: "reads on", setup: func(t *testing.T) string {
+			p := filepath.Join(t.TempDir(), "c.json")
+			writeConfigFile(t, p, `{"5h":"on"}`)
+			return p
+		}, want: want{enabled: true}},
+		{name: "reads off", setup: func(t *testing.T) string {
+			p := filepath.Join(t.TempDir(), "c.json")
+			writeConfigFile(t, p, `{"5h":"off"}`)
+			return p
+		}, want: want{enabled: false}},
+		{name: "boolean true", setup: func(t *testing.T) string {
+			p := filepath.Join(t.TempDir(), "c.json")
+			writeConfigFile(t, p, `{"5h":true}`)
+			return p
+		}, want: want{enabled: true}},
+		{name: "boolean false", setup: func(t *testing.T) string {
+			p := filepath.Join(t.TempDir(), "c.json")
+			writeConfigFile(t, p, `{"5h":false}`)
+			return p
+		}, want: want{enabled: false}},
+		{name: "invalid string", setup: func(t *testing.T) string {
+			p := filepath.Join(t.TempDir(), "c.json")
+			writeConfigFile(t, p, `{"5h":"maybe"}`)
+			return p
+		}, want: want{err: true}},
+		{name: "invalid number", setup: func(t *testing.T) string {
+			p := filepath.Join(t.TempDir(), "c.json")
+			writeConfigFile(t, p, `{"5h":42}`)
+			return p
+		}, want: want{err: true}},
+		{name: "malformed JSON", setup: func(t *testing.T) string {
+			p := filepath.Join(t.TempDir(), "c.json")
+			writeConfigFile(t, p, `{bad`)
+			return p
+		}, want: want{err: true}},
+	}
+	for _, tc := range tests {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			path := tc.setup(t)
+			enabled, err := loadFiveHourConfig(path)
+			if tc.want.err {
+				if err == nil {
+					t.Fatalf("expected error, got enabled=%v", enabled)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("loadFiveHourConfig: %v", err)
+			}
+			if enabled != tc.want.enabled {
+				t.Fatalf("enabled=%v, want %v", enabled, tc.want.enabled)
+			}
+		})
+	}
+}
+
+// TestSaveFiveHourConfig pins the writer: on/off write the expected string,
+// unknown keys are preserved, and the parent directory is created on demand.
+func TestSaveFiveHourConfig(t *testing.T) {
+	t.Parallel()
+
+	t.Run("writes on", func(t *testing.T) {
+		t.Parallel()
+		path := filepath.Join(t.TempDir(), "config.json")
+		if err := saveFiveHourConfig(path, true); err != nil {
+			t.Fatalf("save: %v", err)
+		}
+		var payload map[string]any
+		if err := json.Unmarshal(mustReadFile(t, path), &payload); err != nil {
+			t.Fatalf("parse: %v", err)
+		}
+		if got, _ := payload["5h"].(string); got != "on" {
+			t.Fatalf("expected 5h=on, got %v", payload["5h"])
+		}
+	})
+
+	t.Run("writes off and preserves unknown keys", func(t *testing.T) {
+		t.Parallel()
+		path := filepath.Join(t.TempDir(), "config.json")
+		writeConfigFile(t, path, `{"other":"kept","nested":{"x":1}}`)
+		if err := saveFiveHourConfig(path, false); err != nil {
+			t.Fatalf("save: %v", err)
+		}
+		var payload map[string]any
+		if err := json.Unmarshal(mustReadFile(t, path), &payload); err != nil {
+			t.Fatalf("parse: %v", err)
+		}
+		if got, _ := payload["5h"].(string); got != "off" {
+			t.Fatalf("expected 5h=off, got %v", payload["5h"])
+		}
+		if got, _ := payload["other"].(string); got != "kept" {
+			t.Fatalf("expected unknown key preserved, got %v", payload["other"])
+		}
+		if _, ok := payload["nested"]; !ok {
+			t.Fatalf("expected nested object preserved, got %v", payload)
+		}
+	})
+
+	t.Run("creates parent directory", func(t *testing.T) {
+		t.Parallel()
+		path := filepath.Join(t.TempDir(), "nested", "subdir", "config.json")
+		if err := saveFiveHourConfig(path, true); err != nil {
+			t.Fatalf("save: %v", err)
+		}
+		if _, err := os.Stat(path); err != nil {
+			t.Fatalf("expected config file to exist: %v", err)
+		}
+	})
+
+	t.Run("rejects empty path", func(t *testing.T) {
+		t.Parallel()
+		if err := saveFiveHourConfig("", true); err == nil {
+			t.Fatalf("expected error for empty config path")
+		}
+	})
+
+	// Permissions tightening: a pre-existing file with looser mode must be
+	// chmod'd to 0o600 after save. os.WriteFile only applies 0o600 on initial
+	// creation, so without the explicit chmod an existing 0o644 file would keep
+	// its permissive mode. Skipped on Windows where chmod is a no-op.
+	t.Run("tightens pre-existing permissive file to 0o600", func(t *testing.T) {
+		if runtime.GOOS == "windows" {
+			t.Skip("chmod is a no-op on Windows")
+		}
+		t.Parallel()
+		path := filepath.Join(t.TempDir(), "config.json")
+		if err := os.WriteFile(path, []byte(`{"other":"kept"}`), 0o644); err != nil {
+			t.Fatalf("seed permissive file: %v", err)
+		}
+		before, err := os.Stat(path)
+		if err != nil {
+			t.Fatalf("stat before: %v", err)
+		}
+		if mode := before.Mode().Perm(); mode != 0o644 {
+			t.Fatalf("expected seeded file mode 0o644, got %o", mode)
+		}
+		if err := saveFiveHourConfig(path, true); err != nil {
+			t.Fatalf("save: %v", err)
+		}
+		after, err := os.Stat(path)
+		if err != nil {
+			t.Fatalf("stat after: %v", err)
+		}
+		if mode := after.Mode().Perm(); mode != 0o600 {
+			t.Fatalf("expected file mode 0o600 after save, got %o", mode)
+		}
+		var payload map[string]any
+		if err := json.Unmarshal(mustReadFile(t, path), &payload); err != nil {
+			t.Fatalf("parse: %v", err)
+		}
+		if got, _ := payload["5h"].(string); got != "on" {
+			t.Fatalf("expected 5h=on, got %v", payload["5h"])
+		}
+		if got, _ := payload["other"].(string); got != "kept" {
+			t.Fatalf("expected unknown key preserved, got %v", payload["other"])
+		}
+	})
+}
+
+// TestRunConfigCommand covers the `config` subcommand end-to-end: enabling,
+// disabling, state reporting, malformed/invalid input, and the requirement
+// that auth/accounts are never consulted.
+func TestRunConfigCommand(t *testing.T) {
+	t.Parallel()
+
+	t.Run("writes on/off and reports state", func(t *testing.T) {
+		t.Parallel()
+		for _, enable := range []string{"on", "off"} {
+			enable := enable
+			t.Run(enable, func(t *testing.T) {
+				t.Parallel()
+				path := filepath.Join(t.TempDir(), "config.json")
+				var out strings.Builder
+				if err := runConfigCommand(config{ConfigFile: path}, &out, []string{"5h", enable}); err != nil {
+					t.Fatalf("runConfigCommand: %v", err)
+				}
+				if !strings.Contains(out.String(), enable) {
+					t.Fatalf("expected %q in output, got %q", enable, out.String())
+				}
+				var payload map[string]any
+				_ = json.Unmarshal(mustReadFile(t, path), &payload)
+				if got, _ := payload["5h"].(string); got != enable {
+					t.Fatalf("expected 5h=%s on disk, got %v", enable, payload["5h"])
+				}
+			})
+		}
+	})
+
+	t.Run("effective state", func(t *testing.T) {
+		t.Parallel()
+		for _, tc := range []struct {
+			name, content, want string
+		}{
+			{"on", `{"5h":"on"}`, "on"},
+			{"off", `{"5h":"off"}`, "off"},
+			{"missing defaults to on", "", "on"},
+		} {
+			tc := tc
+			t.Run(tc.name, func(t *testing.T) {
+				t.Parallel()
+				path := filepath.Join(t.TempDir(), "config.json")
+				if tc.content != "" {
+					writeConfigFile(t, path, tc.content)
+				}
+				var out strings.Builder
+				if err := runConfigCommand(config{ConfigFile: path}, &out, []string{"5h"}); err != nil {
+					t.Fatalf("runConfigCommand: %v", err)
+				}
+				if got := strings.TrimSpace(out.String()); got != tc.want {
+					t.Fatalf("got %q, want %q", got, tc.want)
+				}
+			})
+		}
+	})
+
+	t.Run("invalid value rejected", func(t *testing.T) {
+		t.Parallel()
+		if err := runConfigCommand(config{ConfigFile: filepath.Join(t.TempDir(), "c.json")}, &strings.Builder{}, []string{"5h", "maybe"}); err == nil {
+			t.Fatalf("expected error for invalid value")
+		}
+	})
+
+	t.Run("malformed config rejected", func(t *testing.T) {
+		t.Parallel()
+		path := filepath.Join(t.TempDir(), "config.json")
+		writeConfigFile(t, path, `{bad`)
+		if err := runConfigCommand(config{ConfigFile: path}, &strings.Builder{}, []string{"5h"}); err == nil {
+			t.Fatalf("expected error for malformed JSON")
+		}
+	})
+
+	t.Run("missing feature name rejected", func(t *testing.T) {
+		t.Parallel()
+		if err := runConfigCommand(config{ConfigFile: filepath.Join(t.TempDir(), "c.json")}, &strings.Builder{}, nil); err == nil {
+			t.Fatalf("expected error for missing feature")
+		}
+	})
+
+	t.Run("unknown feature rejected", func(t *testing.T) {
+		t.Parallel()
+		err := runConfigCommand(config{ConfigFile: filepath.Join(t.TempDir(), "c.json")}, &strings.Builder{}, []string{"unknown", "on"})
+		if err == nil || !strings.Contains(err.Error(), "unknown") {
+			t.Fatalf("expected unknown feature error, got %v", err)
+		}
+	})
+
+	t.Run("does not require auth or accounts file", func(t *testing.T) {
+		t.Parallel()
+		dir := t.TempDir()
+		var out strings.Builder
+		err := runConfigCommand(config{
+			AuthFile:     filepath.Join(dir, "missing-auth.json"),
+			AccountsFile: filepath.Join(dir, "missing-accounts.json"),
+			ConfigFile:   filepath.Join(dir, "config.json"),
+		}, &out, []string{"5h", "on"})
+		if err != nil {
+			t.Fatalf("config must work without auth/accounts, got: %v", err)
+		}
+	})
+}
+
+// TestRunWithArgsConfigRoutesBeforeAuthValidation pins the integration
+// contract: `config` is the only subcommand that must succeed with empty
+// AuthFile/AccountsFile/UsageURL. Every other command still rejects them.
+func TestRunWithArgsConfigRoutesBeforeAuthValidation(t *testing.T) {
+	t.Parallel()
+
+	t.Run("config 5h routes on/off/state without auth/accounts/usage", func(t *testing.T) {
+		t.Parallel()
+		for _, tc := range []struct {
+			name, arg, content, wantOutput, wantStored string
+		}{
+			{"on", "on", "", "on", "on"},
+			{"off", "off", "", "off", "off"},
+			{"state", "", `{"5h":"off"}`, "off", ""}, // pre-seeded, no write
+		} {
+			tc := tc
+			t.Run(tc.name, func(t *testing.T) {
+				t.Parallel()
+				path := filepath.Join(t.TempDir(), "config.json")
+				if tc.content != "" {
+					writeConfigFile(t, path, tc.content)
+				}
+				args := []string{"config", "5h"}
+				if tc.arg != "" {
+					args = append(args, tc.arg)
+				}
+				var out strings.Builder
+				if err := runWithArgs(context.Background(), config{
+					AuthFile: "", AccountsFile: "", UsageURL: "", ConfigFile: path,
+				}, &out, args); err != nil {
+					t.Fatalf("expected config to work without auth/accounts/usage, got: %v", err)
+				}
+				if got := strings.TrimSpace(out.String()); got != tc.wantOutput {
+					t.Fatalf("stdout=%q, want %q", got, tc.wantOutput)
+				}
+				if tc.wantStored != "" {
+					var payload map[string]any
+					_ = json.Unmarshal(mustReadFile(t, path), &payload)
+					if got, _ := payload["5h"].(string); got != tc.wantStored {
+						t.Fatalf("stored 5h=%q, want %q", got, tc.wantStored)
+					}
+				}
+			})
+		}
+	})
+
+	t.Run("empty ConfigFile reports clear error", func(t *testing.T) {
+		t.Parallel()
+		err := runWithArgs(context.Background(), config{ConfigFile: ""}, &strings.Builder{}, []string{"config", "5h", "on"})
+		if err == nil || !strings.Contains(err.Error(), "config file path is empty") {
+			t.Fatalf("expected clear empty-config error, got %v", err)
+		}
+	})
+
+	t.Run("non-config command still rejects empty Auth", func(t *testing.T) {
+		t.Parallel()
+		err := runWithArgs(context.Background(), config{
+			AuthFile: "", AccountsFile: "", UsageURL: "http://unused.invalid/",
+			ConfigFile: filepath.Join(t.TempDir(), "config.json"),
+		}, &strings.Builder{}, nil)
+		if err == nil || !strings.Contains(err.Error(), "auth file path is empty") {
+			t.Fatalf("expected auth file path error, got %v", err)
+		}
+	})
+}
+
+// TestDefaultConfig pins the env override and the documented default location
+// for the toggle config file.
+func TestDefaultConfig(t *testing.T) {
+	t.Run("env override wins", func(t *testing.T) {
+		custom := filepath.Join(t.TempDir(), "my-config.json")
+		t.Setenv("CODEX_USAGE_CONFIG_FILE", custom)
+		if cfg := defaultConfig(); cfg.ConfigFile != custom {
+			t.Fatalf("expected %q, got %q", custom, cfg.ConfigFile)
+		}
+	})
+
+	t.Run("default location is codex-usage-cli/config.json", func(t *testing.T) {
+		t.Setenv("CODEX_USAGE_CONFIG_FILE", "")
+		t.Setenv("HOME", "")
+		t.Setenv("USERPROFILE", t.TempDir())
+		cfg := defaultConfig()
+		want := filepath.Join(".local", "share", "codex-usage-cli", "config.json")
+		if !strings.HasSuffix(cfg.ConfigFile, want) {
+			t.Fatalf("expected path to end with %q, got %q", want, cfg.ConfigFile)
+		}
+	})
+}
+
+// TestRunWithArgsDefaults5hToOnWhenConfigFileEmpty is the zero-value contract:
+// a `config{}` constructed without a ConfigFile must still treat 5h as ON,
+// matching the documented runtime default. The CLI must rely on the loader as
+// the single source of truth for that default rather than the zero value.
+func TestRunWithArgsDefaults5hToOnWhenConfigFileEmpty(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"user_id":"user-1","rate_limit":{"primary_window":{"used_percent":35},"secondary_window":{"used_percent":60}}}`))
+	}))
+	defer server.Close()
+
+	dir := t.TempDir()
+	authFile := filepath.Join(dir, "auth.json")
+	if err := os.WriteFile(authFile, []byte(`{"openai.access":"token"}`), 0o600); err != nil {
+		t.Fatalf("write auth: %v", err)
+	}
+
+	var out strings.Builder
+	err := runWithArgs(context.Background(), config{
+		AuthFile:     authFile,
+		AccountsFile: filepath.Join(dir, "accounts.json"),
+		UsageURL:     server.URL,
+		HTTPClient:   server.Client(),
+		// ConfigFile intentionally empty; FiveHourEnabled intentionally false.
+	}, &out, nil)
+	if err != nil {
+		t.Fatalf("runWithArgs: %v", err)
+	}
+	// 5h ON + dual response: stdout reports the 5h primary (35), not the
+	// weekly secondary (60). If the loader's ON default is bypassed the test
+	// would see 60 because OFF promotes the weekly.
+	if out.String() != "35" {
+		t.Fatalf("expected 5h primary 35 (default 5h ON), got %q", out.String())
+	}
+}
+
+// TestNormalizeUsageForToggle is the single source of truth for the OFF/ON
+// mapping: stdout, persistence, rotation and cooldown all observe whatever
+// this helper returns. Each branch pins one contract.
+func TestNormalizeUsageForToggle(t *testing.T) {
+	t.Parallel()
+
+	primaryReset := int64(1777014899)
+	secondaryReset := int64(1777619699)
+	withBoth := usageWindow{
+		UsedPercent: "35", ResetAt: int64Ptr(primaryReset),
+		SecondaryUsedPercent: "60", SecondaryResetAt: int64Ptr(secondaryReset),
+	}
+	primaryOnly := usageWindow{UsedPercent: "35", ResetAt: int64Ptr(primaryReset)}
+
+	t.Run("5h on + dual keeps primary as 5h and secondary as weekly", func(t *testing.T) {
+		t.Parallel()
+		out, dual := normalizeUsageForToggle(withBoth, true)
+		if !dual || out.UsedPercent != "35" || out.SecondaryUsedPercent != "60" {
+			t.Fatalf("unexpected: dual=%v used=%q secondary=%q", dual, out.UsedPercent, out.SecondaryUsedPercent)
+		}
+	})
+
+	t.Run("5h on + secondary null falls back to primary as weekly", func(t *testing.T) {
+		t.Parallel()
+		out, dual := normalizeUsageForToggle(primaryOnly, true)
+		if dual || out.UsedPercent != "35" || strings.TrimSpace(out.SecondaryUsedPercent) != "" {
+			t.Fatalf("unexpected: dual=%v used=%q secondary=%q", dual, out.UsedPercent, out.SecondaryUsedPercent)
+		}
+	})
+
+	t.Run("5h off + dual promotes weekly secondary into primary", func(t *testing.T) {
+		t.Parallel()
+		out, dual := normalizeUsageForToggle(withBoth, false)
+		if dual || out.UsedPercent != "60" {
+			t.Fatalf("expected weekly promoted to 60, got dual=%v used=%q", dual, out.UsedPercent)
+		}
+		if out.ResetAt == nil || *out.ResetAt != secondaryReset {
+			t.Fatalf("expected weekly reset promoted, got %v", out.ResetAt)
+		}
+		if strings.TrimSpace(out.SecondaryUsedPercent) != "" || out.SecondaryResetAt != nil {
+			t.Fatalf("expected secondary cleared, got %+v", out)
+		}
+	})
+
+	t.Run("5h off + secondary null keeps primary as weekly fallback", func(t *testing.T) {
+		t.Parallel()
+		out, dual := normalizeUsageForToggle(primaryOnly, false)
+		if dual || out.UsedPercent != "35" {
+			t.Fatalf("unexpected: dual=%v used=%q", dual, out.UsedPercent)
+		}
+	})
+}
+
+// TestRunDualStdoutAndPersistence covers the dual-response stdout contract and
+// the OFF-promotes-weekly persistence contract end-to-end through runWithArgs.
+func TestRunDualStdoutAndPersistence(t *testing.T) {
+	t.Parallel()
+
+	dualBody := `{"user_id":"user-1","rate_limit":{"primary_window":{"used_percent":35,"reset_at":1777014899},"secondary_window":{"used_percent":60,"reset_at":1777619699}}}`
+	nullSecondaryBody := `{"user_id":"user-1","rate_limit":{"primary_window":{"used_percent":35,"reset_at":1777014899},"secondary_window":null}}`
+
+	cases := []struct {
+		name, body     string
+		fiveHour       bool
+		stdout, stored string
+		stripSecondary bool
+	}{
+		{"5h on + dual: stdout is 5h primary (35)", dualBody, true, "35", "35", false},
+		{"5h on + secondary null: stdout is primary as weekly (35)", nullSecondaryBody, true, "35", "35", false},
+		{"5h off + dual: stdout is promoted weekly (60)", dualBody, false, "60", "60", true},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(tc.body))
+			}))
+			defer server.Close()
+
+			dir := t.TempDir()
+			cfgPath := filepath.Join(dir, "config.json")
+			if err := saveFiveHourConfig(cfgPath, tc.fiveHour); err != nil {
+				t.Fatalf("save config: %v", err)
+			}
+			authFile := filepath.Join(dir, "auth.json")
+			if err := os.WriteFile(authFile, []byte(`{"openai.access":"token"}`), 0o600); err != nil {
+				t.Fatalf("write auth: %v", err)
+			}
+			accountsFile := filepath.Join(dir, "accounts.json")
+
+			var out strings.Builder
+			if err := runWithArgs(context.Background(), config{
+				AuthFile: authFile, AccountsFile: accountsFile, ConfigFile: cfgPath,
+				UsageURL: server.URL, HTTPClient: server.Client(),
+			}, &out, nil); err != nil {
+				t.Fatalf("runWithArgs: %v", err)
+			}
+			if out.String() != tc.stdout {
+				t.Fatalf("stdout=%q, want %q", out.String(), tc.stdout)
+			}
+			store := mustReadStore(t, accountsFile)
+			acct, ok := store["user-1"]
+			if !ok {
+				t.Fatalf("expected user-1 persisted")
+			}
+			if got, _ := acct["usedPercent"].(string); got != tc.stored {
+				t.Fatalf("stored usedPercent=%q, want %q", got, tc.stored)
+			}
+			if tc.stripSecondary {
+				if _, has := acct["secondaryUsedPercent"]; has {
+					t.Fatalf("expected secondaryUsedPercent stripped")
+				}
+				if _, has := acct["secondaryResetAt"]; has {
+					t.Fatalf("expected secondaryResetAt stripped")
+				}
+			}
+		})
+	}
+}
+
+// TestAccountWithUsageCooldownAndStripping pins the new dual-mode persistence
+// behavior: 5h off strips any stale secondary fields left over from prior 5h-on
+// runs; 5h on uses the later reset when both windows are exhausted. The
+// 5h-off cooldown set/clear behavior is covered by the baseline tests
+// (TestAccountWithUsageSetsCooldownWhenWeeklyExhausted and
+// TestAccountWithUsageClearsCooldownWhenBelowThreshold).
+func TestAccountWithUsageCooldownAndStripping(t *testing.T) {
+	t.Parallel()
+
+	primaryReset := int64(1777014899)
+	weeklyReset := int64(1777619699)
+
+	t.Run("5h off strips stale secondary fields", func(t *testing.T) {
+		t.Parallel()
+		stripped := accountWithUsage(map[string]any{
+			"user_id": "u1", "access": "t",
+			"secondaryUsedPercent": "stale", "secondaryResetAt": int64(1700000000),
+		}, usageWindow{
+			UsedPercent: "70", ResetAt: int64Ptr(primaryReset), UserID: "u1",
+		}, false)
+		if _, has := stripped["secondaryUsedPercent"]; has {
+			t.Fatalf("strip: secondaryUsedPercent should be removed")
+		}
+		if _, has := stripped["secondaryResetAt"]; has {
+			t.Fatalf("strip: secondaryResetAt should be removed")
+		}
+	})
+
+	t.Run("5h on + both exhausted takes later reset", func(t *testing.T) {
+		t.Parallel()
+		updated := accountWithUsage(map[string]any{"user_id": "u1", "access": "t"}, usageWindow{
+			UsedPercent: "85", ResetAt: int64Ptr(primaryReset), // 5h reset (earlier)
+			SecondaryUsedPercent: "99", SecondaryResetAt: int64Ptr(weeklyReset), // weekly (later)
+			UserID: "u1",
+		}, true)
+		if got, ok := valueToInt64(updated["cooldownUntil"]); !ok || got != weeklyReset {
+			t.Fatalf("cooldownUntil=%v, want %d", updated["cooldownUntil"], weeklyReset)
+		}
+	})
+}
+
+// TestSelectEligibleAlternateAccountAcrossModes pins the per-candidate
+// rotation eligibility matrix:
+//
+//	toggle | shape        | threshold (primary) | threshold (secondary)
+//	------ | ------------ | ------------------- | ---------------------
+//	ON     | dual         | 80%                 | 98%
+//	ON     | weekly-only  | 98%                 | n/a
+//	OFF    | stale dual   | ignored             | 98%
+//	OFF    | weekly-only  | 98%                 | n/a
+//
+// Dual detection uses BOTH secondaryUsedPercent AND secondaryResetAt so legacy
+// entries written before new metadata was added still classify as dual.
+func TestSelectEligibleAlternateAccountAcrossModes(t *testing.T) {
+	t.Parallel()
+
+	now := time.Now().Unix()
+
+	// 5h ON + dual candidate: primary 85 >= 80% blocks, even when the secondary
+	// weekly is comfortably below 98%. We need a SECOND eligible candidate to
+	// verify rotation skipped the hot one.
+	t.Run("5h on + dual blocks primary at 80% with future reset", func(t *testing.T) {
+		t.Parallel()
+		store := map[string]map[string]any{
+			"user-current": {"user_id": "user-current", "access": "current-token"},
+			"user-5h-hot": {
+				"user_id": "user-5h-hot", "access": "tok",
+				"usedPercent": "85", "resetAt": now + 3600,
+				"secondaryUsedPercent": "50", "secondaryResetAt": now + 86400,
+			},
+			"user-ready": {"user_id": "user-ready", "access": "ready-token"},
+		}
+		selected, ok := selectEligibleAlternateAccount(store, "user-current", now, true)
+		if !ok || selected["user_id"] != "user-ready" {
+			t.Fatalf("expected user-ready (5h-hot dual blocked at 80), got %v ok=%v", selected["user_id"], ok)
+		}
+	})
+
+	// 5h ON + dual candidate: secondary 99 >= 98% blocks, even when the primary
+	// 5h is below 80%. The primary's 80% threshold is irrelevant when secondary
+	// is exhausted.
+	t.Run("5h on + dual blocks secondary at 98% with future reset", func(t *testing.T) {
+		t.Parallel()
+		store := map[string]map[string]any{
+			"user-current": {"user_id": "user-current", "access": "current-token"},
+			"user-weekly-hot": {
+				"user_id": "user-weekly-hot", "access": "tok",
+				"usedPercent": "50", "resetAt": now + 3600,
+				"secondaryUsedPercent": "99", "secondaryResetAt": now + 86400,
+			},
+			"user-ready": {"user_id": "user-ready", "access": "ready-token"},
+		}
+		selected, ok := selectEligibleAlternateAccount(store, "user-current", now, true)
+		if !ok || selected["user_id"] != "user-ready" {
+			t.Fatalf("expected user-ready (weekly-hot dual blocked at 98), got %v ok=%v", selected["user_id"], ok)
+		}
+	})
+
+	// 5h ON + weekly-only candidate: primary is treated as the weekly window
+	// (98%), not as the 5h window (80%). 85% must therefore stay eligible.
+	t.Run("5h on + weekly-only treats primary as weekly (85 below 98)", func(t *testing.T) {
+		t.Parallel()
+		store := map[string]map[string]any{
+			"user-current": {"user_id": "user-current", "access": "current-token"},
+			"user-85":      {"user_id": "user-85", "access": "tok", "usedPercent": "85", "resetAt": now + 3600},
+		}
+		selected, ok := selectEligibleAlternateAccount(store, "user-current", now, true)
+		if !ok || selected["user_id"] != "user-85" {
+			t.Fatalf("expected user-85 eligible (5h ON + weekly-only -> primary as weekly 98), got %v ok=%v", selected["user_id"], ok)
+		}
+	})
+
+	// 5h OFF + stale dual: persisted when 5h was on. The stale 5h primary (85
+	// above 80%) and stored cooldown must be IGNORED; only the persisted
+	// secondary weekly (50, below 98%) matters. The candidate stays eligible.
+	t.Run("5h off + stale dual ignores primary 5h and cooldown, secondary 50 below 98", func(t *testing.T) {
+		t.Parallel()
+		store := map[string]map[string]any{
+			"user-current": {"user_id": "user-current", "access": "current-token"},
+			"user-stale-dual": {
+				"user_id": "user-stale-dual", "access": "tok",
+				"usedPercent": "85", "resetAt": now + 3600, // stale 5h
+				"cooldownUntil":        now + 3600, // might have been derived from primary
+				"secondaryUsedPercent": "50", "secondaryResetAt": now + 86400,
+			},
+		}
+		selected, ok := selectEligibleAlternateAccount(store, "user-current", now, false)
+		if !ok || selected["user_id"] != "user-stale-dual" {
+			t.Fatalf("expected user-stale-dual eligible (stale primary+cooldown ignored, secondary 50 below 98), got %v ok=%v", selected["user_id"], ok)
+		}
+	})
+
+	// 5h OFF + stale dual: persisted when 5h was on. The secondary 99 is
+	// exhausted with a future reset, so the candidate must be blocked even
+	// though the stored primary 5h/cooldown are stale.
+	t.Run("5h off + stale dual blocks on secondary 99 with future reset", func(t *testing.T) {
+		t.Parallel()
+		store := map[string]map[string]any{
+			"user-current": {"user_id": "user-current", "access": "current-token"},
+			"user-stale-dual-hot": {
+				"user_id": "user-stale-dual-hot", "access": "tok",
+				"usedPercent": "85", "resetAt": now + 3600, // stale 5h (ignored)
+				"cooldownUntil":        now + 3600, // ignored under toggle OFF
+				"secondaryUsedPercent": "99", "secondaryResetAt": now + 86400,
+			},
+			"user-ready": {"user_id": "user-ready", "access": "ready-token"},
+		}
+		selected, ok := selectEligibleAlternateAccount(store, "user-current", now, false)
+		if !ok || selected["user_id"] != "user-ready" {
+			t.Fatalf("expected user-ready (stale-dual-hot blocked on secondary 98), got %v ok=%v", selected["user_id"], ok)
+		}
+	})
+
+	// 5h OFF + stale dual: missing secondary used_percent is conservative/
+	// eligible. Only secondaryResetAt is persisted (legacy dual entry without
+	// new metadata); the candidate must NOT be blocked.
+	t.Run("5h off + stale dual with missing secondary usage stays eligible", func(t *testing.T) {
+		t.Parallel()
+		store := map[string]map[string]any{
+			"user-current": {"user_id": "user-current", "access": "current-token"},
+			"user-stale-dual-partial": {
+				"user_id": "user-stale-dual-partial", "access": "tok",
+				"usedPercent": "99", "resetAt": now + 3600, // stale 5h (ignored)
+				"cooldownUntil":    now + 3600,  // ignored under toggle OFF
+				"secondaryResetAt": now + 86400, // legacy: only the reset, no usage
+			},
+		}
+		selected, ok := selectEligibleAlternateAccount(store, "user-current", now, false)
+		if !ok || selected["user_id"] != "user-stale-dual-partial" {
+			t.Fatalf("expected user-stale-dual-partial eligible (missing secondary usage is conservative), got %v ok=%v", selected["user_id"], ok)
+		}
+	})
+
+	// Mixed persisted-mode: a dual candidate AND a weekly-only candidate in the
+	// same store, evaluated under toggle ON. The dual one is blocked on its
+	// primary 5h; the weekly-only one is evaluated against the weekly 98%.
+	t.Run("5h on + mixed persisted-mode evaluates dual vs weekly-only per candidate", func(t *testing.T) {
+		t.Parallel()
+		store := map[string]map[string]any{
+			"user-current": {"user_id": "user-current", "access": "current-token"},
+			"user-dual-85": {
+				"user_id": "user-dual-85", "access": "tok",
+				"usedPercent": "85", "resetAt": now + 3600, // blocked at 80 on dual
+				"secondaryUsedPercent": "40", "secondaryResetAt": now + 86400,
+			},
+			"user-weekly-95": {
+				"user_id": "user-weekly-95", "access": "tok",
+				"usedPercent": "95", "resetAt": now + 86400, // blocked at 98 on weekly-only
+			},
+			"user-weekly-50": {
+				"user_id": "user-weekly-50", "access": "tok",
+				"usedPercent": "50", "resetAt": now + 86400, // eligible weekly-only
+			},
+		}
+		selected, ok := selectEligibleAlternateAccount(store, "user-current", now, true)
+		if !ok || selected["user_id"] != "user-weekly-50" {
+			t.Fatalf("expected user-weekly-50 (dual-85 blocked on 80, weekly-95 blocked on 98), got %v ok=%v", selected["user_id"], ok)
+		}
+	})
+}
+
+// TestRunRotationAcrossToggleModes exercises the dual-response rotation
+// contract through runWithArgs: 5h on rotates at 80% on the 5h primary; 5h off
+// ignores the 5h value entirely and only rotates at 98% on the promoted
+// weekly secondary. The 5h-off-primary-only path is covered by the baseline
+// tests (TestRunRotatesWhenWeeklyUsageExhausted and
+// TestRunDoesNotRotateWhenWeeklyBelowThreshold).
+func TestRunRotationAcrossToggleModes(t *testing.T) {
+	t.Parallel()
+
+	now := time.Now().Unix()
+	primaryReset := now + 7200
+	weeklyReset := now + 86400*5
+	dual := func(p, s string) string {
+		return `{"user_id":"user-current","rate_limit":{"primary_window":{"used_percent":` + p + `,"reset_at":` + strconv.FormatInt(primaryReset, 10) + `},"secondary_window":{"used_percent":` + s + `,"reset_at":` + strconv.FormatInt(weeklyReset, 10) + `}}}`
+	}
+
+	cases := []struct {
+		name, body string
+		fiveHour   bool
+		stdout     string
+		rotated    bool
+	}{
+		{"5h on rotates at 80% on the 5h primary (weekly 50 below 98)", dual("85", "50"), true, "85", true},
+		{"5h off does NOT rotate on 85 (below weekly 98, even when 5h is high)", dual("85", "50"), false, "50", false},
+		{"5h off rotates on weekly 99 promoted from secondary", dual("10", "99"), false, "99", true},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(tc.body))
+			}))
+			defer server.Close()
+
+			dir := t.TempDir()
+			cfgPath := filepath.Join(dir, "config.json")
+			if err := saveFiveHourConfig(cfgPath, tc.fiveHour); err != nil {
+				t.Fatalf("save config: %v", err)
+			}
+			authFile := filepath.Join(dir, "auth.json")
+			if err := os.WriteFile(authFile, []byte(`{"openai.access":"current-token","openai.accountId":"acct-current"}`), 0o600); err != nil {
+				t.Fatalf("write auth: %v", err)
+			}
+			accountsFile := filepath.Join(dir, "accounts.json")
+			store := map[string]map[string]any{
+				"user-current": {"user_id": "user-current", "accountId": "acct-current", "access": "current-token"},
+				"user-other":   {"user_id": "user-other", "accountId": "acct-other", "access": "other-token"},
+			}
+			encoded, _ := json.Marshal(store)
+			if err := os.WriteFile(accountsFile, encoded, 0o600); err != nil {
+				t.Fatalf("write accounts: %v", err)
+			}
+
+			var out strings.Builder
+			if err := runWithArgs(context.Background(), config{
+				AuthFile: authFile, AccountsFile: accountsFile, ConfigFile: cfgPath,
+				UsageURL: server.URL, HTTPClient: server.Client(),
+			}, &out, nil); err != nil {
+				t.Fatalf("runWithArgs: %v", err)
+			}
+			if out.String() != tc.stdout {
+				t.Fatalf("stdout=%q, want %q", out.String(), tc.stdout)
+			}
+			data, _ := os.ReadFile(authFile)
+			gotOther := strings.Contains(string(data), "other-token")
+			if gotOther != tc.rotated {
+				t.Fatalf("rotation=%v, want %v (auth=%s)", gotOther, tc.rotated, string(data))
+			}
+		})
+	}
+}
+
+// TestPrintAccountsTableModeDetection pins the table-mode contract: dual mode
+// only triggers when at least one successful row exposes the secondary window.
+// Error-only rows must NOT accidentally flip the renderer into dual mode; when
+// dual mode is active, error rows render "-" for the missing secondary cells.
+func TestPrintAccountsTableModeDetection(t *testing.T) {
+	t.Parallel()
+
+	dualRow := func() accountUsageRow {
+		return accountUsageRow{
+			Current: true, Index: 1, Email: "ok@example.com",
+			UsedPercent: "35", SecondaryUsedPercent: "60",
+			ResetDisplay: "2h 15m", SecondaryResetDisplay: "1d 3h",
+			IsDualRow: true,
+		}
+	}
+	weeklyRow := func(idx int, email, used, reset string) accountUsageRow {
+		return accountUsageRow{Index: idx, Email: email, UsedPercent: used, ResetDisplay: reset}
+	}
+	errRow := func(idx int, email, msg string) accountUsageRow {
+		return accountUsageRow{Index: idx, Email: email, UsedPercent: "ERR", ResetDisplay: "-", Err: errors.New(msg)}
+	}
+	mustContain := func(t *testing.T, printed string, wants []string) {
+		t.Helper()
+		for _, w := range wants {
+			if !strings.Contains(printed, w) {
+				t.Fatalf("expected %q in output, got %q", w, printed)
+			}
+		}
+	}
+	mustNotContain := func(t *testing.T, printed string, banned []string) {
+		t.Helper()
+		for _, b := range banned {
+			if strings.Contains(printed, b) {
+				t.Fatalf("did not expect %q in output, got %q", b, printed)
+			}
+		}
+	}
+	render := func(t *testing.T, rows []accountUsageRow) string {
+		t.Helper()
+		var out strings.Builder
+		if err := printAccountsTable(&out, rows); err != nil {
+			t.Fatalf("printAccountsTable: %v", err)
+		}
+		return out.String()
+	}
+
+	t.Run("dual mode when any successful row has secondary", func(t *testing.T) {
+		t.Parallel()
+		mustContain(t, render(t, []accountUsageRow{dualRow()}), []string{"USED%", "WEEK%", "RESET", "WEEK-RESET"})
+	})
+
+	t.Run("weekly-only when no successful row has secondary", func(t *testing.T) {
+		t.Parallel()
+		printed := render(t, []accountUsageRow{weeklyRow(1, "ok@example.com", "22.5", "2h 15m")})
+		mustNotContain(t, printed, []string{"| USED% |"})
+		mustContain(t, printed, []string{"| WEEK% |", "| WEEK-RESET |"})
+	})
+
+	t.Run("error-only rows do NOT force dual mode", func(t *testing.T) {
+		t.Parallel()
+		rows := []accountUsageRow{
+			errRow(1, "broken@example.com", "missing access token"),
+			errRow(2, "broken-too@example.com", "usage endpoint returned 401"),
+		}
+		printed := render(t, rows)
+		mustNotContain(t, printed, []string{"| USED% |", "| RESET |"})
+		mustContain(t, printed, []string{"[ERR: missing access token]", "[ERR: usage endpoint returned 401]"})
+	})
+
+	t.Run("error row in dual mode renders ERR in USED% and '-' in secondary cells", func(t *testing.T) {
+		t.Parallel()
+		rows := []accountUsageRow{dualRow(), errRow(2, "broken@example.com", "missing access token")}
+		printed := render(t, rows)
+		mustContain(t, printed, []string{"USED%", "WEEK%", "RESET", "WEEK-RESET"})
+		errLine := lineContaining(printed, "broken@example.com")
+		// ERR must be in the USED% column of the error row, not silently
+		// dropped or moved into the weekly column. The exact cell widths are
+		// not pinned; we only verify the line starts with `| 2 ` and contains
+		// `ERR` followed by a `-`.
+		if !strings.HasPrefix(errLine, "| 2 ") {
+			t.Fatalf("expected error row to start with `| 2 `, got %q", errLine)
+		}
+		if !strings.Contains(errLine, "ERR") {
+			t.Fatalf("expected ERR in error row, got %q", errLine)
+		}
+		if !strings.Contains(errLine, "-") {
+			t.Fatalf("expected '-' in error row secondary cells, got %q", errLine)
+		}
+	})
+
+	// Mixed dual/fallback: when one row is dual and another row is a fallback
+	// weekly row (no secondary data), the fallback row must NOT be mislabeled
+	// under USED%/RESET — it must render its weekly value under WEEK%/WEEK-RESET
+	// with "-" under USED%/RESET.
+	t.Run("fallback weekly row in dual mode renders '-' under USED%/RESET", func(t *testing.T) {
+		t.Parallel()
+		rows := []accountUsageRow{
+			dualRow(), // index 1, dual: USED=35 WEEK=60
+			{
+				Index: 2, Email: "fallback@example.com",
+				UsedPercent: "22.5", ResetDisplay: "2h 15m",
+			},
+		}
+		printed := render(t, rows)
+		mustContain(t, printed, []string{"USED%", "WEEK%", "RESET", "WEEK-RESET"})
+
+		fallbackLine := lineContaining(printed, "fallback@example.com")
+		if !strings.HasPrefix(fallbackLine, "| 2 ") {
+			t.Fatalf("expected fallback row to start with `| 2 `, got %q", fallbackLine)
+		}
+		cells := splitTableRow(fallbackLine)
+		if len(cells) != 7 {
+			t.Fatalf("expected 7 cells in dual fallback row, got %d (%q)", len(cells), fallbackLine)
+		}
+		if cells[3] != "-" {
+			t.Fatalf("expected fallback row USED%% cell to be \"-\", got %q (line=%q)", cells[3], fallbackLine)
+		}
+		if cells[4] != "22.5" {
+			t.Fatalf("expected fallback row WEEK%% cell to be 22.5, got %q (line=%q)", cells[4], fallbackLine)
+		}
+		if cells[5] != "-" {
+			t.Fatalf("expected fallback row RESET cell to be \"-\", got %q (line=%q)", cells[5], fallbackLine)
+		}
+		if cells[6] != "2h 15m" {
+			t.Fatalf("expected fallback row WEEK-RESET cell to be 2h 15m, got %q (line=%q)", cells[6], fallbackLine)
+		}
+	})
+}
+
+// TestPersistOpenAIAccountDeletesStaleDerivedFields pins the deletion policy
+// enforced by persistOpenAIAccount for usage-derived keys. accountWithUsage
+// already strips derived keys that no longer apply from the incoming copy, but
+// the previous merge logic re-introduced the stale value from the previously
+// persisted record (because the merge only assigned keys present in the
+// incoming copy, never deleted anything). These subtests pin the fix:
+//
+//   - A dual record refreshed under toggle OFF (or promoted to weekly-only)
+//     must drop secondaryUsedPercent, secondaryResetAt, and any stale dual
+//     cooldownUntil while keeping the canonical weekly usedPercent/resetAt.
+//   - An exhausted record refreshed below threshold must drop cooldownUntil.
+//   - Auth and account metadata (access, refresh, accountId, email, user_id)
+//     and arbitrary custom fields must always survive the merge.
+//
+// No tombstone/null artifact is written: omitted derived keys are deleted, not
+// blanked.
+func TestPersistOpenAIAccountDeletesStaleDerivedFields(t *testing.T) {
+	t.Parallel()
+
+	seedStore := func(t *testing.T, accountsFile string, seed map[string]map[string]any) {
+		t.Helper()
+		encoded, err := json.Marshal(seed)
+		if err != nil {
+			t.Fatalf("marshal seed store: %v", err)
+		}
+		if err := os.WriteFile(accountsFile, encoded, 0o600); err != nil {
+			t.Fatalf("write seed store: %v", err)
+		}
+	}
+
+	t.Run("dual refreshed under toggle OFF strips stale secondary and dual cooldown while keeping canonical weekly", func(t *testing.T) {
+		t.Parallel()
+
+		accountsFile := filepath.Join(t.TempDir(), "openai-accounts.json")
+		weeklyReset := int64(1777619699)
+
+		// Pre-seed a record captured while 5h was ON (dual response). It carries
+		// secondary window values plus a stale dual cooldownUntil derived from
+		// "both windows exhausted → take later reset".
+		seedStore(t, accountsFile, map[string]map[string]any{
+			"user-promote": {
+				"user_id":              "user-promote",
+				"accountId":            "acct-promote",
+				"access":               "token-promote",
+				"refresh":              "refresh-promote",
+				"email":                "promote@example.com",
+				"usedPercent":          "85",              // stale 5h primary
+				"resetAt":              int64(1777014899), // stale 5h reset
+				"secondaryUsedPercent": "99",              // weekly secondary
+				"secondaryResetAt":     weeklyReset,       // weekly reset
+				"cooldownUntil":        weeklyReset,       // stale dual cooldown
+				"notes":                "preserve-me",
+			},
+		})
+
+		// Refresh: toggle OFF promotes the weekly window into the canonical
+		// primary fields. The incoming copy omits secondaryUsedPercent,
+		// secondaryResetAt, and cooldownUntil because they no longer apply.
+		if err := persistOpenAIAccount(accountsFile, map[string]any{
+			"user_id":     "user-promote",
+			"accountId":   "acct-promote",
+			"access":      "token-promote",
+			"refresh":     "refresh-promote",
+			"email":       "promote@example.com",
+			"usedPercent": "22",        // weekly primary (promoted)
+			"resetAt":     weeklyReset, // weekly reset (promoted)
+			"notes":       "preserve-me",
+		}); err != nil {
+			t.Fatalf("persistOpenAIAccount: %v", err)
+		}
+
+		entry := mustReadStore(t, accountsFile)["user-promote"]
+
+		if _, has := entry["secondaryUsedPercent"]; has {
+			t.Fatalf("expected secondaryUsedPercent to be deleted, got %v", entry["secondaryUsedPercent"])
+		}
+		if _, has := entry["secondaryResetAt"]; has {
+			t.Fatalf("expected secondaryResetAt to be deleted, got %v", entry["secondaryResetAt"])
+		}
+		if _, has := entry["cooldownUntil"]; has {
+			t.Fatalf("expected stale dual cooldownUntil to be deleted, got %v", entry["cooldownUntil"])
+		}
+
+		// Canonical weekly usage/reset must be the refreshed values, not the
+		// stale 5h ones from the prior dual record.
+		if got, _ := entry["usedPercent"].(string); got != "22" {
+			t.Fatalf("expected canonical usedPercent 22, got %v", entry["usedPercent"])
+		}
+		if got, ok := valueToInt64(entry["resetAt"]); !ok || got != weeklyReset {
+			t.Fatalf("expected canonical resetAt %d, got %v", weeklyReset, entry["resetAt"])
+		}
+	})
+
+	t.Run("exhausted record refreshed below threshold drops stale cooldownUntil", func(t *testing.T) {
+		t.Parallel()
+
+		accountsFile := filepath.Join(t.TempDir(), "openai-accounts.json")
+		weeklyReset := int64(1777014899)
+
+		seedStore(t, accountsFile, map[string]map[string]any{
+			"user-cooldown": {
+				"user_id":       "user-cooldown",
+				"accountId":     "acct-cooldown",
+				"access":        "token-cooldown",
+				"refresh":       "refresh-cooldown",
+				"email":         "cooldown@example.com",
+				"usedPercent":   "98", // exhausted on prior run
+				"resetAt":       weeklyReset,
+				"cooldownUntil": weeklyReset, // stale cooldown from prior run
+			},
+		})
+
+		// Refresh below threshold. accountWithUsage would have omitted
+		// cooldownUntil; the merge must honour that deletion.
+		if err := persistOpenAIAccount(accountsFile, map[string]any{
+			"user_id":     "user-cooldown",
+			"accountId":   "acct-cooldown",
+			"access":      "token-cooldown",
+			"refresh":     "refresh-cooldown",
+			"email":       "cooldown@example.com",
+			"usedPercent": "35",
+			"resetAt":     weeklyReset,
+		}); err != nil {
+			t.Fatalf("persistOpenAIAccount: %v", err)
+		}
+
+		entry := mustReadStore(t, accountsFile)["user-cooldown"]
+
+		if _, has := entry["cooldownUntil"]; has {
+			t.Fatalf("expected stale cooldownUntil to be deleted, got %v", entry["cooldownUntil"])
+		}
+		// usedPercent/resetAt must be the refreshed values.
+		if got, _ := entry["usedPercent"].(string); got != "35" {
+			t.Fatalf("expected usedPercent 35, got %v", entry["usedPercent"])
+		}
+		if got, ok := valueToInt64(entry["resetAt"]); !ok || got != weeklyReset {
+			t.Fatalf("expected resetAt %d, got %v", weeklyReset, entry["resetAt"])
+		}
+	})
+
+	t.Run("auth and custom metadata survive the merge while stale derived fields are dropped", func(t *testing.T) {
+		t.Parallel()
+
+		accountsFile := filepath.Join(t.TempDir(), "openai-accounts.json")
+
+		// Pre-seed a record with stale derived fields AND custom metadata
+		// that is not owned by accountWithUsage (region, notes, label).
+		seedStore(t, accountsFile, map[string]map[string]any{
+			"user-meta": {
+				"user_id":              "user-meta",
+				"accountId":            "acct-meta",
+				"access":               "token-meta-old",
+				"refresh":              "refresh-meta-old",
+				"email":                "meta@example.com",
+				"usedPercent":          "99",
+				"resetAt":              int64(1777014899),
+				"cooldownUntil":        int64(1777014899),
+				"secondaryUsedPercent": "70",
+				"secondaryResetAt":     int64(1777619699),
+				"region":               "us-east",
+				"notes":                "tagged",
+				"label":                "primary",
+			},
+		})
+
+		// Refresh: access/refresh are rotated, canonical weekly fields are
+		// updated, but region/notes/label are NOT present in the incoming
+		// copy. They must survive untouched alongside access/accountId/email/
+		// user_id. Derived fields are intentionally omitted.
+		if err := persistOpenAIAccount(accountsFile, map[string]any{
+			"user_id":     "user-meta",
+			"accountId":   "acct-meta",
+			"access":      "token-meta-new",
+			"refresh":     "refresh-meta-new",
+			"email":       "meta@example.com",
+			"usedPercent": "20",
+			"resetAt":     int64(1777619699),
+		}); err != nil {
+			t.Fatalf("persistOpenAIAccount: %v", err)
+		}
+
+		entry := mustReadStore(t, accountsFile)["user-meta"]
+
+		// Auth and account metadata: updated when present, preserved when not.
+		if got, _ := entry["access"].(string); got != "token-meta-new" {
+			t.Fatalf("expected access rotated to token-meta-new, got %q", got)
+		}
+		if got, _ := entry["refresh"].(string); got != "refresh-meta-new" {
+			t.Fatalf("expected refresh rotated to refresh-meta-new, got %q", got)
+		}
+		if got, _ := entry["accountId"].(string); got != "acct-meta" {
+			t.Fatalf("expected accountId preserved as acct-meta, got %q", got)
+		}
+		if got, _ := entry["email"].(string); got != "meta@example.com" {
+			t.Fatalf("expected email preserved as meta@example.com, got %q", got)
+		}
+		if got, _ := entry["user_id"].(string); got != "user-meta" {
+			t.Fatalf("expected user_id preserved as user-meta, got %q", got)
+		}
+
+		// Custom metadata: untouched by the merge.
+		if got, _ := entry["region"].(string); got != "us-east" {
+			t.Fatalf("expected custom field region preserved, got %q", got)
+		}
+		if got, _ := entry["notes"].(string); got != "tagged" {
+			t.Fatalf("expected custom field notes preserved, got %q", got)
+		}
+		if got, _ := entry["label"].(string); got != "primary" {
+			t.Fatalf("expected custom field label preserved, got %q", got)
+		}
+
+		// Stale derived fields: dropped.
+		if _, has := entry["cooldownUntil"]; has {
+			t.Fatalf("expected stale cooldownUntil to be deleted, got %v", entry["cooldownUntil"])
+		}
+		if _, has := entry["secondaryUsedPercent"]; has {
+			t.Fatalf("expected stale secondaryUsedPercent to be deleted, got %v", entry["secondaryUsedPercent"])
+		}
+		if _, has := entry["secondaryResetAt"]; has {
+			t.Fatalf("expected stale secondaryResetAt to be deleted, got %v", entry["secondaryResetAt"])
+		}
+	})
 }
