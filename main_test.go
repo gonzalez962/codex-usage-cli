@@ -13,6 +13,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -282,6 +283,33 @@ func TestRunReturnsErrorOnNon200(t *testing.T) {
 
 	if !strings.Contains(err.Error(), "401") {
 		t.Fatalf("expected status code in error, got: %v", err)
+	}
+}
+
+// TestFetchUsageWindowRedactsReflectedBearerToken: a reflected token in the
+// response body must never appear in the returned error; non-secret text is kept.
+func TestFetchUsageWindowRedactsReflectedBearerToken(t *testing.T) {
+	t.Parallel()
+	const token = "reflected-bearer-token-do-not-leak"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("Authorization"); got != "Bearer "+token {
+			t.Errorf("unexpected Authorization header: %q", got)
+		}
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = fmt.Fprintf(w, "auth failed for %s please retry", token)
+	}))
+	defer server.Close()
+	_ = t.TempDir()
+	_, err := fetchUsageWindow(context.Background(), server.Client(), server.URL, token)
+	if err == nil {
+		t.Fatalf("expected error from non-200 response")
+	}
+	msg := err.Error()
+	if strings.Contains(msg, token) {
+		t.Fatalf("error leaked bearer token %q: %v", token, err)
+	}
+	if !strings.Contains(msg, "[REDACTED]") || !strings.Contains(msg, "please retry") {
+		t.Fatalf("expected [REDACTED] placeholder and surviving response text, got: %v", err)
 	}
 }
 
@@ -2260,11 +2288,7 @@ func writeConfigFile(t *testing.T, path, content string) {
 	}
 }
 
-// -----------------------------------------------------------------------------
-// 5h toggle contract: load/save, normalization, dual response mapping, and the
-// `config` subcommand. These tests pin the small surface the CLI exposes for
-// toggling 5h mode and document the OFF-promotes-weekly contract.
-// -----------------------------------------------------------------------------
+// 5h toggle contract: load/save, normalization, dual response mapping, and the `config` subcommand.
 
 // TestLoadFiveHourConfig is the contract for the loader: missing file, missing
 // key, on/off string reads, boolean reads, invalid values, malformed JSON, and
@@ -2799,10 +2823,7 @@ func TestRunDualStdoutAndPersistence(t *testing.T) {
 
 // TestAccountWithUsageCooldownAndStripping pins the new dual-mode persistence
 // behavior: 5h off strips any stale secondary fields left over from prior 5h-on
-// runs; 5h on uses the later reset when both windows are exhausted. The
-// 5h-off cooldown set/clear behavior is covered by the baseline tests
-// (TestAccountWithUsageSetsCooldownWhenWeeklyExhausted and
-// TestAccountWithUsageClearsCooldownWhenBelowThreshold).
+// runs; 5h on uses the later reset when both windows are exhausted.
 func TestAccountWithUsageCooldownAndStripping(t *testing.T) {
 	t.Parallel()
 
@@ -3202,11 +3223,7 @@ func TestPrintAccountsTableModeDetection(t *testing.T) {
 }
 
 // TestPersistOpenAIAccountDeletesStaleDerivedFields pins the deletion policy
-// enforced by persistOpenAIAccount for usage-derived keys. accountWithUsage
-// already strips derived keys that no longer apply from the incoming copy, but
-// the previous merge logic re-introduced the stale value from the previously
-// persisted record (because the merge only assigned keys present in the
-// incoming copy, never deleted anything). These subtests pin the fix:
+// enforced by persistOpenAIAccount for usage-derived keys. Subtests pin:
 //
 //   - A dual record refreshed under toggle OFF (or promoted to weekly-only)
 //     must drop secondaryUsedPercent, secondaryResetAt, and any stale dual
@@ -4029,5 +4046,704 @@ func TestDefaultConfigResolvesPiAuthFile(t *testing.T) {
 				t.Fatalf("expected PiAuthFile %q, got %q", tt.want, cfg.PiAuthFile)
 			}
 		})
+	}
+}
+
+type piResponses map[string]string
+
+func newPiServer(t *testing.T, r piResponses) (*httptest.Server, *atomic.Int32) {
+	t.Helper()
+	var n atomic.Int32
+	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		n.Add(1)
+		if body, ok := r[strings.TrimSpace(strings.TrimPrefix(req.Header.Get("Authorization"), "Bearer "))]; ok {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(body))
+			return
+		}
+		http.Error(w, "unknown token", http.StatusUnauthorized)
+	}))
+	t.Cleanup(s.Close)
+	return s, &n
+}
+
+func piPayload(userID, used, weekly string) string {
+	if weekly == "" {
+		return fmt.Sprintf(`{"user_id":%q,"email":%q,"rate_limit":{"primary_window":{"used_percent":%s,"reset_at":1777414800}}}`, userID, userID+"@example.com", used)
+	}
+	return fmt.Sprintf(`{"user_id":%q,"email":%q,"rate_limit":{"primary_window":{"used_percent":%s,"reset_at":1777414800},"secondary_window":{"used_percent":%s,"reset_at":1778203200}}}`, userID, userID+"@example.com", used, weekly)
+}
+
+func ocAuthBody(access, refresh string, expires int64, acctID string) string {
+	if acctID == "" {
+		return fmt.Sprintf(`{"openai.access":%q,"openai.refresh":%q,"openai.expires":%d,"openai.type":"oauth"}`, access, refresh, expires)
+	}
+	return fmt.Sprintf(`{"openai.access":%q,"openai.refresh":%q,"openai.expires":%d,"openai.accountId":%q,"openai.type":"oauth"}`, access, refresh, expires, acctID)
+}
+
+func piAuthBody(access, refresh string, expires int64, acctID string) string {
+	if acctID == "" {
+		return fmt.Sprintf(`{"openai-codex":{"type":"oauth","access":%q,"refresh":%q,"expires":%d}}`, access, refresh, expires)
+	}
+	return fmt.Sprintf(`{"openai-codex":{"type":"oauth","access":%q,"refresh":%q,"expires":%d,"accountId":%q}}`, access, refresh, expires, acctID)
+}
+
+func assertOCAuth(t *testing.T, path, wantAccess, wantRefresh string, wantExpires int64, wantAcctID string) {
+	t.Helper()
+	p := readJSONObject(t, path)
+	if p["openai.access"] != wantAccess || p["openai.refresh"] != wantRefresh || p["openai.type"] != "oauth" {
+		t.Fatalf("openai oauth mismatch: %#v", p)
+	}
+	if wantExpires == 0 {
+		if _, has := p["openai.expires"]; has {
+			t.Fatalf("openai.expires should be absent")
+		}
+	} else if got, ok := p["openai.expires"].(json.Number); !ok || got.String() != strconv.FormatInt(wantExpires, 10) {
+		t.Fatalf("openai.expires: got %v, want %d", p["openai.expires"], wantExpires)
+	}
+	if wantAcctID == "" {
+		if _, has := p["openai.accountId"]; has {
+			t.Fatalf("openai.accountId should be absent")
+		}
+	} else if p["openai.accountId"] != wantAcctID {
+		t.Fatalf("openai.accountId: got %v, want %q", p["openai.accountId"], wantAcctID)
+	}
+}
+
+func storeInt64Must(t *testing.T, m map[string]any, key string) int64 {
+	t.Helper()
+	v, ok := valueToInt64(m[key])
+	if !ok {
+		t.Fatalf("%s not int64: %#v", key, m[key])
+	}
+	return v
+}
+
+func TestReadPiAuthUnderLock(t *testing.T) {
+	t.Parallel()
+	t.Run("missing or empty path returns errPiAuthMissing", func(t *testing.T) {
+		t.Parallel()
+		nested := filepath.Join(t.TempDir(), "nested", "auth.json")
+		for _, p := range []string{"", nested} {
+			if _, err := readPiAuthUnderLock(p); !errors.Is(err, errPiAuthMissing) {
+				t.Fatalf("%q: got %v", p, err)
+			}
+		}
+		for _, p := range []string{nested, nested + ".lock", filepath.Dir(nested)} {
+			if _, err := os.Stat(p); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("%s created: %v", p, err)
+			}
+		}
+	})
+	t.Run("valid round-trips and releases lock", func(t *testing.T) {
+		t.Parallel()
+		f := filepath.Join(t.TempDir(), "auth.json")
+		seedAuthFile(t, f, `{"openai-codex":{"type":"oauth","access":"a","refresh":"r","expires":42}}`)
+		p, err := readPiAuthUnderLock(f)
+		if err != nil || p["openai-codex"] == nil {
+			t.Fatalf("err=%v payload=%v", err, p)
+		}
+		if _, err := os.Stat(f + ".lock"); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("lock not released: %v", err)
+		}
+	})
+	t.Run("directory path rejected", func(t *testing.T) {
+		t.Parallel()
+		if _, err := readPiAuthUnderLock(t.TempDir()); err == nil {
+			t.Fatal("want error for directory path")
+		}
+	})
+	t.Run("malformed/empty/non-object rejected as non-missing", func(t *testing.T) {
+		t.Parallel()
+		for _, s := range []string{"{not valid", "", `[{"openai-codex":{}}]`, "{} {}"} {
+			s := s
+			t.Run(s, func(t *testing.T) {
+				t.Parallel()
+				f := filepath.Join(t.TempDir(), "auth.json")
+				seedAuthFile(t, f, s)
+				_, err := readPiAuthUnderLock(f)
+				if err == nil || errors.Is(err, errPiAuthMissing) {
+					t.Fatalf("want non-missing error, got %v", err)
+				}
+				if data, _ := os.ReadFile(f); string(data) != s {
+					t.Fatalf("file mutated: %q", string(data))
+				}
+				if _, err := os.Stat(f + ".lock"); !errors.Is(err, os.ErrNotExist) {
+					t.Fatalf("stale lock: %v", err)
+				}
+			})
+		}
+	})
+	t.Run("release failure joins combined error (POSIX)", func(t *testing.T) {
+		if runtime.GOOS == "windows" {
+			t.Skip("os.Remove of non-empty dir only fails on POSIX")
+		}
+		t.Parallel()
+		piFile := filepath.Join(t.TempDir(), "auth.json")
+		seedAuthFile(t, piFile, `{"openai-codex":{"type":"oauth","access":"a","refresh":"r","expires":1}}`)
+		lock := piFile + ".lock"
+		if err := acquirePiLock(lock); err != nil {
+			t.Fatalf("acquirePiLock: %v", err)
+		}
+		if err := os.WriteFile(filepath.Join(lock, "stub"), []byte("x"), 0o600); err != nil {
+			t.Fatalf("populate: %v", err)
+		}
+		releaseErr := releasePiLock(lock)
+		if releaseErr == nil {
+			t.Fatal("want release failure")
+		}
+		combined := combinePiAuthWriteAndReleaseErrors(errors.New("read"), releaseErr)
+		if !strings.Contains(combined.Error(), "read") || !strings.Contains(combined.Error(), releaseErr.Error()) {
+			t.Fatalf("combined must join both: %v", combined)
+		}
+	})
+}
+
+func TestReconcilePiInbound(t *testing.T) {
+	t.Parallel()
+	const (
+		ocAccess, ocRefresh, piAccess           = "oc-access", "oc-refresh", "pi-access"
+		piRefresh, piAcctID, curUser, otherUser = "pi-refresh", "pi-acct", "user-cur", "user-other"
+		oldExpires, newExpires                  = int64(1776000000000), int64(1778000000000)
+	)
+	savedUser := func(userID, access, refresh string, expires int64, email string) map[string]any {
+		e := map[string]any{"user_id": userID, "access": access, "refresh": refresh, "expires": expires, "type": "oauth"}
+		if email != "" {
+			e["email"] = email
+		}
+		return e
+	}
+	runCase := func(t *testing.T, ocExpires int64, store map[string]map[string]any, piSeed, piBodyStr string, omitOc bool) (bool, int32, string, string) {
+		t.Helper()
+		authFile, piAuthFile, accountsFile := piSyncFixture(t)
+		seedAuthFile(t, authFile, ocAuthBody(ocAccess, ocRefresh, ocExpires, "oc-acct"))
+		seedAuthFile(t, piAuthFile, piSeed)
+		data, _ := json.Marshal(store)
+		if err := os.WriteFile(accountsFile, data, 0o600); err != nil {
+			t.Fatalf("write store: %v", err)
+		}
+		responses := piResponses{ocAccess: piPayload(curUser, "55", "")}
+		if piBodyStr != "" {
+			responses[piAccess] = piBodyStr
+		}
+		server, reqs := newPiServer(t, responses)
+		cfg := config{AuthFile: authFile, PiAuthFile: piAuthFile, AccountsFile: accountsFile, UsageURL: server.URL, HTTPClient: server.Client()}
+		acct := map[string]any{"access": ocAccess, "refresh": ocRefresh, "expires": ocExpires, "type": "oauth"}
+		if omitOc {
+			delete(acct, "expires")
+		}
+		_, _, changed, err := reconcilePiInbound(context.Background(), cfg, acct, usageWindow{UserID: curUser, UsedPercent: "55"}, true)
+		if err != nil {
+			t.Fatalf("reconcilePiInbound: %v", err)
+		}
+		return changed, reqs.Load(), accountsFile, authFile
+	}
+
+	cases := []struct {
+		name, ocAccess, ocRefresh, ocAcctID, storeKey, storeAcc, piSeed, piBody string
+		ocExpires, wantOcExp                                                    int64
+		omitOc                                                                  bool
+		store                                                                   map[string]map[string]any
+		changed                                                                 bool
+		reqs                                                                    int32
+		storeExp                                                                int64
+	}{
+		{name: "active newer updates store+OpenCode", ocExpires: oldExpires, store: map[string]map[string]any{curUser: savedUser(curUser, ocAccess, ocRefresh, oldExpires, "saved@x")},
+			piSeed: piAuthBody(piAccess, piRefresh, newExpires, piAcctID), piBody: piPayload(curUser, "55", ""),
+			changed: true, reqs: 1,
+			ocAccess: piAccess, ocRefresh: piRefresh, wantOcExp: newExpires, ocAcctID: piAcctID, storeAcc: piAccess, storeExp: newExpires,
+		},
+		{name: "non-active newer updates only store", ocExpires: oldExpires,
+			store: map[string]map[string]any{
+				curUser:   savedUser(curUser, ocAccess, ocRefresh, oldExpires, ""),
+				otherUser: savedUser(otherUser, "old-other", "old-other-r", oldExpires, ""),
+			},
+			piSeed: piAuthBody(piAccess, piRefresh, newExpires, piAcctID), piBody: piPayload(otherUser, "12", ""),
+			changed: true, reqs: 1, storeKey: otherUser, storeAcc: piAccess, storeExp: newExpires,
+		},
+		{name: "equal/older Pi expires no-op", ocExpires: newExpires, store: map[string]map[string]any{curUser: savedUser(curUser, ocAccess, ocRefresh, newExpires, "")},
+			piSeed: piAuthBody(piAccess, piRefresh, oldExpires, ""), piBody: piPayload(curUser, "55", ""),
+			changed: false, reqs: 1, wantOcExp: newExpires, storeAcc: ocAccess, storeExp: newExpires,
+		},
+		{name: "saved expires missing/invalid no-op", ocExpires: oldExpires, store: map[string]map[string]any{curUser: {"user_id": curUser, "access": ocAccess, "expires": 1.5, "type": "oauth"}},
+			piSeed: piAuthBody(piAccess, piRefresh, newExpires, ""), piBody: piPayload(curUser, "55", ""),
+			changed: false, reqs: 1,
+		},
+		{name: "no-match no-op", ocExpires: oldExpires, store: map[string]map[string]any{curUser: savedUser(curUser, ocAccess, ocRefresh, oldExpires, "")},
+			piSeed: piAuthBody(piAccess, piRefresh, newExpires, ""), piBody: piPayload("user-unknown", "77", ""),
+			changed: false, reqs: 1, storeAcc: ocAccess, storeExp: oldExpires,
+		},
+		{name: "current OpenCode expires missing no-op", ocExpires: oldExpires, omitOc: true, store: map[string]map[string]any{curUser: savedUser(curUser, ocAccess, ocRefresh, oldExpires, "")},
+			piSeed: piAuthBody(piAccess, piRefresh, newExpires, ""), piBody: piPayload(curUser, "55", ""),
+			changed: false, reqs: 1,
+		},
+		{name: "current OpenCode newer never downgrades", ocExpires: newExpires, store: map[string]map[string]any{curUser: savedUser(curUser, ocAccess, ocRefresh, oldExpires, "")},
+			piSeed: piAuthBody(piAccess, piRefresh, oldExpires, ""), piBody: piPayload(curUser, "55", ""),
+			changed: false, reqs: 1, wantOcExp: newExpires, storeAcc: ocAccess, storeExp: oldExpires,
+		},
+		{name: "saved account newer than Pi never downgrades", ocExpires: oldExpires, store: map[string]map[string]any{curUser: savedUser(curUser, ocAccess, ocRefresh, newExpires+1, "")},
+			piSeed: piAuthBody(piAccess, piRefresh, newExpires, ""), piBody: piPayload(curUser, "55", ""),
+			changed: false, reqs: 1, storeAcc: ocAccess, storeExp: newExpires + 1,
+		},
+		{name: "self-heal: Pi == saved but Pi > current -> only OpenCode", ocExpires: oldExpires, store: map[string]map[string]any{curUser: savedUser(curUser, "old-saved", "old-saved-r", newExpires, "saved@x")},
+			piSeed: piAuthBody(ocAccess, "pi-r-shared", newExpires, piAcctID), piBody: piPayload(curUser, "55", ""),
+			changed: true, reqs: 0, ocRefresh: "pi-r-shared", wantOcExp: newExpires, ocAcctID: piAcctID, storeAcc: "old-saved", storeExp: newExpires,
+		},
+		{name: "shape-change: dual Pi response persists secondary (5h ON)", ocExpires: oldExpires, store: map[string]map[string]any{curUser: savedUser(curUser, ocAccess, ocRefresh, oldExpires, "")},
+			piSeed: piAuthBody(piAccess, piRefresh, newExpires, piAcctID), piBody: piPayload(curUser, "10", "20"),
+			changed: true, reqs: 1,
+			ocAccess: piAccess, ocRefresh: piRefresh, wantOcExp: newExpires, ocAcctID: piAcctID, storeAcc: piAccess, storeExp: newExpires,
+		},
+		{name: "invalid Pi credential no-op", ocExpires: oldExpires, store: map[string]map[string]any{curUser: savedUser(curUser, ocAccess, ocRefresh, oldExpires, "")},
+			piSeed:  `{"openai-codex":{"type":"oauth","refresh":"r","expires":1}}`,
+			changed: false, reqs: 0, storeAcc: ocAccess, storeExp: oldExpires,
+		},
+		{name: "Pi API rejection no-op", ocExpires: oldExpires, store: map[string]map[string]any{curUser: savedUser(curUser, ocAccess, ocRefresh, oldExpires, "")},
+			piSeed:  piAuthBody(piAccess, piRefresh, newExpires, ""),
+			changed: false, reqs: 1, storeAcc: ocAccess, storeExp: oldExpires,
+		},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			changed, reqs, accountsFile, authFile := runCase(t, tc.ocExpires, tc.store, tc.piSeed, tc.piBody, tc.omitOc)
+			if changed != tc.changed || reqs != tc.reqs {
+				t.Fatalf("changed=%v reqs=%d; want changed=%v reqs=%d", changed, reqs, tc.changed, tc.reqs)
+			}
+			if tc.ocAccess == "" {
+				tc.ocAccess = ocAccess
+			}
+			if tc.ocRefresh == "" {
+				tc.ocRefresh = ocRefresh
+			}
+			if tc.ocAcctID == "" {
+				tc.ocAcctID = "oc-acct"
+			}
+			if tc.wantOcExp == 0 {
+				tc.wantOcExp = tc.ocExpires
+			}
+			assertOCAuth(t, authFile, tc.ocAccess, tc.ocRefresh, tc.wantOcExp, tc.ocAcctID)
+			if tc.storeAcc != "" {
+				key := tc.storeKey
+				if key == "" {
+					key = curUser
+				}
+				s := mustReadStore(t, accountsFile)[key]
+				if s["access"] != tc.storeAcc || storeInt64Must(t, s, "expires") != tc.storeExp {
+					t.Fatalf("saved access=%v expires=%v; want %s %d", s["access"], s["expires"], tc.storeAcc, tc.storeExp)
+				}
+			}
+		})
+	}
+
+	t.Run("store write failure leaves OpenCode unchanged", func(t *testing.T) {
+		if runtime.GOOS == "windows" {
+			t.Skip("chmod only enforced on POSIX")
+		}
+		t.Parallel()
+		authFile, piAuthFile, accountsFile := piSyncFixture(t)
+		seedAuthFile(t, authFile, ocAuthBody(ocAccess, ocRefresh, oldExpires, "oc-acct"))
+		seedAuthFile(t, piAuthFile, piAuthBody(piAccess, piRefresh, newExpires, piAcctID))
+		writeStore(t, accountsFile, savedUser(curUser, ocAccess, ocRefresh, oldExpires, ""))
+		if err := os.Chmod(accountsFile, 0o400); err != nil {
+			t.Fatalf("chmod: %v", err)
+		}
+		t.Cleanup(func() { _ = os.Chmod(accountsFile, 0o600) })
+		responses := piResponses{ocAccess: piPayload(curUser, "55", ""), piAccess: piPayload(curUser, "55", "")}
+		server, _ := newPiServer(t, responses)
+		cfg := config{AuthFile: authFile, PiAuthFile: piAuthFile, AccountsFile: accountsFile, UsageURL: server.URL, HTTPClient: server.Client()}
+		_, _, _, err := reconcilePiInbound(context.Background(), cfg,
+			map[string]any{"access": ocAccess, "refresh": ocRefresh, "expires": oldExpires, "type": "oauth"},
+			usageWindow{UserID: curUser, UsedPercent: "55"}, true)
+		if err == nil {
+			t.Fatalf("want store-write error")
+		}
+		assertOCAuth(t, authFile, ocAccess, ocRefresh, oldExpires, "oc-acct")
+	})
+
+	t.Run("OpenCode write failure returns error and leaves store updated", func(t *testing.T) {
+		if runtime.GOOS == "windows" {
+			t.Skip("chmod only enforced on POSIX")
+		}
+		t.Parallel()
+		authFile, piAuthFile, accountsFile := piSyncFixture(t)
+		seedAuthFile(t, authFile, ocAuthBody(ocAccess, ocRefresh, oldExpires, "oc-acct"))
+		seedAuthFile(t, piAuthFile, piAuthBody(piAccess, piRefresh, newExpires, piAcctID))
+		writeStore(t, accountsFile, savedUser(curUser, ocAccess, ocRefresh, oldExpires, ""))
+		if err := os.Chmod(authFile, 0o400); err != nil {
+			t.Fatalf("chmod: %v", err)
+		}
+		t.Cleanup(func() { _ = os.Chmod(authFile, 0o600) })
+		responses := piResponses{ocAccess: piPayload(curUser, "55", ""), piAccess: piPayload(curUser, "55", "")}
+		server, _ := newPiServer(t, responses)
+		cfg := config{AuthFile: authFile, PiAuthFile: piAuthFile, AccountsFile: accountsFile, UsageURL: server.URL, HTTPClient: server.Client()}
+		_, _, _, err := reconcilePiInbound(context.Background(), cfg,
+			map[string]any{"access": ocAccess, "refresh": ocRefresh, "expires": oldExpires, "type": "oauth"},
+			usageWindow{UserID: curUser, UsedPercent: "55"}, true)
+		if err == nil {
+			t.Fatalf("want opencode-write error")
+		}
+		if s := mustReadStore(t, accountsFile)[curUser]; s["access"] != piAccess {
+			t.Fatalf("store not updated: access=%v", s["access"])
+		}
+		assertOCAuth(t, authFile, ocAccess, ocRefresh, oldExpires, "oc-acct")
+	})
+}
+
+func TestRunDefaultPiInboundReconciliation(t *testing.T) {
+	t.Parallel()
+	t.Run("same access: no second API call", func(t *testing.T) {
+		t.Parallel()
+		authFile, piAuthFile, accountsFile := piSyncFixture(t)
+		const shared = "shared-access"
+		seedAuthFile(t, authFile, ocAuthBody(shared, "oc-r", 1776000000000, "oc-acct"))
+		seedAuthFile(t, piAuthFile, piAuthBody(shared, "pi-r-shared", 1778000000000, "pi-acct"))
+		writeStore(t, accountsFile, map[string]any{"user_id": "user-cur", "access": shared, "expires": int64(1776000000000), "type": "oauth"})
+		server, requests := newPiServer(t, piResponses{shared: piPayload("user-cur", "42", "")})
+		var out strings.Builder
+		if err := runWithArgs(context.Background(), config{AuthFile: authFile, PiAuthFile: piAuthFile, AccountsFile: accountsFile, UsageURL: server.URL, HTTPClient: server.Client()}, &out, nil); err != nil {
+			t.Fatalf("runWithArgs: %v", err)
+		}
+		if out.String() != "42" || requests.Load() != 1 {
+			t.Fatalf("stdout=%q requests=%d; want 42, 1", out.String(), requests.Load())
+		}
+		assertOCAuth(t, authFile, shared, "pi-r-shared", 1778000000000, "pi-acct")
+	})
+	t.Run("shape-change: 5h ON recomputes mode from dual Pi response", func(t *testing.T) {
+		t.Parallel()
+		authFile, piAuthFile, accountsFile := piSyncFixture(t)
+		seedAuthFile(t, authFile, ocAuthBody("oc-access", "oc-r", 1776000000000, "oc-acct"))
+		seedAuthFile(t, piAuthFile, piAuthBody("pi-access", "pi-r", 1778000000000, "pi-acct"))
+		writeStore(t, accountsFile, map[string]any{"user_id": "user-cur", "access": "oc-access", "expires": int64(1776000000000), "type": "oauth", "usedPercent": "10", "resetAt": int64(1777414800)})
+		responses := piResponses{"oc-access": piPayload("user-cur", "10", ""), "pi-access": piPayload("user-cur", "10", "20")}
+		server, _ := newPiServer(t, responses)
+		cfgFile := filepath.Join(t.TempDir(), "config.json")
+		if err := os.WriteFile(cfgFile, []byte(`{"5h":"on"}`), 0o600); err != nil {
+			t.Fatalf("seed cfg: %v", err)
+		}
+		var out strings.Builder
+		if err := runWithArgs(context.Background(), config{AuthFile: authFile, PiAuthFile: piAuthFile, AccountsFile: accountsFile, ConfigFile: cfgFile, UsageURL: server.URL, HTTPClient: server.Client()}, &out, nil); err != nil {
+			t.Fatalf("runWithArgs: %v", err)
+		}
+		if out.String() != "10" {
+			t.Fatalf("stdout: got %q, want 10 (5h primary)", out.String())
+		}
+		saved := mustReadStore(t, accountsFile)["user-cur"]
+		if saved["secondaryUsedPercent"] != "20" || storeInt64Must(t, saved, "secondaryResetAt") != 1778203200 {
+			t.Fatalf("secondary not persisted: secondaryUsedPercent=%v secondaryResetAt=%v", saved["secondaryUsedPercent"], saved["secondaryResetAt"])
+		}
+	})
+	t.Run("email preservation: saved email kept", func(t *testing.T) {
+		t.Parallel()
+		authFile, piAuthFile, accountsFile := piSyncFixture(t)
+		seedAuthFile(t, authFile, ocAuthBody("oc-access", "oc-r", 1776000000000, "oc-acct"))
+		seedAuthFile(t, piAuthFile, piAuthBody("pi-access", "pi-r", 1778000000000, "pi-acct"))
+		writeStore(t, accountsFile, map[string]any{"user_id": "user-cur", "access": "oc-access", "refresh": "oc-r", "expires": int64(1776000000000), "type": "oauth", "email": "saved@example.com"})
+		responses := piResponses{"oc-access": piPayload("user-cur", "55", ""), "pi-access": piPayload("user-cur", "55", "")}
+		server, _ := newPiServer(t, responses)
+		var out strings.Builder
+		if err := runWithArgs(context.Background(), config{AuthFile: authFile, PiAuthFile: piAuthFile, AccountsFile: accountsFile, UsageURL: server.URL, HTTPClient: server.Client()}, &out, nil); err != nil {
+			t.Fatalf("runWithArgs: %v", err)
+		}
+		saved := mustReadStore(t, accountsFile)["user-cur"]
+		if saved["email"] != "saved@example.com" {
+			t.Fatalf("saved email overwritten: got %v", saved["email"])
+		}
+	})
+}
+
+func TestRunNonDefaultCommandsDoNotImportPi(t *testing.T) {
+	t.Parallel()
+	const (
+		ocAccess, ocRefresh, otherAccess, piNew = "opencode-access", "opencode-refresh", "other-access", "pi-new"
+		ocExpires                               = int64(1776000000000)
+	)
+	setup := func(t *testing.T) (string, string, string, *httptest.Server, *atomic.Int32) {
+		t.Helper()
+		authFile, piAuthFile, accountsFile := piSyncFixture(t)
+		seedAuthFile(t, authFile, ocAuthBody(ocAccess, ocRefresh, ocExpires, "oc-acct"))
+		seedAuthFile(t, piAuthFile, piAuthBody(piNew, "pi-r", 1778000000000, "pi-acct"))
+		writeStore(t, accountsFile, map[string]any{"user_id": "user-cur", "access": ocAccess, "refresh": ocRefresh, "expires": ocExpires, "type": "oauth"}, map[string]any{"user_id": "user-other", "access": otherAccess, "refresh": "other-r", "expires": ocExpires, "type": "oauth"})
+		responses := piResponses{ocAccess: piPayload("user-cur", "13", ""), otherAccess: piPayload("user-other", "66", ""), piNew: piPayload("user-cur", "13", "")}
+		server, requests := newPiServer(t, responses)
+		return authFile, piAuthFile, accountsFile, server, requests
+	}
+	cases := []struct {
+		name   string
+		args   []string
+		expect func(t *testing.T, a, p string, r *atomic.Int32)
+	}{
+		{"accounts", []string{"accounts"}, func(t *testing.T, a, _ string, r *atomic.Int32) {
+			assertOCAuth(t, a, ocAccess, ocRefresh, ocExpires, "oc-acct")
+			if got := r.Load(); got != 2 {
+				t.Fatalf("accounts must not issue Pi request: got %d, want 2", got)
+			}
+		}},
+		{"list", []string{"list"}, func(t *testing.T, a, _ string, _ *atomic.Int32) {
+			assertOCAuth(t, a, ocAccess, ocRefresh, ocExpires, "oc-acct")
+		}},
+		{"use rotates Pi but does not inbound-import", []string{"use", "user-other"}, func(t *testing.T, _, p string, _ *atomic.Int32) {
+			pc, _ := readJSONObject(t, p)["openai-codex"].(map[string]any)
+			if pc == nil || pc["access"] == piNew {
+				t.Fatalf("use triggered inbound import: %v", pc)
+			}
+			if pc == nil || pc["access"] != otherAccess {
+				t.Fatalf("use did not rotate Pi to user-other: %v", pc)
+			}
+		}},
+		{"config does not touch Pi auth", []string{"config", "5h"}, func(t *testing.T, a, p string, _ *atomic.Int32) {
+			original := mustReadFile(t, p)
+			cfgFile := filepath.Join(t.TempDir(), "config.json")
+			if err := runWithArgs(context.Background(), config{AuthFile: a, PiAuthFile: p, AccountsFile: filepath.Dir(p) + "/accounts.json", ConfigFile: cfgFile, UsageURL: "http://unused", HTTPClient: http.DefaultClient}, &strings.Builder{}, []string{"config", "5h"}); err != nil {
+				t.Fatalf("config: %v", err)
+			}
+			if string(mustReadFile(t, p)) != string(original) {
+				t.Fatalf("config mutated Pi auth")
+			}
+			assertOCAuth(t, a, ocAccess, ocRefresh, ocExpires, "oc-acct")
+		}},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			a, p, acc, server, requests := setup(t)
+			var out strings.Builder
+			if err := runWithArgs(context.Background(), config{AuthFile: a, PiAuthFile: p, AccountsFile: acc, UsageURL: server.URL, HTTPClient: server.Client()}, &out, tc.args); err != nil {
+				t.Fatalf("runWithArgs %v: %v", tc.args, err)
+			}
+			tc.expect(t, a, p, requests)
+		})
+	}
+}
+
+func TestRunDefaultCommand(t *testing.T) {
+	t.Parallel()
+	type seed struct{ oc, pi string }
+	cases := []struct {
+		name      string
+		seed      seed
+		resp      piResponses
+		wantRun   bool
+		wantOut   string
+		wantErr   []string
+		wantAPI   int32
+		wantStore map[string]map[string]any
+		cfgFile   string
+		emptyPi   bool
+	}{
+		{
+			name:    "both unavailable: explicit English error, no stdout, no API",
+			wantErr: []string{errNeitherProviderAvailable.Error()},
+			wantAPI: 0,
+		},
+		{
+			name:    "explicit empty PiAuthFile + missing OC auth: same English error",
+			wantErr: []string{errNeitherProviderAvailable.Error()},
+			wantAPI: 0, emptyPi: true,
+		},
+		{
+			name:    "OC available, Pi unavailable: legacy OC pipeline runs",
+			seed:    seed{oc: ocAuthBody("oc-a", "oc-r", 1776000000000, "oc-acct")},
+			resp:    piResponses{"oc-a": piPayload("user-cur", "55", "")},
+			wantRun: true, wantOut: "55", wantAPI: 1,
+		},
+		{
+			name:    "Pi malformed: routes to OC, no Pi request",
+			seed:    seed{oc: ocAuthBody("oc-a", "oc-r", 1776000000000, "oc-acct"), pi: "{not valid"},
+			resp:    piResponses{"oc-a": piPayload("user-cur", "37", "")},
+			wantRun: true, wantOut: "37", wantAPI: 1,
+		},
+		{
+			name:    "OC missing + Pi available: Pi-only path runs, persists store, no OC write",
+			seed:    seed{pi: piAuthBody("pi-a", "pi-r", 1778000000000, "pi-acct")},
+			resp:    piResponses{"pi-a": piPayload("user-cur", "42", "")},
+			wantRun: true, wantOut: "42", wantAPI: 1,
+			wantStore: map[string]map[string]any{
+				"user-cur": {"access": "pi-a", "refresh": "pi-r", "expires": int64(1778000000000), "usedPercent": "42", "type": "oauth", "accountId": "pi-acct"},
+			},
+		},
+		{
+			name:    "OC malformed + Pi available: Pi-only path runs, OC untouched",
+			seed:    seed{oc: "{not valid", pi: piAuthBody("pi-a", "pi-r", 1778000000000, "pi-acct")},
+			resp:    piResponses{"pi-a": piPayload("user-cur", "55", "")},
+			wantRun: true, wantOut: "55", wantAPI: 1,
+		},
+		{
+			name:    "OC + Pi available, both API OK: OC pipeline + inbound reconcile",
+			seed:    seed{oc: ocAuthBody("oc-a", "oc-r", 1776000000000, "oc-acct"), pi: piAuthBody("pi-a", "pi-r", 1778000000000, "pi-acct")},
+			resp:    piResponses{"oc-a": piPayload("user-cur", "55", ""), "pi-a": piPayload("user-cur", "55", "")},
+			wantRun: true, wantOut: "55", wantAPI: 2,
+		},
+		{
+			name:    "OC API rejected + Pi valid: Pi-only fallback succeeds",
+			seed:    seed{oc: ocAuthBody("oc-a", "oc-r", 1776000000000, "oc-acct"), pi: piAuthBody("pi-a", "pi-r", 1778000000000, "pi-acct")},
+			resp:    piResponses{"pi-a": piPayload("user-cur", "72", "")},
+			wantRun: true, wantOut: "72", wantAPI: 2,
+		},
+		{
+			name:    "both APIs fail: joined runtime diagnostic, NEVER the not-installed error",
+			seed:    seed{oc: ocAuthBody("oc-a", "oc-r", 1776000000000, "oc-acct"), pi: piAuthBody("pi-a", "pi-r", 1778000000000, "pi-acct")},
+			wantErr: []string{"OpenCode usage fetch failed", "Pi usage fetch also failed"},
+			wantAPI: 2,
+		},
+		{
+			name:    "Pi-only: 5h ON dual response persists secondary; stdout primary",
+			seed:    seed{pi: piAuthBody("pi-a", "pi-r", 1778000000000, "pi-acct")},
+			resp:    piResponses{"pi-a": piPayload("user-cur", "10", "20")},
+			wantRun: true, wantOut: "10", wantAPI: 1, cfgFile: `{"5h":"on"}`,
+			wantStore: map[string]map[string]any{"user-cur": {"usedPercent": "10", "secondaryUsedPercent": "20"}},
+		},
+		{
+			name:    "Pi-only: 5h OFF promotes secondary to primary; clears secondary",
+			seed:    seed{pi: piAuthBody("pi-a", "pi-r", 1778000000000, "pi-acct")},
+			resp:    piResponses{"pi-a": piPayload("user-cur", "10", "20")},
+			wantRun: true, wantOut: "20", wantAPI: 1, cfgFile: `{"5h":"off"}`,
+			wantStore: map[string]map[string]any{"user-cur": {"usedPercent": "20"}},
+		},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			authFile, piAuthFile, accountsFile := piSyncFixture(t)
+			if tc.seed.oc != "" {
+				seedAuthFile(t, authFile, tc.seed.oc)
+			}
+			if tc.seed.pi != "" {
+				seedAuthFile(t, piAuthFile, tc.seed.pi)
+			}
+			server, requests := newPiServer(t, tc.resp)
+			cfg := config{AuthFile: authFile, PiAuthFile: piAuthFile, AccountsFile: accountsFile, UsageURL: server.URL, HTTPClient: server.Client()}
+			if tc.emptyPi {
+				cfg.PiAuthFile = ""
+			}
+			if tc.cfgFile != "" {
+				cfg.ConfigFile = filepath.Join(t.TempDir(), "config.json")
+				if err := os.WriteFile(cfg.ConfigFile, []byte(tc.cfgFile), 0o600); err != nil {
+					t.Fatalf("seed cfg: %v", err)
+				}
+			}
+			var out strings.Builder
+			err := runWithArgs(context.Background(), cfg, &out, nil)
+			if tc.wantRun && err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if !tc.wantRun && err == nil {
+				t.Fatalf("expected error, got nil; stdout=%q", out.String())
+			}
+			if tc.wantRun && out.String() != tc.wantOut {
+				t.Fatalf("stdout=%q want %q", out.String(), tc.wantOut)
+			}
+			if !tc.wantRun {
+				for _, want := range tc.wantErr {
+					if !strings.Contains(err.Error(), want) {
+						t.Fatalf("error %q must contain %q", err.Error(), want)
+					}
+				}
+				if (tc.seed.oc != "" || tc.seed.pi != "") && strings.Contains(err.Error(), errNeitherProviderAvailable.Error()) {
+					t.Fatalf("error must not be the not-installed error when a provider was configured: %v", err)
+				}
+				if out.Len() != 0 {
+					t.Fatalf("must not print on failure, got %q", out.String())
+				}
+			}
+			if got := requests.Load(); got != tc.wantAPI {
+				t.Fatalf("api calls: got %d, want %d", got, tc.wantAPI)
+			}
+			for userID, wantFields := range tc.wantStore {
+				saved := mustReadStore(t, accountsFile)[userID]
+				for k, want := range wantFields {
+					if k == "expires" {
+						if got := storeInt64Must(t, saved, k); got != want.(int64) {
+							t.Fatalf("stored %s.%s=%v want %v", userID, k, saved[k], want)
+						}
+						continue
+					}
+					if saved[k] != want {
+						t.Fatalf("stored %s.%s=%v want %v", userID, k, saved[k], want)
+					}
+				}
+			}
+		})
+	}
+}
+
+func TestLoadProviderAvailability(t *testing.T) {
+	t.Parallel()
+	t.Run("OC unavailable: missing/empty/malformed/no-access", func(t *testing.T) {
+		t.Parallel()
+		if _, ok := loadOpenCodeAccountIfAvailable(filepath.Join(t.TempDir(), "auth.json")); ok {
+			t.Fatal("missing file must be unavailable")
+		}
+		if _, ok := loadOpenCodeAccountIfAvailable(""); ok {
+			t.Fatal("empty path must be unavailable")
+		}
+		f := filepath.Join(t.TempDir(), "auth.json")
+		for _, body := range []string{`{not valid`, `{"openai.accountId":"acct-1"}`} {
+			seedAuthFile(t, f, body)
+			if _, ok := loadOpenCodeAccountIfAvailable(f); ok {
+				t.Fatalf("body %q must be unavailable", body)
+			}
+		}
+	})
+	t.Run("OC legacy non-empty access is available", func(t *testing.T) {
+		t.Parallel()
+		f := filepath.Join(t.TempDir(), "auth.json")
+		seedAuthFile(t, f, `{"openai.access":"legacy-token"}`)
+		a, ok := loadOpenCodeAccountIfAvailable(f)
+		if !ok || a["access"] != "legacy-token" {
+			t.Fatalf("legacy auth file must remain available, got ok=%v", ok)
+		}
+	})
+	t.Run("Pi unavailable: empty/missing/missing-entry/malformed/invalid-oauth", func(t *testing.T) {
+		t.Parallel()
+		if _, ok := loadPiAuthIfUsable(""); ok {
+			t.Fatal("empty path must be unavailable")
+		}
+		if _, ok := loadPiAuthIfUsable(filepath.Join(t.TempDir(), "nope.json")); ok {
+			t.Fatal("missing file must be unavailable")
+		}
+		f := filepath.Join(t.TempDir(), "auth.json")
+		for _, body := range []string{`{"anthropic":{"access":"anth"}}`, `{not valid`, `{"openai-codex":{"type":"oauth","access":"a"}}`} {
+			seedAuthFile(t, f, body)
+			if _, ok := loadPiAuthIfUsable(f); ok {
+				t.Fatalf("body %q must be unavailable", body)
+			}
+		}
+	})
+	t.Run("Pi valid openai-codex is available and reusable", func(t *testing.T) {
+		t.Parallel()
+		f := filepath.Join(t.TempDir(), "auth.json")
+		seedAuthFile(t, f, piAuthBody("pi-a", "pi-r", 1778000000000, "pi-acct"))
+		info, ok := loadPiAuthIfUsable(f)
+		if !ok || info == nil || info.CredMap["access"] != "pi-a" || info.Payload["openai-codex"] == nil {
+			t.Fatalf("valid credential must be available: %#v", info)
+		}
+	})
+}
+
+func TestPiOnlyNoRotation(t *testing.T) {
+	t.Parallel()
+	authFile, piAuthFile, accountsFile := piSyncFixture(t)
+	seedAuthFile(t, piAuthFile, piAuthBody("pi-a", "pi-r", 1778000000000, "pi-acct"))
+	writeStore(t, accountsFile,
+		map[string]any{"user_id": "user-cur", "access": "pi-a", "refresh": "pi-r", "expires": int64(1778000000000), "type": "oauth"},
+		map[string]any{"user_id": "user-other", "access": "other-a", "refresh": "other-r", "expires": int64(1778000000000), "type": "oauth"},
+	)
+	server, _ := newPiServer(t, piResponses{"pi-a": piPayload("user-cur", "99", "")})
+	var out strings.Builder
+	if err := runWithArgs(context.Background(), config{AuthFile: authFile, PiAuthFile: piAuthFile, AccountsFile: accountsFile, UsageURL: server.URL, HTTPClient: server.Client()}, &out, nil); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if out.String() != "99" {
+		t.Fatalf("stdout=%q want 99", out.String())
+	}
+	if _, err := os.Stat(authFile); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("Pi-only must NOT create OC auth, stat err=%v", err)
+	}
+	if _, ok := mustReadStore(t, accountsFile)["user-cur"]; !ok {
+		t.Fatal("Pi account disappeared from store (rotated unexpectedly)")
 	}
 }

@@ -11,7 +11,9 @@ CLI en Go para consultar el uso de OpenAI desde OpenCode.
 
 ## Requisitos
 - Go 1.22 o superior.
-- Archivo de autenticación de OpenCode (por defecto: `%USERPROFILE%\\.local\\share\\opencode\\auth.json`).
+- Al menos uno de los dos proveedores de credenciales soportados (ver [Proveedores y fallback](#proveedores-y-fallback)):
+  - **OpenCode** (por defecto: `%USERPROFILE%\\.local\\share\\opencode\\auth.json`), o
+  - **Pi Agent** (por defecto: `%USERPROFILE%\\.pi\\agent\\auth.json` en Windows, `~/.pi/agent/auth.json` en Unix).
 
 ## Compilación local
 ```powershell
@@ -214,9 +216,93 @@ cuando la cuenta activa cambia:
 - `use <selector>` (cambio manual): sincroniza la cuenta seleccionada a Pi.
 - Rotación automática sin argumentos: sincroniza la cuenta alternativa elegida.
 
-El comando sin argumentos cuando la cuenta activa **no** cambia, `accounts`/`list`
-y la registración de la cuenta actual en el store **no** tocan ninguno de los
-dos archivos de auth.
+`accounts`/`list` y la registración ordinaria de la cuenta actual no cambian
+las cuentas activas. El comando sin argumentos sí puede actualizar credenciales
+sin cambiar de cuenta cuando importa desde Pi una versión OAuth más reciente.
+
+### Reconciliación entrante desde Pi (comando sin argumentos)
+
+Cuando se ejecuta sin argumentos, la CLI también hace una **reconciliación
+entrante best-effort** desde el `auth.json` de Pi:
+
+- Lee la entrada `openai-codex` de Pi bajo el mismo protocolo de lock
+  `${auth.json}.lock` que usa la sincronización saliente, pero como una
+  operación **estrictamente de lectura**: nunca crea ni modifica el archivo
+  de auth de Pi durante la inspección. Si el archivo falta, está bloqueado,
+  el JSON está malformado, la credencial no parsea o la API rechaza el
+  token, el comando continúa normalmente con OpenCode (no propaga error).
+- Valida el `access` de Pi contra el endpoint de uso y usa el `user_id`
+  devuelto por la API como **única** clave de match contra el store
+  normalizado (`accountId` es metadata y nunca se usa para emparejar).
+- Si el `access` de Pi es idéntico al de OpenCode, **no** hace una segunda
+  llamada a la API: reutiliza el `usage` ya descargado como validación.
+- La cuenta guardada debe tener un `expires` entero válido. Para una cuenta no
+  activa, Pi debe tener un `expires` estrictamente mayor. Para la cuenta activa,
+  tampoco se permite reemplazar una credencial de OpenCode o del store que sea
+  más reciente. Si el store ya contiene exactamente la versión de Pi pero
+  OpenCode quedó atrás, el siguiente intento actualiza solo OpenCode.
+- Mezcla **solo** los campos OAuth de Pi (`type=oauth`, `access`, `refresh`,
+  `expires`, `accountId` opcional) sobre la cuenta guardada matcheada;
+  preserva `user_id`, `email`, `account` y cualquier metadata personalizada.
+  Normaliza y persiste el `usage` de Pi según el toggle de 5 horas actual.
+- Cuando la cuenta matcheada es la activa de OpenCode (el `user_id` de la API
+  de Pi coincide con el `user_id` de la API de OpenCode): actualiza el tuple
+  OAuth completo de OpenCode y devuelve la cuenta reconciliada al resto del
+  pipeline; la persistencia normal posterior (`ensureCurrentAccountRegistered`)
+  opera sobre la cuenta reconciliada, así que **no puede restaurar
+  credenciales viejas**.
+- Cuando la cuenta matcheada **no** es la activa: solo importa al store. La
+  cuenta activa de OpenCode, el `usage` y el stdout del comando no se tocan
+  y nunca se cambia de cuenta solo porque Pi la tenga.
+
+La inspección entrante es best-effort: un archivo de Pi ausente o inválido,
+contención del lock, token rechazado, falta de coincidencia o expiraciones no
+comparables dejan el comando usando OpenCode sin devolver error. Una vez
+confirmada una credencial válida y más reciente, los fallos al persistir el
+store o actualizar OpenCode sí se devuelven para hacer visible una
+sincronización parcial y permitir reintentarla.
+
+## Proveedores y fallback
+
+El comando sin argumentos soporta dos proveedores independientes de
+credenciales OpenAI/ChatGPT:
+
+- **OpenCode**: lee `auth.json` (variable `OPENCODE_AUTH_FILE`).
+- **Pi Agent**: lee `auth.json` (variable `PI_CODING_AGENT_DIR`).
+
+Antes de ejecutar el pipeline, la CLI evalúa **disponibilidad** de cada
+proveedor y elige un camino según el resultado. Un proveedor se considera
+**no disponible** cuando:
+
+- Su `auth.json` no existe, no es legible, o el JSON está malformado.
+- La credencial que necesita no es parseable como OAuth válido:
+  - **OpenCode**: falta `openai.access` o viene vacío (semántica histórica de
+    `extractToken`; no se exige `refresh`, `expires` ni `type`, así que los
+    `auth.json` pre-existentes siguen siendo utilizables).
+  - **Pi Agent**: falta la entrada `openai-codex` o falla la validación estricta
+    `parsePiOpenAICodexEntry` (acceso, refresh, `expires` entero de
+    milisegundos, `type=oauth` cuando está presente y `accountId` opcional).
+
+La matriz de comportamiento del comando sin argumentos es:
+
+| OpenCode | Pi      | Comportamiento |
+|----------|---------|----------------|
+| disponible | disponible | Camino OpenCode preservado exactamente, incluyendo la [reconciliación entrante desde Pi](#reconciliación-entrante-desde-pi-comando-sin-argumentos). |
+| disponible | no disponible | Camino OpenCode preservado; la reconciliación entrante se omite como no-op (no se propaga error). |
+| no disponible | disponible | **Camino Pi-only**: se consulta el endpoint con el token de Pi, se imprime el `used_percent` en `stdout` y se persiste la cuenta derivada en el store de la CLI. **No** se crea ni se reescribe el `auth.json` de OpenCode y **no** se cambia de cuenta ni se rota. |
+| no disponible | no disponible | Error claro que indica que ni OpenCode ni Pi Agent están instalados o configurados. |
+
+El camino Pi-only aplica el toggle de 5 horas, persiste el `usedPercent`,
+`resetAt`, los campos `secondary*` bajo 5h ON, y el `cooldownUntil` por la
+misma vía que el camino OpenCode, así que el store queda con la misma forma
+que produciría una corrida OpenCode para esa misma cuenta. Un Pi fallido al
+llamar al endpoint propaga el error sin tocar el store ni el `auth.json` de
+OpenCode. Cuando ambos `auth.json` son utilizables pero la consulta inicial
+del endpoint con el token de OpenCode falla, la CLI intenta Pi como fallback;
+si ambas llamadas a la API fallan, devuelve un diagnóstico de runtime en lugar
+del error `OpenCode and Pi Agent are not installed or configured`.
+
+## Sincronización con Pi (`auth.json`)
 
 Cuando el cambio ocurre, la CLI actualiza ambos archivos de forma coherente:
 los campos OAuth de la cuenta seleccionada (`access`, `accountId`, `refresh`,

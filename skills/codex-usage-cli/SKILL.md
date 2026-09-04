@@ -1,14 +1,14 @@
 ---
 name: codex-usage-cli
 description: >
-  Usa codex-usage-cli para consultar el consumo de cuentas OpenAI/ChatGPT guardadas por OpenCode,
+  Usa codex-usage-cli para consultar el consumo de cuentas OpenAI/ChatGPT guardadas por OpenCode o Pi Agent,
   revisar rotación y listar cuentas sin exponer tokens.
   Trigger: Cuando un agente necesite consultar uso de tokens, revisar cuentas OpenAI guardadas,
-  verificar cooldown/reset o identificar la cuenta activa en OpenCode.
+  verificar cooldown/reset o identificar la cuenta activa en OpenCode/Pi.
 license: Apache-2.0
 metadata:
   author: gonzalez962
-  version: "1.2"
+  version: "1.4"
 ---
 
 ## When to Use
@@ -34,7 +34,10 @@ metadata:
 - Con el toggle **desactivado**, la CLI ignora por completo la ventana de 5 horas (independiente de lo que el endpoint devuelva). Si la respuesta trae `secondary_window`, su valor semanal se **promueve** a la primaria canónica (UsedPercent/ResetAt) y los campos secundarios se limpian antes de persistir, rotar, calcular cooldown o imprimir. Si `secondary_window` está ausente o es `null`, se conserva `primary_window` como fallback semanal. El endpoint no cambia: la CLI reinterpreta la respuesta según el toggle.
 - Las filas de `accounts`/`list` se ordenan por `user_id` alfabéticamente. La columna `ID` es estable y se puede pasar a `use #<id>` (requiere el prefijo `#` para evitar colisiones con `user_id` numéricos como `1`/`2`/`10`).
 - Para cambiar la cuenta activa en OpenCode, usa `use <selector>` con el índice de `accounts`/`list` como `#<n>`, el `user_id` exacto, o el email (case-insensitive).
-- Adicionalmente al `auth.json` de OpenCode, la CLI sincroniza la cuenta activa al `auth.json` de Pi (clave de primer nivel `openai-codex`) cuando la cuenta activa **cambia**: `use <selector>` y la rotación automática. El comando sin argumentos sin rotación, `accounts`/`list` y la registración de la cuenta actual en el store **no** tocan ninguno de los dos `auth.json`. Por defecto el archivo es `%USERPROFILE%\.pi\agent\auth.json` (o `~/.pi/agent/auth.json` en Unix). La variable `PI_CODING_AGENT_DIR` sobreescribe el directorio y le anexa `auth.json`; acepta el prefijo `~` (semántica Pi).
+- La sincronización saliente actualiza `openai-codex` en el `auth.json` de Pi cuando `use` o la rotación cambian la cuenta activa. La ruta predeterminada es `%USERPROFILE%\.pi\agent\auth.json` (o `~/.pi/agent/auth.json`) y respeta `PI_CODING_AGENT_DIR`.
+- **Reconciliación entrante desde Pi:** solo el comando sin argumentos lee Pi bajo `${auth.json}.lock`, valida el token mediante el endpoint de uso y empareja exclusivamente por el `user_id` devuelto. Una credencial Pi inválida, bloqueada, no coincidente o no más reciente es un no-op y el flujo continúa con OpenCode.
+- Una coincidencia no activa actualiza solo el store. Una coincidencia activa actualiza store y OpenCode sin degradar una credencial más nueva; si el store ya contiene la versión de Pi, puede completar únicamente OpenCode. Los errores de escritura posteriores a una coincidencia válida se devuelven para hacer visible una sincronización parcial. `accounts`, `list`, `use` y `config` no realizan importación entrante.
+- **Proveedores y fallback (comando sin argumentos):** la CLI evalúa disponibilidad de OpenCode y Pi antes de ejecutar el pipeline. Un proveedor está **no disponible** cuando su `auth.json` falta, está malformado o su credencial no parsea. OpenCode usa la semántica histórica (`openai.access` no vacío; no exige `refresh`/`expires`/`type`); Pi usa validación estricta `parsePiOpenAICodexEntry` bajo su lock. Combinaciones: ambos disponibles → camino OpenCode + reconciliación entrante desde Pi; OpenCode disponible + Pi no → camino OpenCode (la reconciliación se omite como no-op); Pi disponible + OpenCode no → **camino Pi-only** (consulta el endpoint con el token de Pi, persiste en el store, imprime `used_percent`; **no** crea ni reescribe el `auth.json` de OpenCode y **no** rota ni cambia de cuenta); ambos no disponibles → error claro indicando que OpenCode y Pi Agent no están instalados o configurados. Una falla inicial del API de OpenCode intenta Pi (siempre que Pi esté utilizable); si ambos APIs fallan, el error devuelto es un diagnóstico de runtime y no el error de "no instalado/configurado". El camino Pi-only aplica el toggle de 5 horas y persiste la misma forma de store que el camino OpenCode.
 - Cuando hay cambio, la CLI propaga los campos OAuth de la cuenta seleccionada (`access`, `accountId`, `refresh`, `expires`, `type`) al `auth.json` de OpenCode tanto en la representación plana `openai.*` como en la anidada `openai` (si esta última ya existía), preservando cualquier otro provider y los campos personalizados bajo `openai.*`. Los campos que la cuenta fuente no trae se eliminan de ambas representaciones para que no sobreviva valor obsoleto de la cuenta anterior.
 - La credencial sincronizada a Pi se construye **solo** con los campos OAuth de la cuenta seleccionada: `type` (siempre `"oauth"`; la CLI normaliza registros legados que omiten `type`), `access`, `refresh`, `expires` (entero de milisegundos desde epoch, validado sin truncar) y `accountId` (omitido si está ausente o vacío). Metadatos de uso (`usedPercent`, `resetAt`, `secondaryUsedPercent`, `secondaryResetAt`, `cooldownUntil`) y de identidad (`user_id`, `email`) **nunca** se copian a Pi.
 - La actualización a Pi reemplaza únicamente la entrada `openai-codex`, preservando las claves y valores de cualquier otro provider (`anthropic`, `google`, etc.) y sus valores anidados. El formateo del archivo (espacios, orden de claves) puede variar porque la CLI lo re-marshala; el archivo se decodifica con `UseNumber` para que números grandes de otros providers (>2⁵³) sobrevivan la lectura/modificación/escritura sin redondeo. El archivo se crea con `0600` y, cuando hay que crearlo, el directorio padre se crea con `0700`; en POSIX un archivo existente se ajusta a `0600` **antes** de escribir. Si la CLI no puede ajustar permisos, aborta sin tocar credenciales. Un archivo vacío se rechaza como malformado (mismo comportamiento que `JSON.parse` de Pi). La CLI adquiere el lock `${auth.json}.lock` como directorio atómico (protocolo `proper-lockfile` de Pi), 10 intentos × 20 ms, y nunca borra locks que no creó.
@@ -163,7 +166,7 @@ $env:PI_CODING_AGENT_DIR="C:\ruta\pi"; codex-usage-cli use #2
 
 ## Agent Workflow
 
-1. Para una respuesta automática o scriptable, ejecuta `codex-usage-cli` y trata stdout como un número (ventana 5h con toggle activado y doble ventana disponible; semanal en cualquier otro caso).
+1. Para una respuesta automática o scriptable, ejecuta `codex-usage-cli` y trata stdout como un número (ventana 5h con toggle activado y doble ventana disponible; semanal en cualquier otro caso). Si el comando devuelve un error indicando que OpenCode y Pi Agent no están instalados o configurados, informa al usuario que debe configurar al menos uno de los dos proveedores (`auth.json` con un `openai.access` válido en OpenCode, o `auth.json` con una entrada `openai-codex` OAuth válida en Pi). Si solo Pi está disponible, la CLI ejecuta el camino Pi-only: usa el token de Pi, imprime el `used_percent` y persiste la cuenta en el store, pero no crea ni reescribe el `auth.json` de OpenCode ni rota de cuenta.
 2. Para una respuesta al usuario sobre varias cuentas, ejecuta `codex-usage-cli accounts`.
 3. Resume la tabla Markdown sin incluir tokens ni rutas sensibles. Recuerda que las columnas cambian según el toggle (`USED%/WEEK%` vs solo `WEEK%`).
 4. Si la cuenta activa aparece con uso alto, menciona el tiempo restante de reset (5h o semanal según corresponda) y si hay otras cuentas disponibles según la tabla.

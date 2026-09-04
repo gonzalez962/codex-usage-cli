@@ -61,26 +61,8 @@ func (w usageWindow) fiveHourAvailable(toggleEnabled bool) bool {
 }
 
 // normalizeUsageForToggle applies the 5h toggle to a raw usage window and
-// returns both the canonical usage every consumer (persistence, rotation,
-// cooldown, display, stdout) should see and the effective fiveHourMode.
-//
-// Contract (matches the README/SKILL map):
-//
-//   - 5h ON + secondary present: dual mode is preserved. Primary keeps the
-//     5h value (rate_limit.primary_window) and secondary keeps the weekly
-//     value (rate_limit.secondary_window). fiveHourMode is true.
-//   - 5h ON + secondary missing/null: primary is retained as the weekly
-//     fallback. Secondary fields stay empty and fiveHourMode is false.
-//   - 5h OFF + secondary present: the 5h primary data is fully ignored. The
-//     weekly secondary value is PROMOTED into the canonical primary fields
-//     (UsedPercent / ResetAt) and the secondary fields are CLEARED so the
-//     downstream pipeline only ever sees the weekly contract. fiveHourMode
-//     is false.
-//   - 5h OFF + secondary missing/null: primary is retained as the weekly
-//     fallback. fiveHourMode is false.
-//
-// Centralizing this here means callers in runDefaultCommand and
-// runAccountsCommand no longer carry the OFF-mode promotion logic inline.
+// returns the canonical usage every consumer should see plus the effective
+// fiveHourMode (matches the README/SKILL contract).
 func normalizeUsageForToggle(usage usageWindow, toggleEnabled bool) (usageWindow, bool) {
 	if toggleEnabled {
 		return usage, usage.fiveHourAvailable(toggleEnabled)
@@ -210,24 +192,75 @@ func runWithArgs(ctx context.Context, cfg config, stdout io.Writer, args []strin
 	return runDefaultCommand(ctx, cfg, stdout)
 }
 
-func runDefaultCommand(ctx context.Context, cfg config, stdout io.Writer) error {
+// errNeitherProviderAvailable is returned when both OpenCode and Pi auth
+// are unavailable. The wording is part of the CLI contract: users and tests
+// assert this exact English phrase.
+var errNeitherProviderAvailable = errors.New("OpenCode and Pi Agent are not installed or configured")
 
-	account, err := readOpenAIAccount(cfg.AuthFile)
-	if err != nil {
-		return err
+// ocInitialFetchError marks the failure of the FIRST OpenCode usage fetch in
+// runDefaultCommandOpenCodePath; the dispatcher uses errors.As to fall back
+// to Pi-only. Later stage errors return unwrapped so partial-sync states
+// stay visible. The wrapper preserves the original fetchUsageWindow text.
+type ocInitialFetchError struct{ Err error }
+
+func (e *ocInitialFetchError) Error() string { return e.Err.Error() }
+func (e *ocInitialFetchError) Unwrap() error { return e.Err }
+
+func runDefaultCommand(ctx context.Context, cfg config, stdout io.Writer) error {
+	// OC is permissive (no refresh/expires/type check); Pi uses strict
+	// parsePiOpenAICodexEntry under the proper-lockfile protocol. Fallback
+	// fires only when the FIRST OC usage fetch fails AND Pi is usable.
+	ocAccount, ocAvailable := loadOpenCodeAccountIfAvailable(cfg.AuthFile)
+	piInfo, piAvailable := loadPiAuthIfUsable(cfg.PiAuthFile)
+
+	if !ocAvailable && !piAvailable {
+		return errNeitherProviderAvailable
+	}
+	if !ocAvailable {
+		return runDefaultCommandPiOnlyPath(ctx, cfg, stdout, piInfo)
 	}
 
+	err := runDefaultCommandOpenCodePath(ctx, cfg, stdout, ocAccount, piInfo, piAvailable)
+	if err == nil {
+		return nil
+	}
+	var initialErr *ocInitialFetchError
+	if !piAvailable || !errors.As(err, &initialErr) {
+		return err
+	}
+	if piErr := runDefaultCommandPiOnlyPath(ctx, cfg, stdout, piInfo); piErr != nil {
+		// Join both diagnostics so the caller sees both reasons rather than
+		// the misleading "not configured" error.
+		return fmt.Errorf("OpenCode usage fetch failed (%v); Pi usage fetch also failed (%v)", initialErr.Err, piErr)
+	}
+	return nil
+}
+
+// runDefaultCommandOpenCodePath preserves the existing OpenCode pipeline,
+// including the best-effort inbound Pi reconciliation. The first
+// fetchUsageWindow is the ONLY fallback-eligible stage (wrapped in
+// ocInitialFetchError); later stages return errors unwrapped so partial-
+// sync states stay visible.
+func runDefaultCommandOpenCodePath(ctx context.Context, cfg config, stdout io.Writer, account map[string]any, piInfo *piAuthInfo, piAvailable bool) error {
 	token, _ := account["access"].(string)
 	usage, err := fetchUsageWindow(ctx, cfg.HTTPClient, cfg.UsageURL, token)
 	if err != nil {
-		return err
+		return &ocInitialFetchError{Err: err}
 	}
 
-	// Apply the 5h toggle ONCE here so persistence, rotation, cooldown and
-	// stdout all observe the canonical contract. With 5h off and a dual
-	// response this promotes the weekly secondary into the primary fields
-	// and clears the secondary fields.
 	usage, fiveHourMode := normalizeUsageForToggle(usage, cfg.FiveHourEnabled)
+
+	// Best-effort inbound Pi reconciliation. ONLY runDefaultCommand does
+	// this import; clean no-ops return nil; partial-sync write failures
+	// surface as errors. Skipped when Pi was determined unavailable.
+	if piAvailable {
+		account, usage, _, err = reconcilePiInboundFromPayload(ctx, cfg, piInfo, account, usage, cfg.FiveHourEnabled)
+		if err != nil {
+			return err
+		}
+	}
+	// Recompute after the inbound swap (idempotent on an already-normalized usage).
+	usage, fiveHourMode = normalizeUsageForToggle(usage, cfg.FiveHourEnabled)
 
 	if err := ensureCurrentAccountRegistered(cfg.AccountsFile, account, usage, fiveHourMode); err != nil {
 		return err
@@ -257,6 +290,86 @@ func runDefaultCommand(ctx context.Context, cfg config, stdout io.Writer) error 
 
 	_, err = io.WriteString(stdout, usage.UsedPercent)
 	return err
+}
+
+// runDefaultCommandPiOnlyPath runs the default command when only Pi is
+// available. MUST NOT touch OpenCode auth.json and MUST NOT rotate (Pi-only
+// is single-account); the persisted shape matches the OC path.
+func runDefaultCommandPiOnlyPath(ctx context.Context, cfg config, stdout io.Writer, piInfo *piAuthInfo) error {
+	piToken, _ := piInfo.CredMap["access"].(string)
+	if strings.TrimSpace(piToken) == "" {
+		return errors.New("Pi openai-codex credential is missing a non-empty access token")
+	}
+
+	usage, err := fetchUsageWindow(ctx, cfg.HTTPClient, cfg.UsageURL, piToken)
+	if err != nil {
+		return err
+	}
+
+	usage, fiveHourMode := normalizeUsageForToggle(usage, cfg.FiveHourEnabled)
+	persisted := accountWithUsage(piInfo.CredMap, usage, fiveHourMode)
+
+	// Persist ONLY into the store. OpenCode's auth.json is intentionally not
+	// touched here: Pi-only mode must never create or rewrite it.
+	if err := persistOpenAIAccount(cfg.AccountsFile, persisted); err != nil {
+		return err
+	}
+
+	_, err = io.WriteString(stdout, usage.UsedPercent)
+	return err
+}
+
+// loadOpenCodeAccountIfAvailable returns the parsed OpenCode account when the
+// auth file exists and yields a non-empty openai.access token. The check is
+// intentionally permissive (no refresh/expires/type enforcement) so legacy
+// auth files keep satisfying it; missing files, parse errors, and missing or
+// empty access tokens count as unavailable.
+func loadOpenCodeAccountIfAvailable(authFile string) (map[string]any, bool) {
+	if strings.TrimSpace(authFile) == "" {
+		return nil, false
+	}
+	account, err := readOpenAIAccount(authFile)
+	if err != nil {
+		return nil, false
+	}
+	token, _ := account["access"].(string)
+	if strings.TrimSpace(token) == "" {
+		return nil, false
+	}
+	return account, true
+}
+
+// piAuthInfo carries the already-validated Pi auth.json payload and the raw
+// openai-codex credential map so callers reuse them without a second read.
+type piAuthInfo struct {
+	Payload map[string]any
+	CredMap map[string]any
+}
+
+// loadPiAuthIfUsable reads Pi's auth.json under the proper-lockfile protocol
+// and reports availability for routing. Missing files, lock failures,
+// malformed JSON, missing openai-codex entries, or invalid OAuth entries
+// all count as unavailable.
+func loadPiAuthIfUsable(piAuthFile string) (*piAuthInfo, bool) {
+	if strings.TrimSpace(piAuthFile) == "" {
+		return nil, false
+	}
+	payload, err := readPiAuthUnderLock(piAuthFile)
+	if err != nil {
+		return nil, false
+	}
+	rawCred, present := payload["openai-codex"]
+	if !present || rawCred == nil {
+		return nil, false
+	}
+	credMap, ok := rawCred.(map[string]any)
+	if !ok {
+		return nil, false
+	}
+	if _, err := parsePiOpenAICodexEntry(credMap); err != nil {
+		return nil, false
+	}
+	return &piAuthInfo{Payload: payload, CredMap: credMap}, true
 }
 
 type accountUsageRow struct {
@@ -1187,6 +1300,17 @@ func writeAccountsStore(accountsFile string, store map[string]map[string]any) er
 	return nil
 }
 
+// redactBearerToken replaces any exact occurrence of token within msg with a
+// fixed placeholder so non-200 error messages from hostile or buggy endpoints
+// never echo the bearer access token back to logs or callers. Non-secret text
+// is preserved.
+func redactBearerToken(msg, token string) string {
+	if token == "" || msg == "" {
+		return msg
+	}
+	return strings.ReplaceAll(msg, token, "[REDACTED]")
+}
+
 func fetchUsageWindow(ctx context.Context, client *http.Client, usageURL, token string) (usageWindow, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, usageURL, nil)
 	if err != nil {
@@ -1205,6 +1329,9 @@ func fetchUsageWindow(ctx context.Context, client *http.Client, usageURL, token 
 	if resp.StatusCode != http.StatusOK {
 		message, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 		msg := strings.TrimSpace(string(message))
+		if token != "" {
+			msg = redactBearerToken(msg, token)
+		}
 		if msg != "" {
 			return usageWindow{}, fmt.Errorf("usage endpoint returned %d: %s", resp.StatusCode, msg)
 		}
@@ -2148,6 +2275,262 @@ func activateAccount(cfg config, account map[string]any) error {
 	}
 
 	return nil
+}
+
+// -----------------------------------------------------------------------------
+// Inbound Pi reconciliation (best-effort, default command only).
+// -----------------------------------------------------------------------------
+
+// errPiAuthMissing is the sentinel for a missing Pi auth file. Callers
+// treat it as a clean skip without surfacing an error.
+var errPiAuthMissing = errors.New("Pi auth file is missing")
+
+// readPiAuthUnderLock reads Pi's auth.json under the proper-lockfile protocol
+// used by the activation path. READ-ONLY: never creates the parent dir, the
+// auth file, or writes to it. A missing file returns errPiAuthMissing.
+//
+// The lock is released explicitly; read or release failures are joined so
+// neither is hidden. When the combined error is non-nil the payload is NOT
+// returned: a compromised release means another writer could be racing.
+func readPiAuthUnderLock(piAuthFile string) (map[string]any, error) {
+	if strings.TrimSpace(piAuthFile) == "" {
+		return nil, errPiAuthMissing
+	}
+
+	info, err := os.Stat(piAuthFile)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, errPiAuthMissing
+		}
+		return nil, fmt.Errorf("checking Pi auth file: %w", err)
+	}
+	if info.IsDir() {
+		return nil, fmt.Errorf("Pi auth path is a directory: %s", piAuthFile)
+	}
+
+	lockPath := piAuthFile + ".lock"
+	if err := acquirePiLock(lockPath); err != nil {
+		return nil, fmt.Errorf("acquiring Pi auth lock for read: %w", err)
+	}
+
+	payload, _, readErr := loadPiAuthFile(piAuthFile)
+	releaseErr := releasePiLock(lockPath)
+	if combined := combinePiAuthWriteAndReleaseErrors(readErr, releaseErr); combined != nil {
+		return nil, combined
+	}
+	return payload, nil
+}
+
+// parsePiOpenAICodexEntry validates the Pi openai-codex credential with the
+// same strict OAuth parsing as buildPiCredential (access/refresh/expires/
+// type/accountId, exact-int64 expires) and projects it to map[string]any for
+// accountWithUsage/persistOpenAIAccount. Errors never echo credential values.
+func parsePiOpenAICodexEntry(credMap map[string]any) (map[string]any, error) {
+	cred, err := buildPiCredential(credMap)
+	if err != nil {
+		return nil, err
+	}
+
+	account := map[string]any{
+		"type":    cred.Type,
+		"access":  cred.Access,
+		"refresh": cred.Refresh,
+		"expires": cred.Expires,
+	}
+	if strings.TrimSpace(cred.AccountID) != "" {
+		account["accountId"] = cred.AccountID
+	}
+	return account, nil
+}
+
+// reconcilePiInbound best-effort reconciles a newer Pi openai-codex
+// credential into the saved store and (when matched is current) into
+// OpenCode's auth.json. Invoked ONLY from runDefaultCommand; `accounts`/
+// `list`/`use`/`config` MUST NOT call it.
+//
+// Returns (account, usage, changed, error). account/usage are returned only
+// on an active match; changed = true iff a store or OpenCode mutation
+// occurred. error is non-nil ONLY for persistence/OpenCode write failures
+// AFTER a valid newer match; clean no-ops return nil. Match key is user_id
+// (accountId is metadata, never a match key); skip when Pi access == current
+// OC access (reuse usage); saved expires must be a valid exact-int64.
+//
+// Rules: non-active match imports ONLY if Pi expires > saved (strictly).
+// Active match (Pi user_id == current OC user_id): no-op when current OC
+// expires is missing/invalid; never downgrade; self-heal (Pi == saved but >
+// current OC: update ONLY active OC); otherwise persist store FIRST then
+// active OC (a store failure surfaces an error; the next run self-heals
+// via the equal-saved/newer-current branch). Merge ONLY Pi OAuth fields
+// (type=oauth, access, refresh, expires, optional accountId); user_id,
+// email, custom metadata preserved.
+func reconcilePiInbound(
+	ctx context.Context,
+	cfg config,
+	account map[string]any,
+	usage usageWindow,
+	fiveHourToggle bool,
+) (map[string]any, usageWindow, bool, error) {
+	if strings.TrimSpace(cfg.PiAuthFile) == "" {
+		return account, usage, false, nil
+	}
+
+	piPayload, err := readPiAuthUnderLock(cfg.PiAuthFile)
+	if err != nil {
+		return account, usage, false, nil
+	}
+
+	rawCred, present := piPayload["openai-codex"]
+	if !present || rawCred == nil {
+		return account, usage, false, nil
+	}
+	credMap, ok := rawCred.(map[string]any)
+	if !ok {
+		return account, usage, false, nil
+	}
+
+	piInfo := &piAuthInfo{Payload: piPayload, CredMap: credMap}
+	return reconcilePiInboundFromPayload(ctx, cfg, piInfo, account, usage, fiveHourToggle)
+}
+
+// reconcilePiInboundFromPayload accepts an already-loaded Pi auth payload
+// (typically returned by loadPiAuthIfUsable during the dispatcher) so Pi's
+// auth.json is read under the lock exactly once per run. Semantics match
+// reconcilePiInbound exactly.
+func reconcilePiInboundFromPayload(
+	ctx context.Context,
+	cfg config,
+	piInfo *piAuthInfo,
+	account map[string]any,
+	usage usageWindow,
+	fiveHourToggle bool,
+) (map[string]any, usageWindow, bool, error) {
+	if piInfo == nil {
+		return account, usage, false, nil
+	}
+
+	piAccount, err := parsePiOpenAICodexEntry(piInfo.CredMap)
+	if err != nil {
+		return account, usage, false, nil
+	}
+
+	piAccess, _ := piAccount["access"].(string)
+	piExpires, _ := piAccount["expires"].(int64)
+
+	// Validate Pi access. Reuse the current usage when tokens match so we
+	// never make a second API call for the same token (the API response is
+	// deterministic per-token).
+	piUsage := usage
+	currentAccess, _ := account["access"].(string)
+	if strings.TrimSpace(piAccess) != strings.TrimSpace(currentAccess) {
+		fetched, fetchErr := fetchUsageWindow(ctx, cfg.HTTPClient, cfg.UsageURL, piAccess)
+		if fetchErr != nil {
+			return account, usage, false, nil
+		}
+		piUsage = fetched
+	}
+
+	piUserID := strings.TrimSpace(piUsage.UserID)
+	if piUserID == "" {
+		return account, usage, false, nil
+	}
+
+	// Match Pi user_id into the normalized saved accounts store.
+	store, err := readAccountsStore(cfg.AccountsFile)
+	if err != nil {
+		return account, usage, false, nil
+	}
+	store = normalizeAccountsStoreByUserID(store)
+
+	saved, ok := store[piUserID]
+	if !ok {
+		return account, usage, false, nil
+	}
+
+	// Validate saved expires is an exact integer. Missing/invalid -> no-op.
+	savedExpiresRaw, hasExpires := saved["expires"]
+	if !hasExpires || savedExpiresRaw == nil {
+		return account, usage, false, nil
+	}
+	savedExpires, err := parseExactInt64(savedExpiresRaw)
+	if err != nil {
+		return account, usage, false, nil
+	}
+
+	// Active match: Pi API user_id == current OpenCode API user_id.
+	currentUserID := strings.TrimSpace(usage.UserID)
+	isActiveMatch := currentUserID != "" && currentUserID == piUserID
+
+	// Active-match extra check: inspect current OC expires to enforce the
+	// never-downgrade rule and to detect self-heal.
+	var currentOpenCodeExpires int64
+	if isActiveMatch {
+		rawCurrent, has := account["expires"]
+		if !has || rawCurrent == nil {
+			return account, usage, false, nil // cannot compare
+		}
+		n, perr := parseExactInt64(rawCurrent)
+		if perr != nil {
+			return account, usage, false, nil
+		}
+		currentOpenCodeExpires = n
+		// Never downgrade either source.
+		if currentOpenCodeExpires >= piExpires || savedExpires > piExpires {
+			return account, usage, false, nil
+		}
+	} else if piExpires <= savedExpires {
+		// Non-active: import only when Pi expires is STRICTLY greater.
+		return account, usage, false, nil
+	}
+
+	// Build the merged saved entry: preserve identity/custom metadata,
+	// replace OAuth fields with the newer Pi values.
+	merged := copyAccountData(saved)
+	merged["type"] = "oauth"
+	merged["access"] = piAccess
+	merged["refresh"] = piAccount["refresh"]
+	merged["expires"] = piExpires
+	if aid, ok := piAccount["accountId"].(string); ok && strings.TrimSpace(aid) != "" {
+		merged["accountId"] = aid
+	} else {
+		delete(merged, "accountId")
+	}
+
+	piUsageNorm, piFiveHourMode := normalizeUsageForToggle(piUsage, fiveHourToggle)
+	if savedEmail, ok := saved["email"].(string); ok && strings.TrimSpace(savedEmail) != "" {
+		// The default pipeline persists the returned usage once more; carry
+		// the saved email through that final accountWithUsage call as well.
+		piUsageNorm.Email = savedEmail
+	}
+	mergedWithUsage := accountWithUsage(merged, piUsageNorm, piFiveHourMode)
+
+	if isActiveMatch {
+		// Self-heal: Pi expires == saved expires (already in store) but Pi >
+		// current OpenCode expires; update ONLY active OpenCode.
+		if piExpires == savedExpires {
+			if err := updateOpenAIAuthFile(cfg.AuthFile, mergedWithUsage); err != nil {
+				return mergedWithUsage, piUsageNorm, true, fmt.Errorf("self-healing active OpenCode from Pi: %w", err)
+			}
+			return mergedWithUsage, piUsageNorm, true, nil
+		}
+		// Full forward path: persist store FIRST so a store write failure
+		// leaves OpenCode unchanged; the next run self-heals.
+		if err := persistOpenAIAccount(cfg.AccountsFile, mergedWithUsage); err != nil {
+			return account, usage, false, fmt.Errorf("reconciling Pi into saved store: %w", err)
+		}
+		if err := updateOpenAIAuthFile(cfg.AuthFile, mergedWithUsage); err != nil {
+			// Store updated, OpenCode not: surface the partial sync so the
+			// next run's self-heal retries OpenCode.
+			return mergedWithUsage, piUsageNorm, true, fmt.Errorf("reconciling active OpenCode from Pi after store update: %w", err)
+		}
+		return mergedWithUsage, piUsageNorm, true, nil
+	}
+
+	// Non-active (store-only) match: keep the original OpenCode account +
+	// usage; stdout pipeline stays untouched.
+	if err := persistOpenAIAccount(cfg.AccountsFile, mergedWithUsage); err != nil {
+		return account, usage, false, fmt.Errorf("reconciling Pi into saved store: %w", err)
+	}
+	return account, usage, true, nil
 }
 
 func valueToString(value any) (string, error) {
