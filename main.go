@@ -21,27 +21,47 @@ import (
 
 const defaultUsageURL = "https://chatgpt.com/backend-api/wham/usage"
 
-// usageWeeklyThreshold gates the WEEKLY usage window. It is always applied to
+// defaultWeeklyThreshold gates the WEEKLY usage window. It is always applied to
 // `secondary_window` when 5h mode is active, and to `primary_window` when 5h
 // mode is inactive (or `secondary_window` is missing/null). When the active
 // account's weekly usage reaches (or exceeds) this percentage, the default
 // command considers it exhausted and attempts to rotate to a saved alternate.
-const usageWeeklyThreshold = 98.0
+const defaultWeeklyThreshold = 98.0
 
-// usageFiveHourThreshold gates the 5-HOUR usage window. It is applied to
+// defaultFiveHourThreshold gates the 5-HOUR usage window. It is applied to
 // `primary_window` only when 5h mode is active AND `secondary_window` is
 // present.
-const usageFiveHourThreshold = 80.0
+const defaultFiveHourThreshold = 80.0
+
+// rotationThresholds bundles the 5h and weekly cutoffs that drive rotation,
+// eligibility, and cooldown. The runtime path loads these from the persisted
+// config (with defaults applied when missing); helpers like
+// `selectEligibleAlternateAccount` and `accountWithUsage` accept the struct
+// instead of reading globals so tests can pin exact threshold values.
+type rotationThresholds struct {
+	FiveHour float64
+	Weekly   float64
+}
+
+// defaultRotationThresholds returns the runtime defaults for the 5h and weekly
+// thresholds. Both values are exposed via the `config <key>` subcommands and
+// can be persisted into the config file; this helper is the single source of
+// truth for the in-process defaults.
+func defaultRotationThresholds() rotationThresholds {
+	return rotationThresholds{FiveHour: defaultFiveHourThreshold, Weekly: defaultWeeklyThreshold}
+}
 
 type config struct {
-	AuthFile        string
-	PiAuthFile      string
-	AccountsFile    string
-	ConfigFile      string
-	FiveHourEnabled bool
-	UsageURL        string
-	HTTPClient      *http.Client
-	Now             func() time.Time
+	AuthFile          string
+	PiAuthFile        string
+	AccountsFile      string
+	ConfigFile        string
+	FiveHourEnabled   bool
+	FiveHourThreshold float64
+	WeeklyThreshold   float64
+	UsageURL          string
+	HTTPClient        *http.Client
+	Now               func() time.Time
 }
 
 type usageWindow struct {
@@ -79,6 +99,12 @@ func normalizeUsageForToggle(usage usageWindow, toggleEnabled bool) (usageWindow
 }
 
 func main() {
+	// Hide a console window this process allocated for itself, so callers that
+	// spawn the CLI without CREATE_NO_WINDOW do not flash one. No-op outside
+	// Windows and when the console is shared with a terminal; see
+	// console_windows.go.
+	hideOwnConsoleWindow()
+
 	if err := runWithArgs(context.Background(), defaultConfig(), os.Stdout, os.Args[1:]); err != nil {
 		fmt.Fprintln(os.Stderr, err.Error())
 		os.Exit(1)
@@ -174,6 +200,22 @@ func runWithArgs(ctx context.Context, cfg config, stdout io.Writer, args []strin
 	}
 	cfg.FiveHourEnabled = enabled
 
+	// Resolve the rotation thresholds the same way. Missing config / missing
+	// keys default to the documented runtime values; a malformed value or an
+	// out-of-range stored value is a hard error so the CLI refuses to start
+	// rather than silently ignoring a corrupt setting.
+	fiveHourThreshold, err := loadFiveHourThresholdConfig(cfg.ConfigFile)
+	if err != nil {
+		return err
+	}
+	cfg.FiveHourThreshold = fiveHourThreshold
+
+	weeklyThreshold, err := loadWeeklyThresholdConfig(cfg.ConfigFile)
+	if err != nil {
+		return err
+	}
+	cfg.WeeklyThreshold = weeklyThreshold
+
 	if len(args) > 0 {
 		command := strings.ToLower(strings.TrimSpace(args[0]))
 		switch command {
@@ -185,7 +227,7 @@ func runWithArgs(ctx context.Context, cfg config, stdout io.Writer, args []strin
 			}
 			return runUseCommand(cfg, stdout, strings.TrimSpace(args[1]))
 		default:
-			return fmt.Errorf("unknown command %q (available: accounts, list, use <id>, config <feature> [on|off])", command)
+			return fmt.Errorf("unknown command %q (available: accounts, list, use <id>, config <feature> [value])", command)
 		}
 	}
 
@@ -262,17 +304,17 @@ func runDefaultCommandOpenCodePath(ctx context.Context, cfg config, stdout io.Wr
 	// Recompute after the inbound swap (idempotent on an already-normalized usage).
 	usage, fiveHourMode = normalizeUsageForToggle(usage, cfg.FiveHourEnabled)
 
-	if err := ensureCurrentAccountRegistered(cfg.AccountsFile, account, usage, fiveHourMode); err != nil {
+	if err := ensureCurrentAccountRegistered(cfg.AccountsFile, account, usage, fiveHourMode, rotationThresholds{FiveHour: cfg.FiveHourThreshold, Weekly: cfg.WeeklyThreshold}); err != nil {
 		return err
 	}
 
 	primaryExhausted := false
 	secondaryExhausted := false
 	if fiveHourMode {
-		primaryExhausted = usedPercentAtOrAboveThreshold(usage.UsedPercent, usageFiveHourThreshold)
-		secondaryExhausted = usedPercentAtOrAboveThreshold(usage.SecondaryUsedPercent, usageWeeklyThreshold)
+		primaryExhausted = usedPercentAtOrAboveThreshold(usage.UsedPercent, cfg.FiveHourThreshold)
+		secondaryExhausted = usedPercentAtOrAboveThreshold(usage.SecondaryUsedPercent, cfg.WeeklyThreshold)
 	} else {
-		primaryExhausted = usedPercentAtOrAboveThreshold(usage.UsedPercent, usageWeeklyThreshold)
+		primaryExhausted = usedPercentAtOrAboveThreshold(usage.UsedPercent, cfg.WeeklyThreshold)
 	}
 
 	if primaryExhausted || secondaryExhausted {
@@ -281,7 +323,7 @@ func runDefaultCommandOpenCodePath(ctx context.Context, cfg config, stdout io.Wr
 			return err
 		}
 
-		if nextAccount, ok := selectEligibleAlternateAccount(store, usage.UserID, cfg.Now().Unix(), fiveHourMode); ok {
+		if nextAccount, ok := selectEligibleAlternateAccount(store, usage.UserID, cfg.Now().Unix(), fiveHourMode, cfg.FiveHourThreshold, cfg.WeeklyThreshold); ok {
 			if err := activateAccount(cfg, nextAccount); err != nil {
 				return err
 			}
@@ -307,7 +349,7 @@ func runDefaultCommandPiOnlyPath(ctx context.Context, cfg config, stdout io.Writ
 	}
 
 	usage, fiveHourMode := normalizeUsageForToggle(usage, cfg.FiveHourEnabled)
-	persisted := accountWithUsage(piInfo.CredMap, usage, fiveHourMode)
+	persisted := accountWithUsage(piInfo.CredMap, usage, fiveHourMode, rotationThresholds{FiveHour: cfg.FiveHourThreshold, Weekly: cfg.WeeklyThreshold})
 
 	// Persist ONLY into the store. OpenCode's auth.json is intentionally not
 	// touched here: Pi-only mode must never create or rewrite it.
@@ -391,10 +433,11 @@ type accountUsageRow struct {
 }
 
 func runAccountsCommand(ctx context.Context, cfg config, stdout io.Writer) error {
-	currentAccount, err := readOpenAIAccount(cfg.AuthFile)
-	if err != nil {
-		return err
-	}
+	// OpenCode may not be installed on this machine. A missing or unusable
+	// auth file only means there is no active account to mark with `*`; the
+	// saved store is still listed in full, so `accounts` stays useful on a
+	// Pi-only (or store-only) install.
+	currentAccount, _ := loadOpenCodeAccountIfAvailable(cfg.AuthFile)
 
 	currentToken, _ := currentAccount["access"].(string)
 
@@ -484,7 +527,7 @@ func runAccountsCommand(ctx context.Context, cfg config, stdout io.Writer) error
 			currentUserID = row.UserID
 		}
 
-		updated := accountWithUsage(account, usage, fiveHourMode)
+		updated := accountWithUsage(account, usage, fiveHourMode, rotationThresholds{FiveHour: cfg.FiveHourThreshold, Weekly: cfg.WeeklyThreshold})
 		if persistErr := persistOpenAIAccount(cfg.AccountsFile, updated); persistErr != nil {
 			row.Err = persistErr
 		} else {
@@ -905,15 +948,19 @@ func saveFiveHourConfig(path string, enabled bool) error {
 // or accounts files, so it can be invoked without an active OpenCode account.
 func runConfigCommand(cfg config, stdout io.Writer, args []string) error {
 	if len(args) < 1 {
-		return errors.New("config command requires a feature name (currently supported: 5h)")
+		return errors.New("config command requires a feature name (currently supported: 5h, 5h-threshold, weekly-threshold)")
 	}
 
 	feature := strings.ToLower(strings.TrimSpace(args[0]))
 	switch feature {
 	case "5h":
 		return runConfigFiveHour(cfg, stdout, args[1:])
+	case "5h-threshold":
+		return runConfigThreshold(cfg, stdout, args[1:], loadFiveHourThresholdConfig, saveFiveHourThresholdConfig, "5h_threshold")
+	case "weekly-threshold":
+		return runConfigThreshold(cfg, stdout, args[1:], loadWeeklyThresholdConfig, saveWeeklyThresholdConfig, "weekly_threshold")
 	default:
-		return fmt.Errorf("unknown config feature %q (currently supported: 5h)", feature)
+		return fmt.Errorf("unknown config feature %q (currently supported: 5h, 5h-threshold, weekly-threshold)", feature)
 	}
 }
 
@@ -956,11 +1003,257 @@ func writeConfigState(stdout io.Writer, enabled bool) error {
 	return err
 }
 
-func ensureCurrentAccountRegistered(accountsFile string, account map[string]any, usage usageWindow, fiveHourMode bool) error {
-	return persistOpenAIAccount(accountsFile, accountWithUsage(account, usage, fiveHourMode))
+// runConfigThreshold handles `config <key> [value]` for the two threshold
+// subcommands. Without a value it prints the effective threshold as a plain
+// parseable number (so scripts can capture it directly); with a value it
+// validates and persists the threshold, refusing to touch the file on a
+// validation failure. The behavior is identical for both keys; the loader,
+// writer, and on-disk field name are passed in so we can share the contract
+// without duplicating parsing/save logic.
+func runConfigThreshold(
+	cfg config,
+	stdout io.Writer,
+	args []string,
+	load func(path string) (float64, error),
+	save func(path string, value float64) error,
+	fieldName string,
+) error {
+	if len(args) > 1 {
+		return fmt.Errorf("config %s takes at most one value (a number in (0, 100])", strings.TrimSuffix(fieldName, "_threshold"))
+	}
+
+	if len(args) == 0 {
+		value, err := load(cfg.ConfigFile)
+		if err != nil {
+			return err
+		}
+		return writeConfigThreshold(stdout, value)
+	}
+
+	parsed, err := validateThresholdPercent(args[0])
+	if err != nil {
+		return fmt.Errorf("invalid %s value %q: %w", fieldName, args[0], err)
+	}
+
+	if err := save(cfg.ConfigFile, parsed); err != nil {
+		return err
+	}
+	return writeConfigThreshold(stdout, parsed)
 }
 
-func accountWithUsage(account map[string]any, usage usageWindow, fiveHourMode bool) map[string]any {
+// writeConfigThreshold prints the threshold as a plain parseable number with
+// no surrounding markup so scripts can read the value directly. strconv 'g'
+// picks the shortest representation that round-trips exactly.
+func writeConfigThreshold(stdout io.Writer, value float64) error {
+	_, err := io.WriteString(stdout, strconv.FormatFloat(value, 'g', -1, 64)+"\n")
+	return err
+}
+
+// validateThresholdPercent parses raw as a float64 and rejects anything that
+// is not a finite number inside the half-open interval (0, 100]. 100 is the
+// inclusive upper bound (a threshold of 100 means "rotate when fully used");
+// 0 and negative values are rejected because they would mark an account as
+// exhausted at zero usage. NaN and ±Inf are rejected to keep the persisted
+// value JSON-safe. Errors do not echo the offending value because it has
+// already been quoted in the caller; the caller wraps the value into the
+// final user-facing message.
+func validateThresholdPercent(raw string) (float64, error) {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return 0, errors.New("value is empty")
+	}
+
+	parsed, err := strconv.ParseFloat(trimmed, 64)
+	if err != nil {
+		return 0, fmt.Errorf("not a finite number: %w", err)
+	}
+	if math.IsNaN(parsed) || math.IsInf(parsed, 0) {
+		return 0, errors.New("value must be finite")
+	}
+	if parsed <= 0 {
+		return 0, errors.New("value must be greater than 0")
+	}
+	if parsed > 100 {
+		return 0, errors.New("value must be at most 100")
+	}
+	return parsed, nil
+}
+
+// loadFiveHourThresholdConfig reads the 5h rotation threshold from the
+// config file. Missing path, missing file, or missing key default to the
+// documented runtime value (80). An explicit value outside (0, 100] or any
+// malformed JSON returns an error so the CLI can refuse to start rather than
+// silently defaulting.
+func loadFiveHourThresholdConfig(path string) (float64, error) {
+	value, err := loadThresholdFromConfig(path, "5h_threshold", defaultFiveHourThreshold)
+	if err != nil {
+		return 0, err
+	}
+	if err := validateThresholdValue(value); err != nil {
+		return 0, err
+	}
+	return value, nil
+}
+
+// loadWeeklyThresholdConfig reads the weekly rotation threshold from the
+// config file. Same contract as loadFiveHourThresholdConfig with the
+// documented runtime default (98).
+func loadWeeklyThresholdConfig(path string) (float64, error) {
+	value, err := loadThresholdFromConfig(path, "weekly_threshold", defaultWeeklyThreshold)
+	if err != nil {
+		return 0, err
+	}
+	if err := validateThresholdValue(value); err != nil {
+		return 0, err
+	}
+	return value, nil
+}
+
+// saveFiveHourThresholdConfig persists the 5h rotation threshold, preserving
+// every other key in the config file and tightening permissions to 0o600 (the
+// same hardening saveFiveHourConfig applies). The value is validated before
+// writing: an out-of-range value returns an error WITHOUT touching the file
+// so callers never see a half-updated config.
+func saveFiveHourThresholdConfig(path string, value float64) error {
+	if err := validateThresholdValue(value); err != nil {
+		return err
+	}
+	return persistThresholdConfig(path, "5h_threshold", value)
+}
+
+// saveWeeklyThresholdConfig is the weekly counterpart to
+// saveFiveHourThresholdConfig. Same validation/permission guarantees.
+func saveWeeklyThresholdConfig(path string, value float64) error {
+	if err := validateThresholdValue(value); err != nil {
+		return err
+	}
+	return persistThresholdConfig(path, "weekly_threshold", value)
+}
+
+// loadThresholdFromConfig is the shared loader. It mirrors loadFiveHourConfig:
+// empty path / missing file / missing key all fall back to the documented
+// default. Malformed JSON returns an error so the CLI can refuse to start.
+// A present-but-wrong-typed value is also an error: silently coercing a
+// string to 0 (or any other default) would let users think they had
+// configured a threshold when they had not.
+func loadThresholdFromConfig(path, key string, defaultValue float64) (float64, error) {
+	if strings.TrimSpace(path) == "" {
+		return defaultValue, nil
+	}
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return defaultValue, nil
+		}
+		return 0, fmt.Errorf("reading config file: %w", err)
+	}
+
+	if len(bytes.TrimSpace(data)) == 0 {
+		return defaultValue, nil
+	}
+
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.UseNumber()
+
+	var payload map[string]any
+	if err := decoder.Decode(&payload); err != nil {
+		return 0, fmt.Errorf("parsing config file JSON: %w", err)
+	}
+
+	raw, ok := payload[key]
+	if !ok {
+		return defaultValue, nil
+	}
+
+	switch v := raw.(type) {
+	case float64:
+		if math.IsNaN(v) || math.IsInf(v, 0) {
+			return 0, fmt.Errorf("invalid %s value: must be finite", key)
+		}
+		return v, nil
+	case json.Number:
+		parsed, err := v.Float64()
+		if err != nil {
+			return 0, fmt.Errorf("invalid %s value %q: %w", key, v.String(), err)
+		}
+		if math.IsNaN(parsed) || math.IsInf(parsed, 0) {
+			return 0, fmt.Errorf("invalid %s value: must be finite", key)
+		}
+		return parsed, nil
+	case int:
+		return float64(v), nil
+	case int64:
+		return float64(v), nil
+	default:
+		return 0, fmt.Errorf("invalid %s value of type %T (expected a number)", key, raw)
+	}
+}
+
+// persistThresholdConfig writes the threshold under fieldName, preserving
+// every other key already in the file and tightening permissions to 0o600
+// on non-Windows platforms. Mirrors saveFiveHourConfig so the two writers
+// stay symmetric for tests and operators.
+func persistThresholdConfig(path, fieldName string, value float64) error {
+	if strings.TrimSpace(path) == "" {
+		return errors.New("config file path is empty")
+	}
+
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return fmt.Errorf("creating config directory: %w", err)
+	}
+
+	payload := make(map[string]any)
+	if data, err := os.ReadFile(path); err == nil && len(bytes.TrimSpace(data)) > 0 {
+		if err := json.Unmarshal(data, &payload); err != nil {
+			return fmt.Errorf("parsing existing config file: %w", err)
+		}
+	} else if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("reading existing config file: %w", err)
+	}
+
+	payload[fieldName] = value
+
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		return fmt.Errorf("encoding config file: %w", err)
+	}
+
+	if err := os.WriteFile(path, encoded, 0o600); err != nil {
+		return fmt.Errorf("writing config file: %w", err)
+	}
+
+	if runtime.GOOS != "windows" {
+		if err := os.Chmod(path, 0o600); err != nil {
+			return fmt.Errorf("tightening config file permissions: %w", err)
+		}
+	}
+
+	return nil
+}
+
+// validateThresholdValue is the in-process half of validateThresholdPercent.
+// It is reused by the loaders to refuse corrupted-but-readable JSON (e.g. an
+// explicit value of 0 or 200 left on disk by an older or buggy version of the
+// CLI) so the runtime path never operates with a nonsensical threshold.
+func validateThresholdValue(value float64) error {
+	if math.IsNaN(value) || math.IsInf(value, 0) {
+		return errors.New("threshold must be finite")
+	}
+	if value <= 0 {
+		return errors.New("threshold must be greater than 0")
+	}
+	if value > 100 {
+		return errors.New("threshold must be at most 100")
+	}
+	return nil
+}
+
+func ensureCurrentAccountRegistered(accountsFile string, account map[string]any, usage usageWindow, fiveHourMode bool, thresholds rotationThresholds) error {
+	return persistOpenAIAccount(accountsFile, accountWithUsage(account, usage, fiveHourMode, thresholds))
+}
+
+func accountWithUsage(account map[string]any, usage usageWindow, fiveHourMode bool, thresholds rotationThresholds) map[string]any {
 	accountWithUsage := copyAccountData(account)
 	accountWithUsage["user_id"] = usage.UserID
 	accountWithUsage["usedPercent"] = usage.UsedPercent
@@ -999,8 +1292,8 @@ func accountWithUsage(account map[string]any, usage usageWindow, fiveHourMode bo
 	//     one is exhausted, take that window's reset.
 	var cooldownReset *int64
 	if fiveHourMode {
-		primaryExhausted := usedPercentAtOrAboveThreshold(usage.UsedPercent, usageFiveHourThreshold) && usage.ResetAt != nil
-		secondaryExhausted := usedPercentAtOrAboveThreshold(usage.SecondaryUsedPercent, usageWeeklyThreshold) && usage.SecondaryResetAt != nil
+		primaryExhausted := usedPercentAtOrAboveThreshold(usage.UsedPercent, thresholds.FiveHour) && usage.ResetAt != nil
+		secondaryExhausted := usedPercentAtOrAboveThreshold(usage.SecondaryUsedPercent, thresholds.Weekly) && usage.SecondaryResetAt != nil
 		switch {
 		case primaryExhausted && secondaryExhausted:
 			if *usage.ResetAt >= *usage.SecondaryResetAt {
@@ -1014,7 +1307,7 @@ func accountWithUsage(account map[string]any, usage usageWindow, fiveHourMode bo
 			cooldownReset = usage.SecondaryResetAt
 		}
 	} else {
-		if usedPercentAtOrAboveThreshold(usage.UsedPercent, usageWeeklyThreshold) && usage.ResetAt != nil {
+		if usedPercentAtOrAboveThreshold(usage.UsedPercent, thresholds.Weekly) && usage.ResetAt != nil {
 			cooldownReset = usage.ResetAt
 		}
 	}
@@ -1493,7 +1786,7 @@ func usedPercentAtOrAboveThreshold(usedPercent string, threshold float64) bool {
 	return parsed >= threshold
 }
 
-func selectEligibleAlternateAccount(store map[string]map[string]any, currentUserID string, nowUnix int64, fiveHourMode bool) (map[string]any, bool) {
+func selectEligibleAlternateAccount(store map[string]map[string]any, currentUserID string, nowUnix int64, fiveHourMode bool, fiveHourThreshold, weeklyThreshold float64) (map[string]any, bool) {
 	store = normalizeAccountsStoreByUserID(store)
 
 	keys := make([]string, 0, len(store))
@@ -1523,7 +1816,7 @@ func selectEligibleAlternateAccount(store map[string]map[string]any, currentUser
 		// Eligibility is per-candidate. The toggle decides the EVALUATION mode;
 		// the persisted shape (dual vs weekly-only) decides which fields apply.
 		// See candidateEligible for the full rule table.
-		if !candidateEligible(account, nowUnix, fiveHourMode) {
+		if !candidateEligible(account, nowUnix, fiveHourMode, fiveHourThreshold, weeklyThreshold) {
 			continue
 		}
 
@@ -1556,22 +1849,22 @@ func selectEligibleAlternateAccount(store map[string]map[string]any, currentUser
 // window is missing entirely (no secondaryUsedPercent and no usable
 // secondaryResetAt) a stale dual candidate is treated as eligible — we never
 // block on the absence of data.
-func candidateEligible(account map[string]any, nowUnix int64, fiveHourMode bool) bool {
+func candidateEligible(account map[string]any, nowUnix int64, fiveHourMode bool, fiveHourThreshold, weeklyThreshold float64) bool {
 	hasSecondary := candidateHasSecondaryFields(account)
 
 	switch {
 	case fiveHourMode && hasSecondary:
-		if exceedsThresholdWithFutureReset(account, "usedPercent", "resetAt", usageFiveHourThreshold, nowUnix) {
+		if exceedsThresholdWithFutureReset(account, "usedPercent", "resetAt", fiveHourThreshold, nowUnix) {
 			return false
 		}
-		if exceedsThresholdWithFutureReset(account, "secondaryUsedPercent", "secondaryResetAt", usageWeeklyThreshold, nowUnix) {
+		if exceedsThresholdWithFutureReset(account, "secondaryUsedPercent", "secondaryResetAt", weeklyThreshold, nowUnix) {
 			return false
 		}
 		return !cooldownInFuture(account, nowUnix)
 
 	case fiveHourMode && !hasSecondary:
 		// Weekly-only persisted entry under toggle ON: treat primary as weekly.
-		if exceedsThresholdWithFutureReset(account, "usedPercent", "resetAt", usageWeeklyThreshold, nowUnix) {
+		if exceedsThresholdWithFutureReset(account, "usedPercent", "resetAt", weeklyThreshold, nowUnix) {
 			return false
 		}
 		return !cooldownInFuture(account, nowUnix)
@@ -1581,10 +1874,10 @@ func candidateEligible(account map[string]any, nowUnix int64, fiveHourMode bool)
 		// been derived partly from the now-ignored 5h primary, so it is treated
 		// as unreliable: ignore it. Only the persisted secondary weekly data
 		// blocks. Missing secondary fields are conservative/eligible.
-		return !exceedsThresholdWithFutureReset(account, "secondaryUsedPercent", "secondaryResetAt", usageWeeklyThreshold, nowUnix)
+		return !exceedsThresholdWithFutureReset(account, "secondaryUsedPercent", "secondaryResetAt", weeklyThreshold, nowUnix)
 
 	default: // !fiveHourMode && !hasSecondary
-		if exceedsThresholdWithFutureReset(account, "usedPercent", "resetAt", usageWeeklyThreshold, nowUnix) {
+		if exceedsThresholdWithFutureReset(account, "usedPercent", "resetAt", weeklyThreshold, nowUnix) {
 			return false
 		}
 		return !cooldownInFuture(account, nowUnix)
@@ -2253,7 +2546,18 @@ func loadPiAuthFile(piAuthFile string) (map[string]any, []byte, error) {
 // sync so existing unit tests that pre-date Pi sync stay isolated from the
 // real ~/.pi/agent/auth.json.
 func activateAccount(cfg config, account map[string]any) error {
-	piSyncEnabled := strings.TrimSpace(cfg.PiAuthFile) != ""
+	// A provider that is not installed is skipped instead of failing the whole
+	// activation. OpenCode counts as installed when its auth file exists, since
+	// updateOpenAIAuthFile only ever rewrites an existing file. Pi counts as
+	// installed when its agent directory exists: updatePiAuthFile may create
+	// auth.json inside it (Pi does the same on login), but creating the whole
+	// tree would fabricate a Pi install that is not there.
+	openCodeEnabled := strings.TrimSpace(cfg.AuthFile) != "" && regularFileExists(cfg.AuthFile)
+	piSyncEnabled := strings.TrimSpace(cfg.PiAuthFile) != "" && directoryExists(filepath.Dir(cfg.PiAuthFile))
+
+	if !openCodeEnabled && !piSyncEnabled {
+		return errNeitherProviderAvailable
+	}
 
 	if piSyncEnabled {
 		if _, err := buildPiCredential(account); err != nil {
@@ -2261,8 +2565,10 @@ func activateAccount(cfg config, account map[string]any) error {
 		}
 	}
 
-	if err := updateOpenAIAuthFile(cfg.AuthFile, account); err != nil {
-		return err
+	if openCodeEnabled {
+		if err := updateOpenAIAuthFile(cfg.AuthFile, account); err != nil {
+			return err
+		}
 	}
 
 	if !piSyncEnabled {
@@ -2271,10 +2577,28 @@ func activateAccount(cfg config, account map[string]any) error {
 
 	cred, _ := buildPiCredential(account) // already validated above
 	if err := updatePiAuthFile(cfg.PiAuthFile, cred); err != nil {
+		if !openCodeEnabled {
+			return fmt.Errorf("Pi auth sync failed: %w", err)
+		}
 		return fmt.Errorf("OpenCode auth updated but Pi auth sync failed: %w", err)
 	}
 
 	return nil
+}
+
+// regularFileExists reports whether path names an existing non-directory file.
+// Any stat error (missing, permission denied, broken symlink) counts as absent
+// so callers treat an unusable provider path exactly like an uninstalled one.
+func regularFileExists(path string) bool {
+	info, err := os.Stat(path)
+	return err == nil && !info.IsDir()
+}
+
+// directoryExists reports whether path names an existing directory, with the
+// same "any error means absent" rule as regularFileExists.
+func directoryExists(path string) bool {
+	info, err := os.Stat(path)
+	return err == nil && info.IsDir()
 }
 
 // -----------------------------------------------------------------------------
@@ -2501,7 +2825,7 @@ func reconcilePiInboundFromPayload(
 		// the saved email through that final accountWithUsage call as well.
 		piUsageNorm.Email = savedEmail
 	}
-	mergedWithUsage := accountWithUsage(merged, piUsageNorm, piFiveHourMode)
+	mergedWithUsage := accountWithUsage(merged, piUsageNorm, piFiveHourMode, rotationThresholds{FiveHour: cfg.FiveHourThreshold, Weekly: cfg.WeeklyThreshold})
 
 	if isActiveMatch {
 		// Self-heal: Pi expires == saved expires (already in store) but Pi >

@@ -1,0 +1,19 @@
+{
+  "name": "codex-usage-cli",
+  "version": "0.1.0",
+  "description": "Pi resources for codex-usage-cli: the usage connector extension and the CLI skill.",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/gonzalez962/codex-usage-cli.git"
+  },
+  "pi": {
+    "extensions": ["pi-plugin/codex-usage-cli/index.ts"],
+    "skills": ["skills"]
+  },
+  "files": [
+    "pi-plugin/codex-usage-cli/index.ts",
+    "pi-plugin/codex-usage-cli/README.md",
+    "skills"
+  ]
+}

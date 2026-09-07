@@ -612,7 +612,7 @@ func TestSelectEligibleAlternateAccountSkipsCoolingDown(t *testing.T) {
 		},
 	}
 
-	selected, ok := selectEligibleAlternateAccount(store, "user-current", now, false)
+	selected, ok := selectEligibleAlternateAccount(store, "user-current", now, false, defaultFiveHourThreshold, defaultWeeklyThreshold)
 	if !ok {
 		t.Fatalf("expected an eligible alternate account")
 	}
@@ -1394,7 +1394,7 @@ func TestSelectEligibleAlternateAccountSkipsWeeklyExhausted(t *testing.T) {
 		},
 	}
 
-	selected, ok := selectEligibleAlternateAccount(store, "user-current", now, false)
+	selected, ok := selectEligibleAlternateAccount(store, "user-current", now, false, defaultFiveHourThreshold, defaultWeeklyThreshold)
 	if !ok {
 		t.Fatalf("expected an eligible alternate account")
 	}
@@ -1425,7 +1425,7 @@ func TestSelectEligibleAlternateAccountEligibleAfterPrimaryResetExpires(t *testi
 		},
 	}
 
-	selected, ok := selectEligibleAlternateAccount(store, "user-current", now, false)
+	selected, ok := selectEligibleAlternateAccount(store, "user-current", now, false, defaultFiveHourThreshold, defaultWeeklyThreshold)
 	if !ok {
 		t.Fatalf("expected candidate with expired reset to be eligible")
 	}
@@ -1455,7 +1455,7 @@ func TestSelectEligibleAlternateAccountEligibleWhenResetMissingEntirely(t *testi
 		},
 	}
 
-	selected, ok := selectEligibleAlternateAccount(store, "user-current", now, false)
+	selected, ok := selectEligibleAlternateAccount(store, "user-current", now, false, defaultFiveHourThreshold, defaultWeeklyThreshold)
 	if !ok {
 		t.Fatalf("expected candidate with missing reset to be eligible")
 	}
@@ -1491,7 +1491,7 @@ func TestSelectEligibleAlternateAccountSkipsHotWithFutureReset(t *testing.T) {
 		},
 	}
 
-	selected, ok := selectEligibleAlternateAccount(store, "user-current", now, false)
+	selected, ok := selectEligibleAlternateAccount(store, "user-current", now, false, defaultFiveHourThreshold, defaultWeeklyThreshold)
 	if !ok {
 		t.Fatalf("expected an eligible alternate account")
 	}
@@ -1515,7 +1515,7 @@ func TestAccountWithUsageSetsCooldownWhenWeeklyExhausted(t *testing.T) {
 		UsedPercent: "99",
 		ResetAt:     int64Ptr(primaryReset),
 		UserID:      "user-primary",
-	}, false)
+	}, false, defaultRotationThresholds())
 
 	if got, ok := valueToInt64(updated["cooldownUntil"]); !ok || got != primaryReset {
 		t.Fatalf("expected cooldownUntil to be the weekly reset %d, got %v", primaryReset, updated["cooldownUntil"])
@@ -1545,7 +1545,7 @@ func TestAccountWithUsageClearsCooldownWhenBelowThreshold(t *testing.T) {
 		UsedPercent: "35",
 		ResetAt:     int64Ptr(primaryReset),
 		UserID:      "user-no-secondary",
-	}, false)
+	}, false, defaultRotationThresholds())
 
 	if _, exists := updated["cooldownUntil"]; exists {
 		t.Fatalf("expected cooldownUntil to be cleared when usage is below threshold, got %v", updated["cooldownUntil"])
@@ -2837,7 +2837,7 @@ func TestAccountWithUsageCooldownAndStripping(t *testing.T) {
 			"secondaryUsedPercent": "stale", "secondaryResetAt": int64(1700000000),
 		}, usageWindow{
 			UsedPercent: "70", ResetAt: int64Ptr(primaryReset), UserID: "u1",
-		}, false)
+		}, false, defaultRotationThresholds())
 		if _, has := stripped["secondaryUsedPercent"]; has {
 			t.Fatalf("strip: secondaryUsedPercent should be removed")
 		}
@@ -2852,7 +2852,7 @@ func TestAccountWithUsageCooldownAndStripping(t *testing.T) {
 			UsedPercent: "85", ResetAt: int64Ptr(primaryReset), // 5h reset (earlier)
 			SecondaryUsedPercent: "99", SecondaryResetAt: int64Ptr(weeklyReset), // weekly (later)
 			UserID: "u1",
-		}, true)
+		}, true, defaultRotationThresholds())
 		if got, ok := valueToInt64(updated["cooldownUntil"]); !ok || got != weeklyReset {
 			t.Fatalf("cooldownUntil=%v, want %d", updated["cooldownUntil"], weeklyReset)
 		}
@@ -2890,7 +2890,7 @@ func TestSelectEligibleAlternateAccountAcrossModes(t *testing.T) {
 			},
 			"user-ready": {"user_id": "user-ready", "access": "ready-token"},
 		}
-		selected, ok := selectEligibleAlternateAccount(store, "user-current", now, true)
+		selected, ok := selectEligibleAlternateAccount(store, "user-current", now, true, defaultFiveHourThreshold, defaultWeeklyThreshold)
 		if !ok || selected["user_id"] != "user-ready" {
 			t.Fatalf("expected user-ready (5h-hot dual blocked at 80), got %v ok=%v", selected["user_id"], ok)
 		}
@@ -2910,7 +2910,7 @@ func TestSelectEligibleAlternateAccountAcrossModes(t *testing.T) {
 			},
 			"user-ready": {"user_id": "user-ready", "access": "ready-token"},
 		}
-		selected, ok := selectEligibleAlternateAccount(store, "user-current", now, true)
+		selected, ok := selectEligibleAlternateAccount(store, "user-current", now, true, defaultFiveHourThreshold, defaultWeeklyThreshold)
 		if !ok || selected["user_id"] != "user-ready" {
 			t.Fatalf("expected user-ready (weekly-hot dual blocked at 98), got %v ok=%v", selected["user_id"], ok)
 		}
@@ -2924,7 +2924,7 @@ func TestSelectEligibleAlternateAccountAcrossModes(t *testing.T) {
 			"user-current": {"user_id": "user-current", "access": "current-token"},
 			"user-85":      {"user_id": "user-85", "access": "tok", "usedPercent": "85", "resetAt": now + 3600},
 		}
-		selected, ok := selectEligibleAlternateAccount(store, "user-current", now, true)
+		selected, ok := selectEligibleAlternateAccount(store, "user-current", now, true, defaultFiveHourThreshold, defaultWeeklyThreshold)
 		if !ok || selected["user_id"] != "user-85" {
 			t.Fatalf("expected user-85 eligible (5h ON + weekly-only -> primary as weekly 98), got %v ok=%v", selected["user_id"], ok)
 		}
@@ -2944,7 +2944,7 @@ func TestSelectEligibleAlternateAccountAcrossModes(t *testing.T) {
 				"secondaryUsedPercent": "50", "secondaryResetAt": now + 86400,
 			},
 		}
-		selected, ok := selectEligibleAlternateAccount(store, "user-current", now, false)
+		selected, ok := selectEligibleAlternateAccount(store, "user-current", now, false, defaultFiveHourThreshold, defaultWeeklyThreshold)
 		if !ok || selected["user_id"] != "user-stale-dual" {
 			t.Fatalf("expected user-stale-dual eligible (stale primary+cooldown ignored, secondary 50 below 98), got %v ok=%v", selected["user_id"], ok)
 		}
@@ -2965,7 +2965,7 @@ func TestSelectEligibleAlternateAccountAcrossModes(t *testing.T) {
 			},
 			"user-ready": {"user_id": "user-ready", "access": "ready-token"},
 		}
-		selected, ok := selectEligibleAlternateAccount(store, "user-current", now, false)
+		selected, ok := selectEligibleAlternateAccount(store, "user-current", now, false, defaultFiveHourThreshold, defaultWeeklyThreshold)
 		if !ok || selected["user_id"] != "user-ready" {
 			t.Fatalf("expected user-ready (stale-dual-hot blocked on secondary 98), got %v ok=%v", selected["user_id"], ok)
 		}
@@ -2985,7 +2985,7 @@ func TestSelectEligibleAlternateAccountAcrossModes(t *testing.T) {
 				"secondaryResetAt": now + 86400, // legacy: only the reset, no usage
 			},
 		}
-		selected, ok := selectEligibleAlternateAccount(store, "user-current", now, false)
+		selected, ok := selectEligibleAlternateAccount(store, "user-current", now, false, defaultFiveHourThreshold, defaultWeeklyThreshold)
 		if !ok || selected["user_id"] != "user-stale-dual-partial" {
 			t.Fatalf("expected user-stale-dual-partial eligible (missing secondary usage is conservative), got %v ok=%v", selected["user_id"], ok)
 		}
@@ -3012,7 +3012,7 @@ func TestSelectEligibleAlternateAccountAcrossModes(t *testing.T) {
 				"usedPercent": "50", "resetAt": now + 86400, // eligible weekly-only
 			},
 		}
-		selected, ok := selectEligibleAlternateAccount(store, "user-current", now, true)
+		selected, ok := selectEligibleAlternateAccount(store, "user-current", now, true, defaultFiveHourThreshold, defaultWeeklyThreshold)
 		if !ok || selected["user_id"] != "user-weekly-50" {
 			t.Fatalf("expected user-weekly-50 (dual-85 blocked on 80, weekly-95 blocked on 98), got %v ok=%v", selected["user_id"], ok)
 		}
@@ -4746,4 +4746,758 @@ func TestPiOnlyNoRotation(t *testing.T) {
 	if _, ok := mustReadStore(t, accountsFile)["user-cur"]; !ok {
 		t.Fatal("Pi account disappeared from store (rotated unexpectedly)")
 	}
+}
+
+// ---------------------------------------------------------------------------------------
+// Configurable rotation thresholds: 5h_threshold and weekly_threshold.
+// ---------------------------------------------------------------------------------------
+
+// thresholdFixture centralizes the column header used by table-driven cases for
+// both threshold subcommands. Tests reuse the same matrix for the loader,
+// writer, and CLI dispatch so the contract stays in one place.
+type thresholdFixture struct {
+	name      string
+	raw       string
+	wantValue float64
+	wantErr   bool
+}
+
+// thresholdLoadCases returns the loader matrix shared by the two new keys. The
+// "missing key" row uses the existing 5h toggle in the file so the loader's
+// "ignore unrelated keys" contract is exercised alongside the threshold default.
+// "missing file" / "empty path" rows exercise the documented default semantics:
+// no config means default; existing JSON with the wrong shape returns an error.
+//
+// `key` is the on-disk key the loader looks up; every row in the matrix is
+// templated so each test instance reads only its own key, never the sibling's.
+func thresholdLoadCases(key string, defaultValue float64) []thresholdFixture {
+	return []thresholdFixture{
+		{name: "empty path returns default", raw: "", wantValue: defaultValue},
+		{name: "missing file returns default", raw: "__missing__", wantValue: defaultValue},
+		{name: "empty file returns default", raw: "__empty__", wantValue: defaultValue},
+		{name: "missing key returns default", raw: `{"5h":"on"}`, wantValue: defaultValue},
+		{name: "reads integer", raw: fmt.Sprintf(`{"%s":75}`, key), wantValue: 75},
+		{name: "reads float", raw: fmt.Sprintf(`{"%s":97.5}`, key), wantValue: 97.5},
+		{name: "rejects zero", raw: fmt.Sprintf(`{"%s":0}`, key), wantErr: true},
+		{name: "rejects negative", raw: fmt.Sprintf(`{"%s":-1}`, key), wantErr: true},
+		{name: "rejects over 100", raw: fmt.Sprintf(`{"%s":100.01}`, key), wantErr: true},
+		{name: "rejects 101", raw: fmt.Sprintf(`{"%s":101}`, key), wantErr: true},
+		{name: "rejects string", raw: fmt.Sprintf(`{"%s":"abc"}`, key), wantErr: true},
+		{name: "rejects malformed JSON", raw: `{bad`, wantErr: true},
+	}
+}
+
+func seedThresholdConfig(t *testing.T, dir, content string) string {
+	t.Helper()
+	path := filepath.Join(dir, "config.json")
+	switch content {
+	case "__missing__":
+		_ = os.RemoveAll(path)
+		return filepath.Join(t.TempDir(), "config.json")
+	case "__empty__":
+		if err := os.WriteFile(path, nil, 0o600); err != nil {
+			t.Fatalf("seed empty: %v", err)
+		}
+		return path
+	case "":
+		return filepath.Join(t.TempDir(), "config.json")
+	default:
+		writeConfigFile(t, path, content)
+		return path
+	}
+}
+
+// TestLoadFiveHourThresholdConfig exercises the loader for the 5-hour
+// threshold: defaults (80), valid numeric reads (integer and fractional),
+// rejection of out-of-range values, non-numeric types, and malformed JSON.
+// The contract mirrors the existing 5h toggle loader: missing config means the
+// runtime default, bad config means a hard error so the CLI refuses to start.
+func TestLoadFiveHourThresholdConfig(t *testing.T) {
+	t.Parallel()
+	for _, tc := range thresholdLoadCases("5h_threshold", 80.0) {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			dir := t.TempDir()
+			path := seedThresholdConfig(t, dir, tc.raw)
+			value, err := loadFiveHourThresholdConfig(path)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("expected error, got value=%v", value)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("loadFiveHourThresholdConfig: %v", err)
+			}
+			if value != tc.wantValue {
+				t.Fatalf("value=%v, want %v", value, tc.wantValue)
+			}
+		})
+	}
+}
+
+// TestLoadWeeklyThresholdConfig mirrors the 5h loader contract for the weekly
+// threshold, including its 98 default.
+func TestLoadWeeklyThresholdConfig(t *testing.T) {
+	t.Parallel()
+	for _, tc := range thresholdLoadCases("weekly_threshold", 98.0) {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			dir := t.TempDir()
+			path := seedThresholdConfig(t, dir, tc.raw)
+			value, err := loadWeeklyThresholdConfig(path)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("expected error, got value=%v", value)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("loadWeeklyThresholdConfig: %v", err)
+			}
+			if value != tc.wantValue {
+				t.Fatalf("value=%v, want %v", value, tc.wantValue)
+			}
+		})
+	}
+}
+
+// TestSaveFiveHourThresholdConfig pins the writer: numeric values round-trip,
+// unknown keys are preserved, the parent directory is created on demand, and
+// empty paths are rejected. The numeric fidelity test ensures persisted values
+// are not truncated to integers (the CLI accepts fractional inputs).
+func TestSaveFiveHourThresholdConfig(t *testing.T) {
+	t.Parallel()
+
+	t.Run("writes value and preserves unknown keys", func(t *testing.T) {
+		t.Parallel()
+		path := filepath.Join(t.TempDir(), "config.json")
+		writeConfigFile(t, path, `{"other":"kept","nested":{"x":1}}`)
+		if err := saveFiveHourThresholdConfig(path, 72.5); err != nil {
+			t.Fatalf("save: %v", err)
+		}
+		var payload map[string]any
+		if err := json.Unmarshal(mustReadFile(t, path), &payload); err != nil {
+			t.Fatalf("parse: %v", err)
+		}
+		if got, _ := payload["5h_threshold"].(float64); got != 72.5 {
+			t.Fatalf("expected 5h_threshold=72.5, got %v", payload["5h_threshold"])
+		}
+		if got, _ := payload["other"].(string); got != "kept" {
+			t.Fatalf("expected unknown key preserved, got %v", payload["other"])
+		}
+		if _, ok := payload["nested"]; !ok {
+			t.Fatalf("expected nested object preserved, got %v", payload)
+		}
+	})
+
+	t.Run("creates parent directory", func(t *testing.T) {
+		t.Parallel()
+		path := filepath.Join(t.TempDir(), "nested", "subdir", "config.json")
+		if err := saveFiveHourThresholdConfig(path, 50); err != nil {
+			t.Fatalf("save: %v", err)
+		}
+		if _, err := os.Stat(path); err != nil {
+			t.Fatalf("expected config file to exist: %v", err)
+		}
+	})
+
+	t.Run("rejects empty path", func(t *testing.T) {
+		t.Parallel()
+		if err := saveFiveHourThresholdConfig("", 50); err == nil {
+			t.Fatalf("expected error for empty config path")
+		}
+	})
+
+	t.Run("rejects out-of-range values without writing", func(t *testing.T) {
+		t.Parallel()
+		path := filepath.Join(t.TempDir(), "config.json")
+		writeConfigFile(t, path, `{"5h":"on"}`)
+		for _, bad := range []float64{0, -1, 100.01, 200} {
+			if err := saveFiveHourThresholdConfig(path, bad); err == nil {
+				t.Fatalf("expected error for value %v", bad)
+			}
+			var payload map[string]any
+			if err := json.Unmarshal(mustReadFile(t, path), &payload); err != nil {
+				t.Fatalf("parse after bad save: %v", err)
+			}
+			if _, ok := payload["5h_threshold"]; ok {
+				t.Fatalf("config must not be modified on validation failure, got %v", payload)
+			}
+			if got, _ := payload["5h"].(string); got != "on" {
+				t.Fatalf("expected 5h=on preserved, got %v", payload["5h"])
+			}
+		}
+	})
+}
+
+// TestSaveWeeklyThresholdConfig mirrors the 5h threshold writer for the weekly
+// key, with the same preservation/rejection guarantees.
+func TestSaveWeeklyThresholdConfig(t *testing.T) {
+	t.Parallel()
+
+	t.Run("writes value and preserves unknown keys", func(t *testing.T) {
+		t.Parallel()
+		path := filepath.Join(t.TempDir(), "config.json")
+		writeConfigFile(t, path, `{"other":"kept"}`)
+		if err := saveWeeklyThresholdConfig(path, 99.5); err != nil {
+			t.Fatalf("save: %v", err)
+		}
+		var payload map[string]any
+		if err := json.Unmarshal(mustReadFile(t, path), &payload); err != nil {
+			t.Fatalf("parse: %v", err)
+		}
+		if got, _ := payload["weekly_threshold"].(float64); got != 99.5 {
+			t.Fatalf("expected weekly_threshold=99.5, got %v", payload["weekly_threshold"])
+		}
+		if got, _ := payload["other"].(string); got != "kept" {
+			t.Fatalf("expected unknown key preserved, got %v", payload["other"])
+		}
+	})
+
+	t.Run("rejects empty path", func(t *testing.T) {
+		t.Parallel()
+		if err := saveWeeklyThresholdConfig("", 50); err == nil {
+			t.Fatalf("expected error for empty config path")
+		}
+	})
+
+	t.Run("rejects out-of-range values without writing", func(t *testing.T) {
+		t.Parallel()
+		path := filepath.Join(t.TempDir(), "config.json")
+		writeConfigFile(t, path, `{"5h":"on"}`)
+		for _, bad := range []float64{0, -1, 100.01, 200} {
+			if err := saveWeeklyThresholdConfig(path, bad); err == nil {
+				t.Fatalf("expected error for value %v", bad)
+			}
+			var payload map[string]any
+			if err := json.Unmarshal(mustReadFile(t, path), &payload); err != nil {
+				t.Fatalf("parse after bad save: %v", err)
+			}
+			if _, ok := payload["weekly_threshold"]; ok {
+				t.Fatalf("config must not be modified on validation failure, got %v", payload)
+			}
+		}
+	})
+}
+
+// TestValidateThresholdPercent centralizes the validator contract: finite
+// numbers in the half-open interval (0, 100]. Non-numeric types, NaN, ±Inf,
+// zero, and negatives are rejected with a stable error so the CLI can show a
+// useful message to the user.
+func TestValidateThresholdPercent(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name    string
+		input   string
+		want    float64
+		wantErr bool
+	}{
+		{"integer", "80", 80, false},
+		{"fractional", "97.5", 97.5, false},
+		{"boundary 100", "100", 100, false},
+		{"zero rejected", "0", 0, true},
+		{"negative rejected", "-1", 0, true},
+		{"over 100 rejected", "100.01", 0, true},
+		{"non-numeric rejected", "abc", 0, true},
+		{"empty rejected", "", 0, true},
+	}
+	for _, tc := range tests {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			got, err := validateThresholdPercent(tc.input)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("expected error, got %v", got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("validateThresholdPercent: %v", err)
+			}
+			if got != tc.want {
+				t.Fatalf("got %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestRunConfigThresholdSubcommands covers the `config <key> [value]` CLI:
+// setting a value, reading the effective value (parseable number), preserving
+// unrelated keys, rejecting malformed/out-of-range input without writing, and
+// honoring the empty-path contract.
+func TestRunConfigThresholdSubcommands(t *testing.T) {
+	t.Parallel()
+
+	type sub struct {
+		key, field string
+		defaultVal float64
+	}
+
+	subs := []sub{
+		{key: "5h-threshold", field: "5h_threshold", defaultVal: 80},
+		{key: "weekly-threshold", field: "weekly_threshold", defaultVal: 98},
+	}
+
+	for _, s := range subs {
+		s := s
+		t.Run(s.key+" sets value and reports it back", func(t *testing.T) {
+			t.Parallel()
+			path := filepath.Join(t.TempDir(), "config.json")
+			var out strings.Builder
+			if err := runConfigCommand(config{ConfigFile: path}, &out, []string{s.key, "75"}); err != nil {
+				t.Fatalf("runConfigCommand: %v", err)
+			}
+			if got := strings.TrimSpace(out.String()); got != "75" {
+				t.Fatalf("stdout=%q, want %q", got, "75")
+			}
+			var payload map[string]any
+			if err := json.Unmarshal(mustReadFile(t, path), &payload); err != nil {
+				t.Fatalf("parse: %v", err)
+			}
+			if got, _ := payload[s.field].(float64); got != 75 {
+				t.Fatalf("expected %s=75 on disk, got %v", s.field, payload[s.field])
+			}
+		})
+
+		t.Run(s.key+" reports effective default when missing", func(t *testing.T) {
+			t.Parallel()
+			path := filepath.Join(t.TempDir(), "config.json")
+			var out strings.Builder
+			if err := runConfigCommand(config{ConfigFile: path}, &out, []string{s.key}); err != nil {
+				t.Fatalf("runConfigCommand: %v", err)
+			}
+			want := strconv.FormatFloat(s.defaultVal, 'f', -1, 64)
+			if got := strings.TrimSpace(out.String()); got != want {
+				t.Fatalf("stdout=%q, want %q", got, want)
+			}
+		})
+
+		t.Run(s.key+" reports effective persisted value", func(t *testing.T) {
+			t.Parallel()
+			path := filepath.Join(t.TempDir(), "config.json")
+			writeConfigFile(t, path, fmt.Sprintf(`{"%s":42}`, s.field))
+			var out strings.Builder
+			if err := runConfigCommand(config{ConfigFile: path}, &out, []string{s.key}); err != nil {
+				t.Fatalf("runConfigCommand: %v", err)
+			}
+			if got := strings.TrimSpace(out.String()); got != "42" {
+				t.Fatalf("stdout=%q, want %q", got, "42")
+			}
+		})
+
+		t.Run(s.key+" rejects malformed value without writing", func(t *testing.T) {
+			t.Parallel()
+			path := filepath.Join(t.TempDir(), "config.json")
+			writeConfigFile(t, path, `{"5h":"on"}`)
+			err := runConfigCommand(config{ConfigFile: path}, &strings.Builder{}, []string{s.key, "not-a-number"})
+			if err == nil {
+				t.Fatalf("expected error for malformed value")
+			}
+			var payload map[string]any
+			if perr := json.Unmarshal(mustReadFile(t, path), &payload); perr != nil {
+				t.Fatalf("parse after bad save: %v", perr)
+			}
+			if _, ok := payload[s.field]; ok {
+				t.Fatalf("config must not be modified on validation failure, got %v", payload)
+			}
+			if got, _ := payload["5h"].(string); got != "on" {
+				t.Fatalf("expected 5h=on preserved, got %v", payload["5h"])
+			}
+		})
+
+		t.Run(s.key+" rejects out-of-range value without writing", func(t *testing.T) {
+			t.Parallel()
+			path := filepath.Join(t.TempDir(), "config.json")
+			// Pre-seed with both the 5h toggle and a sentinel custom key so we can
+			// verify all known keys survive an invalid attempt.
+			writeConfigFile(t, path, `{"5h":"on","custom":{"kept":true}}`)
+			for _, bad := range []string{"0", "-1", "100.01", "200"} {
+				err := runConfigCommand(config{ConfigFile: path}, &strings.Builder{}, []string{s.key, bad})
+				if err == nil {
+					t.Fatalf("expected error for value %q", bad)
+				}
+			}
+			var payload map[string]any
+			if perr := json.Unmarshal(mustReadFile(t, path), &payload); perr != nil {
+				t.Fatalf("parse after rejected writes: %v", perr)
+			}
+			if _, ok := payload[s.field]; ok {
+				t.Fatalf("config must not be modified on validation failure, got %v", payload)
+			}
+			if got, _ := payload["5h"].(string); got != "on" {
+				t.Fatalf("expected 5h=on preserved, got %v", payload["5h"])
+			}
+			if _, ok := payload["custom"]; !ok {
+				t.Fatalf("expected custom key preserved, got %v", payload)
+			}
+		})
+
+		t.Run(s.key+" preserves 5h toggle and unknown keys", func(t *testing.T) {
+			t.Parallel()
+			path := filepath.Join(t.TempDir(), "config.json")
+			writeConfigFile(t, path, `{"5h":"off","custom":{"kept":true}}`)
+			if err := runConfigCommand(config{ConfigFile: path}, &strings.Builder{}, []string{s.key, "55"}); err != nil {
+				t.Fatalf("runConfigCommand: %v", err)
+			}
+			var payload map[string]any
+			if err := json.Unmarshal(mustReadFile(t, path), &payload); err != nil {
+				t.Fatalf("parse: %v", err)
+			}
+			if got, _ := payload["5h"].(string); got != "off" {
+				t.Fatalf("expected 5h=off preserved, got %v", payload["5h"])
+			}
+			if _, ok := payload["custom"]; !ok {
+				t.Fatalf("expected custom key preserved, got %v", payload)
+			}
+		})
+
+		t.Run(s.key+" rejects too many positional args", func(t *testing.T) {
+			t.Parallel()
+			err := runConfigCommand(config{ConfigFile: filepath.Join(t.TempDir(), "c.json")}, &strings.Builder{}, []string{s.key, "10", "20"})
+			if err == nil {
+				t.Fatalf("expected error for extra args")
+			}
+		})
+	}
+
+	t.Run("unknown subcommand still rejected with helpful message", func(t *testing.T) {
+		t.Parallel()
+		err := runConfigCommand(config{ConfigFile: filepath.Join(t.TempDir(), "c.json")}, &strings.Builder{}, []string{"monthly-threshold", "80"})
+		if err == nil || !strings.Contains(err.Error(), "unknown config feature") {
+			t.Fatalf("expected unknown-feature error, got %v", err)
+		}
+	})
+}
+
+// TestRunWithArgsLoadsThresholdsFromConfig pins the integration contract: the
+// runtime path (no `config` subcommand) loads the persisted thresholds from the
+// config file before evaluating exhaustion. With 5h_threshold raised above the
+// API value the default-5h-mode path must NOT rotate; with the threshold
+// dropped below the API value the path must rotate. This proves the values
+// flow through `runWithArgs` → `cfg.FiveHourThreshold/WeeklyThreshold` →
+// `accountWithUsage`/rotation.
+func TestRunWithArgsLoadsThresholdsFromConfig(t *testing.T) {
+	t.Parallel()
+
+	resetAt := time.Now().Add(2 * time.Hour).Unix()
+	makeBody := func(used, secondary string) string {
+		return fmt.Sprintf(
+			`{"user_id":"user-current","rate_limit":{"primary_window":{"used_percent":%s,"reset_at":%d},"secondary_window":{"used_percent":%s,"reset_at":%d}}}`,
+			used, resetAt, secondary, resetAt,
+		)
+	}
+
+	t.Run("raised 5h threshold blocks rotation at default value", func(t *testing.T) {
+		t.Parallel()
+		// API returns 85% (above default 80) but below configured 90.
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(makeBody("85", "10")))
+		}))
+		defer server.Close()
+
+		dir := t.TempDir()
+		authFile := filepath.Join(dir, "auth.json")
+		if err := os.WriteFile(authFile, []byte(`{"openai.access":"current-token"}`), 0o600); err != nil {
+			t.Fatalf("write auth: %v", err)
+		}
+		accountsFile := filepath.Join(dir, "accounts.json")
+		writeStore(t, accountsFile,
+			map[string]any{"user_id": "user-current", "access": "current-token"},
+			map[string]any{"user_id": "user-alt", "access": "alt-token"},
+		)
+		configFile := filepath.Join(dir, "config.json")
+		writeConfigFile(t, configFile, `{"5h_threshold":90}`)
+
+		var out strings.Builder
+		err := runWithArgs(context.Background(), config{
+			AuthFile:     authFile,
+			AccountsFile: accountsFile,
+			UsageURL:     server.URL,
+			HTTPClient:   server.Client(),
+			ConfigFile:   configFile,
+		}, &out, nil)
+		if err != nil {
+			t.Fatalf("runWithArgs: %v", err)
+		}
+		if out.String() != "85" {
+			t.Fatalf("stdout=%q want 85", out.String())
+		}
+		store := mustReadStore(t, accountsFile)
+		entry := store["user-current"]
+		if _, has := entry["cooldownUntil"]; has {
+			t.Fatalf("expected no cooldown when below configured 5h threshold, got %v", entry)
+		}
+	})
+
+	t.Run("lowered 5h threshold forces rotation before default cutoff", func(t *testing.T) {
+		t.Parallel()
+		// API returns 70% (below default 80) but above configured 65.
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(makeBody("70", "10")))
+		}))
+		defer server.Close()
+
+		dir := t.TempDir()
+		authFile := filepath.Join(dir, "auth.json")
+		if err := os.WriteFile(authFile, []byte(`{"openai.access":"current-token"}`), 0o600); err != nil {
+			t.Fatalf("write auth: %v", err)
+		}
+		accountsFile := filepath.Join(dir, "accounts.json")
+		writeStore(t, accountsFile,
+			map[string]any{"user_id": "user-current", "access": "current-token"},
+			map[string]any{"user_id": "user-alt", "access": "alt-token"},
+		)
+		configFile := filepath.Join(dir, "config.json")
+		writeConfigFile(t, configFile, `{"5h_threshold":65}`)
+
+		var out strings.Builder
+		err := runWithArgs(context.Background(), config{
+			AuthFile:     authFile,
+			AccountsFile: accountsFile,
+			UsageURL:     server.URL,
+			HTTPClient:   server.Client(),
+			ConfigFile:   configFile,
+		}, &out, nil)
+		if err != nil {
+			t.Fatalf("runWithArgs: %v", err)
+		}
+		// Rotation switched the active account to user-alt; auth.json now points to alt.
+		data, _ := os.ReadFile(authFile)
+		if !strings.Contains(string(data), "alt-token") {
+			t.Fatalf("expected rotation to alt-token, got auth=%s", string(data))
+		}
+	})
+
+	t.Run("raised weekly threshold blocks rotation in 5h-off path", func(t *testing.T) {
+		t.Parallel()
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(fmt.Sprintf(
+				`{"user_id":"user-current","rate_limit":{"primary_window":{"used_percent":99,"reset_at":%d}}}`,
+				resetAt,
+			)))
+		}))
+		defer server.Close()
+
+		dir := t.TempDir()
+		authFile := filepath.Join(dir, "auth.json")
+		if err := os.WriteFile(authFile, []byte(`{"openai.access":"current-token"}`), 0o600); err != nil {
+			t.Fatalf("write auth: %v", err)
+		}
+		accountsFile := filepath.Join(dir, "accounts.json")
+		writeStore(t, accountsFile,
+			map[string]any{"user_id": "user-current", "access": "current-token"},
+			map[string]any{"user_id": "user-alt", "access": "alt-token"},
+		)
+		configFile := filepath.Join(dir, "config.json")
+		writeConfigFile(t, configFile, `{"5h":"off","weekly_threshold":99.5}`)
+
+		var out strings.Builder
+		err := runWithArgs(context.Background(), config{
+			AuthFile:     authFile,
+			AccountsFile: accountsFile,
+			UsageURL:     server.URL,
+			HTTPClient:   server.Client(),
+			ConfigFile:   configFile,
+		}, &out, nil)
+		if err != nil {
+			t.Fatalf("runWithArgs: %v", err)
+		}
+		// 99 < 99.5: no rotation, no cooldown.
+		store := mustReadStore(t, accountsFile)
+		entry := store["user-current"]
+		if _, has := entry["cooldownUntil"]; has {
+			t.Fatalf("expected no cooldown when below configured weekly threshold, got %v", entry)
+		}
+	})
+
+	t.Run("lowered weekly threshold forces cooldown in 5h-off path", func(t *testing.T) {
+		t.Parallel()
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(fmt.Sprintf(
+				`{"user_id":"user-current","rate_limit":{"primary_window":{"used_percent":96,"reset_at":%d}}}`,
+				resetAt,
+			)))
+		}))
+		defer server.Close()
+
+		dir := t.TempDir()
+		authFile := filepath.Join(dir, "auth.json")
+		if err := os.WriteFile(authFile, []byte(`{"openai.access":"current-token"}`), 0o600); err != nil {
+			t.Fatalf("write auth: %v", err)
+		}
+		accountsFile := filepath.Join(dir, "accounts.json")
+		writeStore(t, accountsFile,
+			map[string]any{"user_id": "user-current", "access": "current-token"},
+			map[string]any{"user_id": "user-alt", "access": "alt-token"},
+		)
+		configFile := filepath.Join(dir, "config.json")
+		writeConfigFile(t, configFile, `{"5h":"off","weekly_threshold":95}`)
+
+		var out strings.Builder
+		err := runWithArgs(context.Background(), config{
+			AuthFile:     authFile,
+			AccountsFile: accountsFile,
+			UsageURL:     server.URL,
+			HTTPClient:   server.Client(),
+			ConfigFile:   configFile,
+		}, &out, nil)
+		if err != nil {
+			t.Fatalf("runWithArgs: %v", err)
+		}
+		store := mustReadStore(t, accountsFile)
+		entry := store["user-current"]
+		got, ok := valueToInt64(entry["cooldownUntil"])
+		if !ok || got != resetAt {
+			t.Fatalf("expected cooldownUntil=%d, got %v", resetAt, entry["cooldownUntil"])
+		}
+	})
+}
+
+// TestAccountWithUsageHonorsCustomThresholds locks the per-call threshold
+// override: accountWithUsage must use the thresholds passed in (so callers
+// can wire the runtime-configured values) instead of hardcoded constants.
+func TestAccountWithUsageHonorsCustomThresholds(t *testing.T) {
+	t.Parallel()
+
+	resetAt := int64(1777014899)
+	account := map[string]any{
+		"user_id": "user-x",
+		"access":  "x-token",
+	}
+
+	t.Run("weekly 90 sets cooldown when usedPercent=95", func(t *testing.T) {
+		t.Parallel()
+		out := accountWithUsage(account, usageWindow{
+			UsedPercent: "95",
+			ResetAt:     int64Ptr(resetAt),
+			UserID:      "user-x",
+		}, false, rotationThresholds{FiveHour: defaultFiveHourThreshold, Weekly: 90})
+		if got, ok := valueToInt64(out["cooldownUntil"]); !ok || got != resetAt {
+			t.Fatalf("expected cooldownUntil=%d, got %v", resetAt, out["cooldownUntil"])
+		}
+	})
+
+	t.Run("weekly 99 does NOT set cooldown when usedPercent=95", func(t *testing.T) {
+		t.Parallel()
+		out := accountWithUsage(account, usageWindow{
+			UsedPercent: "95",
+			ResetAt:     int64Ptr(resetAt),
+			UserID:      "user-x",
+		}, false, rotationThresholds{FiveHour: defaultFiveHourThreshold, Weekly: 99})
+		if _, has := out["cooldownUntil"]; has {
+			t.Fatalf("expected no cooldown below custom 99%% threshold, got %v", out["cooldownUntil"])
+		}
+	})
+}
+
+// (table-driven rejection test for out-of-range threshold writes pre-seeds the
+// file with both the 5h toggle and a custom key, so no sentinel is required.)
+
+func TestHideOwnConsoleWindowIsSafeToCall(t *testing.T) {
+	t.Parallel()
+
+	// Guards the build-tag pairing: exactly one implementation must compile on
+	// every platform, and calling it must never panic or affect a console the
+	// test process shares with its shell.
+	hideOwnConsoleWindow()
+}
+
+func TestRunAccountsCommandListsStoreWhenOpenCodeAuthMissing(t *testing.T) {
+	t.Parallel()
+
+	fixedNow := time.Unix(1_700_000_000, 0)
+	reset := fixedNow.Unix() + (45 * 60)
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"user_id":"user-other","email":"other@example.com","rate_limit":{"primary_window":{"used_percent":88,"reset_at":` + strconv.FormatInt(reset, 10) + `}}}`))
+	}))
+	defer server.Close()
+
+	dir := t.TempDir()
+	accountsFile := filepath.Join(dir, "accounts.json")
+	encoded, err := json.Marshal(map[string]map[string]any{
+		"user-other": {"user_id": "user-other", "access": "other-token"},
+	})
+	if err != nil {
+		t.Fatalf("marshal store: %v", err)
+	}
+	if err := os.WriteFile(accountsFile, encoded, 0o600); err != nil {
+		t.Fatalf("write accounts file: %v", err)
+	}
+
+	var out strings.Builder
+	err = runAccountsCommand(context.Background(), config{
+		// OpenCode is not installed: the path exists in config but not on disk.
+		AuthFile:     filepath.Join(dir, "missing", "auth.json"),
+		AccountsFile: accountsFile,
+		UsageURL:     server.URL,
+		HTTPClient:   server.Client(),
+		Now:          func() time.Time { return fixedNow },
+	}, &out)
+	if err != nil {
+		t.Fatalf("runAccountsCommand returned error: %v", err)
+	}
+
+	if !strings.Contains(out.String(), "other@example.com") {
+		t.Fatalf("expected the saved account to be listed, got %q", out.String())
+	}
+	if strings.Contains(out.String(), "*") {
+		t.Fatalf("no account should be marked current without OpenCode auth, got %q", out.String())
+	}
+}
+
+func TestActivateAccountSkipsProvidersThatAreNotInstalled(t *testing.T) {
+	t.Parallel()
+
+	t.Run("missing OpenCode auth file still syncs Pi", func(t *testing.T) {
+		t.Parallel()
+		oc, pi, _ := piSyncFixture(t)
+		seedAuthFile(t, pi, `{"anthropic":{"access":"anth"}}`)
+
+		if err := activateAccount(config{AuthFile: oc, PiAuthFile: pi}, fixturePiAccount()); err != nil {
+			t.Fatalf("activateAccount: %v", err)
+		}
+		assertPiCodex(t, readJSONObject(t, pi), "fixture-access-token", "fixture-refresh-token", 1777014899000, "acct-1")
+		if _, err := os.Stat(oc); !os.IsNotExist(err) {
+			t.Fatalf("OpenCode auth file must not be created when OpenCode is absent (stat err: %v)", err)
+		}
+	})
+
+	t.Run("missing Pi directory still syncs OpenCode", func(t *testing.T) {
+		t.Parallel()
+		oc, pi, _ := piSyncFixture(t)
+		seedAuthFile(t, oc, `{"other":"keep"}`)
+		absentPi := filepath.Join(filepath.Dir(pi), "no-pi-here", "auth.json")
+
+		if err := activateAccount(config{AuthFile: oc, PiAuthFile: absentPi}, fixturePiAccount()); err != nil {
+			t.Fatalf("activateAccount: %v", err)
+		}
+		if got := readJSONObject(t, oc)["openai.access"]; got != "fixture-access-token" {
+			t.Fatalf("OpenCode tuple not updated, got %v", got)
+		}
+		if _, err := os.Stat(filepath.Dir(absentPi)); !os.IsNotExist(err) {
+			t.Fatalf("Pi directory must not be created when Pi is absent (stat err: %v)", err)
+		}
+	})
+
+	t.Run("both providers absent reports the shared not-installed error", func(t *testing.T) {
+		t.Parallel()
+		oc, pi, _ := piSyncFixture(t)
+		absentPi := filepath.Join(filepath.Dir(pi), "no-pi-here", "auth.json")
+
+		err := activateAccount(config{AuthFile: oc, PiAuthFile: absentPi}, fixturePiAccount())
+		if !errors.Is(err, errNeitherProviderAvailable) {
+			t.Fatalf("expected errNeitherProviderAvailable, got %v", err)
+		}
+	})
 }

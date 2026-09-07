@@ -1,3 +1,4 @@
+import { spawn } from "node:child_process";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 const CLI = "codex-usage-cli";
@@ -21,6 +22,109 @@ type ToolDetails = {
 	results?: unknown[];
 	waited_task_ids?: unknown[];
 };
+
+type ExecResult = {
+	stdout: string;
+	stderr: string;
+	code: number | null;
+};
+
+// Run codex-usage-cli in a child process. The installed Pi ExtensionAPI.exec
+// does not expose the `windowsHide` option, so on Windows the spawned binary
+// would allocate a transient console window that flashes briefly even though
+// it is hidden almost immediately. Driving `child_process.spawn` directly
+// keeps the no-shell guarantee of `pi.exec` while letting us pass
+// `windowsHide: true` on win32, and preserves the 8 s timeout plus the
+// AbortSignal semantics the hooks previously delegated to `pi.exec`.
+function runCodexUsageCli(signal: AbortSignal | undefined): Promise<ExecResult> {
+	if (signal?.aborted) {
+		return Promise.reject(new Error("aborted"));
+	}
+
+	return new Promise((resolve, reject) => {
+		const child = spawn(CLI, [], {
+			stdio: ["ignore", "pipe", "pipe"],
+			windowsHide: process.platform === "win32",
+		});
+
+		let stdout = "";
+		let stderr = "";
+		let settled = false;
+		// Both handles start unset so cleanup() can run safely even when a fast
+		// child event reaches settle() before the timer or abort listener is
+		// wired up (TDZ-safe: clearTimeout(null) is a documented no-op in Node).
+		let timeoutHandle: ReturnType<typeof setTimeout> | null = null;
+		let removeAbortListener: (() => void) | null = null;
+
+		// Centralized cleanup: runs exactly once per Promise, on every settlement
+		// path (close, error, timeout, abort). After this returns the timer is
+		// cleared and the AbortSignal listener is detached, so a fast-completing
+		// or aborted CLI never leaks either handle.
+		const cleanup = (): void => {
+			if (timeoutHandle !== null) {
+				clearTimeout(timeoutHandle);
+				timeoutHandle = null;
+			}
+			if (removeAbortListener !== null) {
+				removeAbortListener();
+				removeAbortListener = null;
+			}
+		};
+
+		// `waitForClose` distinguishes the natural-exit paths (`close`, `error`,
+		// where the child has already reached its terminal event) from the kill
+		// paths (`timeout`, `abort`, where the child may still be alive). On the
+		// kill paths we send `kill()` and wait up to 1 s for the child's `close`
+		// before resolving/rejecting. If the backstop fires first, the FIFO queue
+		// proceeds and overlap with the prior child is theoretically possible;
+		// the backstop also keeps a silently-ignored `kill()` from hanging the
+		// queue forever.
+		const settle = (finalize: () => void, waitForClose: boolean): void => {
+			if (settled) return;
+			settled = true;
+			cleanup();
+			if (!waitForClose) {
+				finalize();
+				return;
+			}
+			try {
+				child.kill();
+			} catch {
+				// kill is best-effort; the child may already have exited.
+			}
+			const closeGuard = setTimeout(() => finalize(), 1000);
+			child.once("close", () => {
+				clearTimeout(closeGuard);
+				finalize();
+			});
+		};
+
+		const onAbort = (): void => settle(() => reject(new Error("aborted")), true);
+
+		timeoutHandle = setTimeout(() => {
+			settle(() => reject(new Error("timeout")), true);
+		}, TIMEOUT_MS);
+
+		if (signal) {
+			signal.addEventListener("abort", onAbort, { once: true });
+			removeAbortListener = (): void => {
+				signal.removeEventListener("abort", onAbort);
+			};
+		}
+
+		child.stdout?.setEncoding("utf8");
+		child.stderr?.setEncoding("utf8");
+		child.stdout?.on("data", (chunk: string) => {
+			stdout += chunk;
+		});
+		child.stderr?.on("data", (chunk: string) => {
+			stderr += chunk;
+		});
+
+		child.once("error", (err) => settle(() => reject(err), false));
+		child.once("close", (code) => settle(() => resolve({ stdout, stderr, code }), false));
+	});
+}
 
 export default function codexUsageOnSubagent(pi: ExtensionAPI): void {
 	// Session-local guard for the first main-agent user query; flipped before scheduling
@@ -46,10 +150,7 @@ export default function codexUsageOnSubagent(pi: ExtensionAPI): void {
 
 		const check = async (): Promise<void> => {
 			try {
-				const result = await pi.exec(CLI, [], {
-					timeout: TIMEOUT_MS,
-					signal: ctx?.signal,
-				});
+				const result = await runCodexUsageCli(ctx?.signal);
 				const output = result.stdout.trim();
 				const percentage = Number(output);
 

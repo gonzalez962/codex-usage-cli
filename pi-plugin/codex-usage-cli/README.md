@@ -12,15 +12,27 @@ Output is shown through UI notifications only and is never injected into the LLM
 
 ## Prerequisites
 
-- Pi with the documented `tool_result`, `message_start`, and `pi.exec` runtime methods available.
+- Pi with the documented `input`, `tool_result`, and `message_start` runtime methods available. The extension launches the CLI itself through Node's built-in `child_process.spawn` so it can pass `windowsHide: true` on Windows; it does not depend on the `pi.exec` helper exposing that option. Since the CLI also hides a console it allocated for itself, this flag is now defence in depth rather than the only mitigation.
 - The [`codex-usage-cli`](../README.md) binary on your `PATH` (or in the directory tree Pi resolves through `PATH`). The extension calls it as `codex-usage-cli` with no arguments so it prints the active account percentage and may rotate if the configured threshold is exceeded.
 - The companion `pi-subagents-j0k3r` package installed in Pi (the extension reads the subagent completion custom message that package emits).
 
-No additional npm packages, no Go toolchain, no shell scripts. The extension is a single TypeScript file at `pi-plugin/index.ts`.
+No additional npm packages, no Go toolchain, no shell scripts. The extension is a single TypeScript file at `pi-plugin/codex-usage-cli/index.ts`.
 
-## Install (copy, no package registry)
+## Install
 
-This folder is a copyable extension. Pick the destination that matches the scope you want:
+The extension resolves through every install shape Pi supports. Directory copies rely on Pi's `index.ts` fallback; package installs (`npm:`, `git:`, `local:`) resolve through the `pi.extensions` manifest in the repository's root `package.json`, which also registers the companion skill under `skills/`.
+
+### As a Pi package
+
+```text
+pi install https://github.com/gonzalez962/codex-usage-cli
+```
+
+Or add the source to `~/.pi/agent/settings.json` under `packages`, using any of `npm:codex-usage-cli`, `git:github.com/gonzalez962/codex-usage-cli`, or `local:<path to this repository>`. Because the manifest declares explicit entries, Pi loads exactly `pi-plugin/codex-usage-cli/index.ts` and the `skills/` tree, not the rest of the Go repository.
+
+### As a copied directory
+
+Pick the destination that matches the scope you want:
 
 ### Global (every project)
 
@@ -28,7 +40,7 @@ This folder is a copyable extension. Pick the destination that matches the scope
 ~/.pi/agent/extensions/codex-usage-cli/index.ts
 ```
 
-Copy the contents of `pi-plugin/` (or just `pi-plugin/index.ts`) into that directory so Pi loads it on every session start.
+Copy the contents of `pi-plugin/codex-usage-cli/` (or just `pi-plugin/codex-usage-cli/index.ts`) into that directory so Pi loads it on every session start.
 
 ### Project-local (this workspace only)
 
@@ -50,7 +62,9 @@ The extension does **not** invoke `codex-usage-cli` at load time or on `session_
 2. On `tool_result` for `subagent_continue`, it reads `event.details` directly. Task-mode continuations populate `details.results` and queue a refresh after the same terminal / non-background filter is applied (the package populates `results` only for task-mode continuations, so the filter is a defensive guard, not a behavioural change for the common path); background-handoff continuations omit `results` and are skipped here.
 3. On `message_start` whose `message.customType === "subagent-completion"`, it reads `message.details.task` and queues a refresh. No terminal / mode filter is applied here on purpose: the `subagent-completion` custom message is the runtime's authoritative notification for a finished background (or post-handoff) member, and its `details.task` already represents a terminal completion.
 
-Invocations are serialized through a single FIFO queue so two completions never race on the shared credential store and cannot trigger concurrent rotation. Each call uses a bounded `pi.exec` `timeout` (8 s) and propagates `ctx.signal` so the CLI is cancelled if the parent turn is cancelled. The extension never reads `event.result.details` (the hook payload already exposes the metadata at the top level).
+Invocations are serialized through a single FIFO queue. Normal completions serialize through the child's `close`; on timeout or abort the helper requests termination and waits up to 1 s for `close`. If termination cannot be confirmed within that backstop the queue proceeds and overlap is theoretically possible. Each call uses a bounded 8 s timeout and propagates `ctx.signal` so the CLI is cancelled if the parent turn is cancelled. On Windows the CLI is launched with `child_process.spawn` and `windowsHide: true`; the no-shell guarantee of the original `pi.exec` path is preserved (no `shell: true`, no command interpolation). On other platforms `windowsHide` is a no-op, so the behaviour is unchanged. Console-window suppression no longer depends on this flag alone: `codex-usage-cli` hides a console it allocated for itself, which covers callers that cannot pass the flag at all. The extension never reads `event.result.details` (the hook payload already exposes the metadata at the top level).
+
+The spawn helper centralises its cleanup through a single `cleanup()` step that runs from every settlement path (`close`, `error`, `timeout`, or `abort`) before the Promise resolves or rejects. On settlement the helper clears the 8 s timer and detaches its `AbortSignal` listener exactly once, and the cleanup is idempotent: a second settlement call (for example, the signal aborting after the CLI has already closed) is a no-op and the helper never leaks handles to either the timer queue or the parent signal. The timer and abort-listener handles are let-bound to `null` before being assigned, so a child that emits its terminal event faster than the helper can wire its handlers still settles cleanly without touching an uninitialised binding. On the `timeout` and `abort` paths the helper sends `kill()` and waits up to 1 s for the child's `close` event before finalizing. If the backstop fires first the queue proceeds without confirmation and overlap with the prior child is theoretically possible. The `close` and `error` paths finalize immediately because the child has already reached its terminal event.
 
 ## First main-agent query
 
@@ -59,7 +73,7 @@ In addition to the post-completion hooks, the extension runs `codex-usage-cli` *
 1. A Pi `input` hook fires before agent processing on every user input.
 2. The hook triggers only when `event.source === "interactive"` (typed at the TUI prompt) or `event.source === "rpc"` (sent through the RPC interface). Inputs whose source is `"extension"` are intentionally **not counted**, so extension-generated turns never trigger the first-time refresh. Extension commands such as `/reload` are handled before the `input` hook and do not count as the first query.
 3. The first eligible input flips a session-local guard to `true` **before** scheduling, so a concurrent or reentrant input cannot enqueue a second refresh.
-4. The handler `await`s the serialized `schedule` queue, so the live usage refresh and any account rotation complete before the main-model request is sent. Because `pi.exec` uses an 8 s timeout, the first query of a Pi session may be delayed by up to 8 seconds.
+4. The handler `await`s the serialized `schedule` queue, so the live usage refresh and any account rotation complete before the main-model request is sent. Because the spawn helper enforces an 8 s timeout plus a 1 s close guard on termination, an isolated first query of a Pi session may take about 9 s. Prior queued checks can add further delay.
 5. The UI notification is labelled `codex-usage-cli: main initial-query → X% used.` so the main-agent refresh is easy to distinguish from the subagent post-completion notifications.
 6. After the first eligible user query the guard stays `true` for the rest of the Pi session, so subsequent main-agent queries do **not** re-run the CLI.
 
@@ -103,7 +117,7 @@ If the active account usage is above the CLI's configured threshold (the 5-hour 
 
 ## Security
 
-- The extension runs `codex-usage-cli` through `pi.exec` only. It never invokes a shell or writes credential files directly; any documented account synchronization is performed by the CLI itself.
+- The extension runs `codex-usage-cli` through Node's `child_process.spawn` only, with `shell` disabled and `windowsHide` set on Windows. It never invokes a shell, never interpolates arguments, and never writes credential files directly; any documented account synchronization is performed by the CLI itself.
 - CLI stderr is never surfaced in notifications or model context. Non-zero exits, missing binaries, malformed output, and non-numeric stdout produce only a short UI warning.
 - `event.details` and `message.details` are read only for safe scalar fields (`id`, `agent`, `status`, `mode`, `effective_mode`, plus the top-level `waited_task_ids` array on tool results). Result bodies, error metadata, transcripts, thread snapshots, and any token / auth material are intentionally ignored.
 - The extension does not read `event.result.details`, OpenCode auth files, or environment variables. The CLI itself owns all credential access.
