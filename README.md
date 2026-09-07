@@ -8,6 +8,7 @@ CLI en Go para consultar el uso de OpenAI desde OpenCode.
 - `accounts` y `list`: muestran todas las cuentas guardadas en una tabla Markdown (`|` y `-`). Con el toggle de 5 horas activado y la API exponiendo ambas ventanas para alguna cuenta, la tabla incluye las cuatro columnas de uso (`USED%` 5h + `WEEK%` semanal, `RESET` + `WEEK-RESET`). En cualquier otro caso, la tabla usa el modo semanal único (`WEEK%` / `WEEK-RESET`). La cuenta activa se marca con `*` en la columna `CURRENT`.
 - `use <selector>`: cambia la cuenta activa en OpenCode por una cuenta guardada (sin exponer tokens). El selector es el índice de la tabla con prefijo `#` (`#<n>`), el `user_id` exacto, o el email (case-insensitive).
 - `config 5h on|off`: activa o desactiva el toggle de 5 horas. Persiste el estado en un archivo JSON dedicado junto al store de cuentas. `config 5h` (sin valor) imprime el estado efectivo actual (`on`/`off`).
+- `config 5h-threshold [percent]` y `config weekly-threshold [percent]`: consultan o actualizan los umbrales de rotación. Sin valor imprime el umbral efectivo como número parseable (default **80** para 5 horas, **98** para semanal). Con valor valida que sea un número finito en `(0, 100]` y lo persiste bajo `5h_threshold` / `weekly_threshold`.
 
 ## Requisitos
 - Go 1.22 o superior.
@@ -33,6 +34,24 @@ go install .
 ```
 
 Luego abre una nueva terminal.
+
+## Ventanas de consola en Windows
+
+El binario se enlaza como aplicación de consola, así que ejecutarlo desde una
+terminal funciona como cualquier otra CLI. El efecto secundario es que un
+proceso padre que lo lance sin `CREATE_NO_WINDOW` (un hook de agente, un
+programador de tareas, un wrapper) hace que Windows le asigne una consola nueva
+que aparece en pantalla.
+
+Para que la mitigación no dependa de cada llamador, la CLI la resuelve por sí
+misma: al arrancar consulta `GetConsoleProcessList`. Si hay exactamente un
+proceso adjunto, la consola fue asignada para ella y la oculta con
+`ShowWindow(SW_HIDE)`. Si hay dos o más, la consola es la terminal compartida
+con tu shell y no se toca, así que el uso interactivo no cambia.
+
+Fuera de Windows la función es un no-op: los sistemas tipo Unix no asignan
+ventanas de consola a los procesos hijos, y el comportamiento de la CLI es
+idéntico se ejecute desde una terminal o desde un hook de agente.
 
 ## Uso básico
 Porcentaje de la ventana relevante de la cuenta activa (5 horas si el toggle está activado y la API expone ambas ventanas; semanal en cualquier otro caso):
@@ -142,7 +161,7 @@ columnas, persistencia, rotación, cooldown y stdout de la CLI:
   antes de cualquier persistencia, rotación, cooldown o stdout. Si la
   respuesta no trae `secondary_window`, el valor semanal se conserva desde
   `primary_window` como fallback.
-- Umbrales de rotación y cooldown:
+- Umbrales de rotación y cooldown (configurables; ver `Umbrales de rotación` más abajo):
   - Toggle **on**: 5 horas agotada al **80%**, semanal al **98%**, cooldown toma el reset más tardío si ambas ventanas están agotadas.
   - Toggle **off**: solo semanal al **98%** (usando el valor ya promovido o el fallback de la primaria, según corresponda).
 - Persistencia: solo con toggle **on** se guardan `secondaryUsedPercent` y
@@ -150,6 +169,49 @@ columnas, persistencia, rotación, cooldown y stdout de la CLI:
 - Tabla de `accounts`/`list`: dual (cuatro columnas) cuando el toggle está **on**
   y al menos una cuenta expone la ventana secundaria; semanal única en cualquier
   otro caso.
+
+## Umbrales de rotación (`config 5h-threshold`, `config weekly-threshold`)
+
+Por defecto la CLI considera **agotada** la cuenta activa cuando la ventana de 5
+horas llega al **80%** y la ventana semanal al **98%**. Estos umbrales se pueden
+ajustar (por ejemplo para rotar antes o después) y se persisten en el mismo
+`config.json` que el toggle de 5 horas, bajo las claves `5h_threshold` y
+`weekly_threshold`.
+
+```powershell
+codex-usage-cli config 5h-threshold 75
+```
+
+```powershell
+codex-usage-cli config weekly-threshold 99
+```
+
+```powershell
+codex-usage-cli config 5h-threshold
+```
+
+```powershell
+codex-usage-cli config weekly-threshold
+```
+
+- Sin valor imprime el umbral efectivo como un número parseable (sin
+  decoración), de modo que se puede capturar en scripts.
+- Con valor, la CLI valida que sea un número finito dentro de `(0, 100]`,
+  persiste el cambio y vuelve a imprimir el valor aceptado. Valores fuera de
+  rango, no numéricos, `NaN`/`±Inf` o vacíos se rechazan **sin modificar el
+  archivo de configuración** ni el toggle de 5 horas.
+- El mismo comando funciona aunque no haya auth, cuentas guardadas ni URL de
+  uso configurados, igual que `config 5h`.
+- Las claves desconocidas y el toggle de 5 horas (`5h`) ya presentes en el
+  archivo se conservan intactas. Los permisos del archivo se mantienen en
+  `0600` (en Windows `chmod` es no-op pero la API usa `0600` en la creación).
+- Los umbrales persistidos se aplican de forma consistente en la rotación de
+  la cuenta activa, la elegibilidad de candidatas alternativas y el cálculo de
+  `cooldownUntil` (incluyendo la regla "reset más tardío" cuando ambas
+  ventanas están agotadas).
+- El parser también rechaza valores corruptos leídos desde el archivo: si
+  `5h_threshold` o `weekly_threshold` están fuera de `(0, 100]` o no son
+  numéricos, la CLI se niega a arrancar antes de hacer cualquier rotación.
 
 ## Rotación automática de cuentas
 
@@ -159,7 +221,9 @@ Con el toggle de 5 horas **activado**, la API expone dos ventanas:
 `rate_limit.primary_window` corresponde a la ventana de **5 horas** y
 `rate_limit.secondary_window` corresponde a la ventana **semanal**. La cuenta
 activa se considera agotada cuando la ventana de 5 horas llega al **80%** o la
-ventana semanal llega al **98%**. Si ambas están agotadas, el cooldown
+ventana semanal llega al **98%** (estos cortes son los defaults; puedes
+ajustarlos con `config 5h-threshold` y `config weekly-threshold`, ver la
+sección anterior). Si ambas están agotadas, el cooldown
 persiste hasta el reset más tardío.
 
 Con el toggle **desactivado**, la CLI ignora por completo la ventana de 5
@@ -168,8 +232,9 @@ horas. Si la API devolvió `secondary_window` con el valor semanal, la CLI lo
 secundarios antes de persistir, rotar, calcular cooldown o imprimir. Si la
 respuesta no incluye `secondary_window`, la CLI conserva `primary_window` como
 fallback semanal. En ambos casos la cuenta activa se considera agotada cuando
-esa ventana semanal llega al **98%**, y el cooldown persiste hasta el reset de
-esa misma ventana.
+esa ventana semanal llega al **98%** (default configurable con
+`config weekly-threshold`), y el cooldown persiste hasta el reset de esa
+misma ventana.
 
 En ambos modos, si se cumple el umbral se intenta rotar a una cuenta
 alternativa del store que:
@@ -187,7 +252,9 @@ alternativa del store que:
 
 La elegibilidad es **per-candidato**: el toggle decide el modo de evaluación
 y la forma persistida del candidato (dual vs. semanal pura) decide qué
-campos aplican. Las reglas son:
+campos aplican. Los valores de la tabla son los defaults persistidos; los
+umbrales primaria y secundaria se pueden ajustar con `config 5h-threshold` y
+`config weekly-threshold` respectivamente. Las reglas son:
 
 | Toggle | Forma persistida | Umbral primaria | Umbral secundaria | Cooldown |
 |--------|------------------|-----------------|-------------------|----------|
@@ -263,6 +330,20 @@ store o actualizar OpenCode sí se devuelven para hacer visible una
 sincronización parcial y permitir reintentarla.
 
 ## Proveedores y fallback
+
+Ningún comando exige que ambos proveedores estén instalados. Un proveedor
+ausente se omite en lugar de abortar la ejecución:
+
+- `accounts` / `list`: si el `auth.json` de OpenCode no existe o no es
+  utilizable, la tabla se imprime igual con todas las cuentas guardadas y
+  simplemente ninguna fila lleva el marcador `*` de cuenta activa.
+- `use <id>`: solo sincroniza los proveedores presentes. OpenCode cuenta como
+  presente cuando su `auth.json` existe (la CLI nunca lo crea); Pi cuenta como
+  presente cuando su directorio de agente existe (la CLI puede crear
+  `auth.json` dentro, igual que Pi al iniciar sesión, pero nunca fabrica el
+  árbol completo). Si ninguno está presente, devuelve el error
+  `OpenCode and Pi Agent are not installed or configured`.
+- Comando sin argumentos: ver la matriz de disponibilidad más abajo.
 
 El comando sin argumentos soporta dos proveedores independientes de
 credenciales OpenAI/ChatGPT:
