@@ -5,7 +5,7 @@ CLI en Go para consultar el uso de OpenAI desde OpenCode.
 
 - Sin argumentos: muestra en `stdout` solo el porcentaje usado de la ventana relevante de la cuenta actual. Con el toggle de 5 horas activado y la API exponiendo ambas ventanas, imprime el porcentaje de la ventana de **5 horas** (`rate_limit.primary_window`); en cualquier otro caso (toggle apagado o `secondary_window` ausente/`null`) imprime el porcentaje de la ventana **semanal**.
 - Si la ventana activa supera el umbral interno, puede rotar automáticamente a otra cuenta guardada. Con el toggle de 5 horas activado, la cuenta se considera agotada cuando la ventana de 5 horas llega al **80%** o la ventana semanal llega al **98%**. Con el toggle apagado, solo se considera el **98%** sobre la ventana semanal (la CLI promueve `secondary_window` a la primaria canónica cuando está disponible, o conserva `primary_window` como fallback).
-- `accounts` y `list`: muestran todas las cuentas guardadas en una tabla Markdown (`|` y `-`). Con el toggle de 5 horas activado y la API exponiendo ambas ventanas para alguna cuenta, la tabla incluye las cuatro columnas de uso (`USED%` 5h + `WEEK%` semanal, `RESET` + `WEEK-RESET`). En cualquier otro caso, la tabla usa el modo semanal único (`WEEK%` / `WEEK-RESET`). La cuenta activa se marca con `*` en la columna `CURRENT`.
+- `accounts` y `list`: muestran todas las cuentas guardadas en una tabla Markdown (`|` y `-`). Con el toggle de 5 horas activado y la API exponiendo ambas ventanas para alguna cuenta, la tabla incluye las cuatro columnas de uso (`USED%` 5h + `WEEK%` semanal, `RESET` + `WEEK-RESET`). En cualquier otro caso, la tabla usa el modo semanal único (`WEEK%` / `WEEK-RESET`). La cuenta activa se marca con `*` en la columna `CURRENT`, resuelta desde OpenCode o, si OpenCode no está disponible, desde Pi Agent.
 - `use <selector>`: cambia la cuenta activa en OpenCode por una cuenta guardada (sin exponer tokens). El selector es el índice de la tabla con prefijo `#` (`#<n>`), el `user_id` exacto, o el email (case-insensitive).
 - `config 5h on|off`: activa o desactiva el toggle de 5 horas. Persiste el estado en un archivo JSON dedicado junto al store de cuentas. `config 5h` (sin valor) imprime el estado efectivo actual (`on`/`off`).
 - `config 5h-threshold [percent]` y `config weekly-threshold [percent]`: consultan o actualizan los umbrales de rotación. Sin valor imprime el umbral efectivo como número parseable (default **80** para 5 horas, **98** para semanal). Con valor valida que sea un número finito en `(0, 100]` y lo persiste bajo `5h_threshold` / `weekly_threshold`.
@@ -90,7 +90,13 @@ Salida de ejemplo cuando el toggle de 5 horas está **activado** y la API expone
 
 La tabla usa formato Markdown con `|` como separador de columnas y `-` en la
 fila separadora justo debajo del header. La cuenta activa se marca con `*` en
-la columna `CURRENT`. Las filas se ordenan por `user_id` alfabéticamente y el
+la columna `CURRENT`: se resuelve desde el `auth.json` de OpenCode cuando está
+disponible y, si OpenCode no está instalado o su credencial no es usable, desde
+la entrada `openai-codex` de Pi Agent (lectura bajo lock, sin escrituras). El
+match es por igualdad exacta del access token contra el store, así que no
+agrega ninguna consulta al endpoint de uso; si Pi refrescó su credencial por
+fuera y el store quedó desactualizado, ninguna fila queda marcada hasta que el
+comando sin argumentos vuelva a sincronizar. Las filas se ordenan por `user_id` alfabéticamente y el
 `ID` de la izquierda es estable: lo pasás a `use #<n>` (con el prefijo `#`
 obligatorio) para cambiar la cuenta activa por esa fila.
 

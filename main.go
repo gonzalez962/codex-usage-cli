@@ -432,14 +432,49 @@ type accountUsageRow struct {
 	Err       error
 }
 
-func runAccountsCommand(ctx context.Context, cfg config, stdout io.Writer) error {
-	// OpenCode may not be installed on this machine. A missing or unusable
-	// auth file only means there is no active account to mark with `*`; the
-	// saved store is still listed in full, so `accounts` stays useful on a
-	// Pi-only (or store-only) install.
-	currentAccount, _ := loadOpenCodeAccountIfAvailable(cfg.AuthFile)
+// currentAccountToken resolves the access token of the account currently in
+// use, so `accounts`/`list` can mark it with `*`. OpenCode wins whenever its
+// auth file is usable; only when it is absent or unusable (a Pi-only install,
+// e.g. a VPS) does Pi's `openai-codex` credential decide.
+//
+// READ-ONLY: loadPiAuthIfUsable reads Pi's auth.json under the same
+// proper-lockfile protocol as the default command and never creates or writes
+// anything, so listing accounts stays free of side effects. It never calls
+// reconcilePiInbound, which remains reserved for runDefaultCommand.
+//
+// The match key is exact access-token equality against the saved store — the
+// same key `accounts` already used for OpenCode. It costs no extra usage
+// request. The tradeoff is that a Pi credential refreshed out of band since
+// the last store sync no longer matches, in which case no row is marked;
+// running the default command re-syncs the store and restores the marker.
+// Returns "" when neither provider yields a usable token.
+func currentAccountToken(cfg config) string {
+	if account, ok := loadOpenCodeAccountIfAvailable(cfg.AuthFile); ok {
+		if token, _ := account["access"].(string); strings.TrimSpace(token) != "" {
+			return token
+		}
+	}
 
-	currentToken, _ := currentAccount["access"].(string)
+	piInfo, piAvailable := loadPiAuthIfUsable(cfg.PiAuthFile)
+	if !piAvailable {
+		return ""
+	}
+	// loadPiAuthIfUsable already validated this entry, so the parse cannot
+	// fail here; the error is still handled rather than discarded.
+	piAccount, err := parsePiOpenAICodexEntry(piInfo.CredMap)
+	if err != nil {
+		return ""
+	}
+	token, _ := piAccount["access"].(string)
+	return token
+}
+
+func runAccountsCommand(ctx context.Context, cfg config, stdout io.Writer) error {
+	// OpenCode may not be installed on this machine. The saved store is
+	// listed in full either way, so `accounts` stays useful on a Pi-only
+	// (or store-only) install; currentAccountToken decides whether any row
+	// can still be marked with `*`.
+	currentToken := currentAccountToken(cfg)
 
 	store, err := readAccountsStore(cfg.AccountsFile)
 	if err != nil {

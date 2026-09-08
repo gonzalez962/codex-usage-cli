@@ -5501,3 +5501,285 @@ func TestActivateAccountSkipsProvidersThatAreNotInstalled(t *testing.T) {
 		}
 	})
 }
+
+// TestRunAccountsCommandMarksCurrentFromPiWhenOpenCodeAbsent covers the
+// Pi-only install (e.g. a VPS with Pi Agent but no OpenCode): the CURRENT
+// marker must still identify the account in use. The match key is exact
+// access-token equality against the saved store, which needs no extra
+// usage request.
+func TestRunAccountsCommandMarksCurrentFromPiWhenOpenCodeAbsent(t *testing.T) {
+	t.Parallel()
+
+	fixedNow := time.Unix(1_700_000_000, 0)
+	reset := fixedNow.Unix() + (45 * 60)
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		userID := "user-a"
+		email := "a@example.com"
+		if strings.Contains(r.Header.Get("Authorization"), "pi-token") {
+			userID = "user-b"
+			email = "b@example.com"
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"user_id":"` + userID + `","email":"` + email +
+			`","rate_limit":{"primary_window":{"used_percent":31,"reset_at":` +
+			strconv.FormatInt(reset, 10) + `}}}`))
+	}))
+	defer server.Close()
+
+	dir := t.TempDir()
+	accountsFile := filepath.Join(dir, "accounts.json")
+	encoded, err := json.Marshal(map[string]map[string]any{
+		"user-a": {"user_id": "user-a", "access": "other-token"},
+		"user-b": {"user_id": "user-b", "access": "pi-token"},
+	})
+	if err != nil {
+		t.Fatalf("marshal store: %v", err)
+	}
+	if err := os.WriteFile(accountsFile, encoded, 0o600); err != nil {
+		t.Fatalf("write accounts file: %v", err)
+	}
+
+	piAuthFile := filepath.Join(dir, "pi-auth.json")
+	seedAuthFile(t, piAuthFile, `{"openai-codex":{"type":"oauth","access":"pi-token",`+
+		`"refresh":"pi-refresh","expires":1777014899000,"accountId":"acct-b"}}`)
+
+	var out strings.Builder
+	err = runAccountsCommand(context.Background(), config{
+		// OpenCode is not installed: the path exists in config but not on disk.
+		AuthFile:     filepath.Join(dir, "missing", "auth.json"),
+		PiAuthFile:   piAuthFile,
+		AccountsFile: accountsFile,
+		UsageURL:     server.URL,
+		HTTPClient:   server.Client(),
+		Now:          func() time.Time { return fixedNow },
+	}, &out)
+	if err != nil {
+		t.Fatalf("runAccountsCommand returned error: %v", err)
+	}
+
+	rendered := out.String()
+	if !strings.Contains(rendered, "b@example.com") {
+		t.Fatalf("expected the Pi account to be listed, got %q", rendered)
+	}
+	marked := currentMarkedEmails(t, rendered)
+	if len(marked) != 1 || marked[0] != "b@example.com" {
+		t.Fatalf("expected only b@example.com marked current from Pi, got %v in %q", marked, rendered)
+	}
+}
+
+// TestRunAccountsCommandPrefersOpenCodeOverPiForCurrent pins the precedence:
+// when OpenCode auth is usable it decides CURRENT, and Pi is never consulted.
+func TestRunAccountsCommandPrefersOpenCodeOverPiForCurrent(t *testing.T) {
+	t.Parallel()
+
+	fixedNow := time.Unix(1_700_000_000, 0)
+	reset := fixedNow.Unix() + (45 * 60)
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		userID := "user-a"
+		email := "a@example.com"
+		if strings.Contains(r.Header.Get("Authorization"), "pi-token") {
+			userID = "user-b"
+			email = "b@example.com"
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"user_id":"` + userID + `","email":"` + email +
+			`","rate_limit":{"primary_window":{"used_percent":31,"reset_at":` +
+			strconv.FormatInt(reset, 10) + `}}}`))
+	}))
+	defer server.Close()
+
+	dir := t.TempDir()
+	accountsFile := filepath.Join(dir, "accounts.json")
+	encoded, err := json.Marshal(map[string]map[string]any{
+		"user-a": {"user_id": "user-a", "access": "oc-token"},
+		"user-b": {"user_id": "user-b", "access": "pi-token"},
+	})
+	if err != nil {
+		t.Fatalf("marshal store: %v", err)
+	}
+	if err := os.WriteFile(accountsFile, encoded, 0o600); err != nil {
+		t.Fatalf("write accounts file: %v", err)
+	}
+
+	authFile := filepath.Join(dir, "auth.json")
+	seedAuthFile(t, authFile, `{"openai":{"type":"oauth","access":"oc-token",`+
+		`"refresh":"oc-refresh","expires":1777014899000}}`)
+	piAuthFile := filepath.Join(dir, "pi-auth.json")
+	seedAuthFile(t, piAuthFile, `{"openai-codex":{"type":"oauth","access":"pi-token",`+
+		`"refresh":"pi-refresh","expires":1777014899000,"accountId":"acct-b"}}`)
+
+	var out strings.Builder
+	err = runAccountsCommand(context.Background(), config{
+		AuthFile:     authFile,
+		PiAuthFile:   piAuthFile,
+		AccountsFile: accountsFile,
+		UsageURL:     server.URL,
+		HTTPClient:   server.Client(),
+		Now:          func() time.Time { return fixedNow },
+	}, &out)
+	if err != nil {
+		t.Fatalf("runAccountsCommand returned error: %v", err)
+	}
+
+	rendered := out.String()
+	marked := currentMarkedEmails(t, rendered)
+	if len(marked) != 1 || marked[0] != "a@example.com" {
+		t.Fatalf("expected only a@example.com marked current from OpenCode, got %v in %q", marked, rendered)
+	}
+}
+
+// currentMarkedEmails extracts the EMAIL cell of every rendered row whose
+// CURRENT column holds the `*` marker.
+func currentMarkedEmails(t *testing.T, rendered string) []string {
+	t.Helper()
+	marked := make([]string, 0, 2)
+	for _, line := range strings.Split(rendered, "\n") {
+		cells := strings.Split(strings.Trim(strings.TrimSpace(line), "|"), "|")
+		if len(cells) < 3 || strings.TrimSpace(cells[1]) != "*" {
+			continue
+		}
+		marked = append(marked, strings.TrimSpace(cells[2]))
+	}
+	return marked
+}
+
+// TestCurrentAccountTokenFallsBackToPiWhenOpenCodeTokenIsEmpty pins the
+// fallthrough at the OpenCode branch: an OpenCode auth file that parses but
+// yields a blank access token is NOT a usable provider, so Pi must decide.
+// Without this the empty-token guard could silently return "" and drop the
+// CURRENT marker on a host that has both providers.
+func TestCurrentAccountTokenFallsBackToPiWhenOpenCodeTokenIsEmpty(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	authFile := filepath.Join(dir, "auth.json")
+	seedAuthFile(t, authFile, `{"openai":{"type":"oauth","access":"   ",`+
+		`"refresh":"oc-refresh","expires":1777014899000}}`)
+	piAuthFile := filepath.Join(dir, "pi-auth.json")
+	seedAuthFile(t, piAuthFile, `{"openai-codex":{"type":"oauth","access":"pi-token",`+
+		`"refresh":"pi-refresh","expires":1777014899000,"accountId":"acct-b"}}`)
+
+	if got := currentAccountToken(config{AuthFile: authFile, PiAuthFile: piAuthFile}); got != "pi-token" {
+		t.Fatalf("expected the Pi token when the OpenCode token is blank, got %q", got)
+	}
+}
+
+// TestCurrentAccountTokenReturnsEmptyForUnusablePi covers every way Pi can
+// fail to yield a token. Each case must return "" so no row is marked, never
+// a partial or garbage token that would mark the WRONG account as current.
+func TestCurrentAccountTokenReturnsEmptyForUnusablePi(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name    string
+		content string
+	}{
+		{"malformed JSON", `{"openai-codex":`},
+		{"missing openai-codex entry", `{"anthropic":{"access":"anth"}}`},
+		{"null openai-codex entry", `{"openai-codex":null}`},
+		{"entry is not an object", `{"openai-codex":"not-an-object"}`},
+		{"blank access token", `{"openai-codex":{"type":"oauth","access":"",` +
+			`"refresh":"pi-refresh","expires":1777014899000,"accountId":"acct-b"}}`},
+		{"missing refresh token", `{"openai-codex":{"type":"oauth","access":"pi-token",` +
+			`"expires":1777014899000,"accountId":"acct-b"}}`},
+		{"non-oauth type", `{"openai-codex":{"type":"api","access":"pi-token",` +
+			`"refresh":"pi-refresh","expires":1777014899000,"accountId":"acct-b"}}`},
+		{"non-integer expires", `{"openai-codex":{"type":"oauth","access":"pi-token",` +
+			`"refresh":"pi-refresh","expires":"soon","accountId":"acct-b"}}`},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			dir := t.TempDir()
+			piAuthFile := filepath.Join(dir, "pi-auth.json")
+			seedAuthFile(t, piAuthFile, tc.content)
+
+			got := currentAccountToken(config{
+				// OpenCode absent, so Pi is the only possible source.
+				AuthFile:   filepath.Join(dir, "missing", "auth.json"),
+				PiAuthFile: piAuthFile,
+			})
+			if got != "" {
+				t.Fatalf("expected no token for an unusable Pi entry, got %q", got)
+			}
+		})
+	}
+}
+
+// TestCurrentAccountTokenIsReadOnly backs the documented guarantee that
+// listing accounts never mutates anything. The README and the function
+// comment both promise this; without an assertion the promise can rot into a
+// silent side effect that creates Pi state on a host where Pi is absent.
+func TestCurrentAccountTokenIsReadOnly(t *testing.T) {
+	t.Parallel()
+
+	t.Run("absent Pi creates neither the file nor its directory", func(t *testing.T) {
+		t.Parallel()
+		dir := t.TempDir()
+		absentPi := filepath.Join(dir, "no-pi-here", "auth.json")
+
+		if got := currentAccountToken(config{
+			AuthFile:   filepath.Join(dir, "missing", "auth.json"),
+			PiAuthFile: absentPi,
+		}); got != "" {
+			t.Fatalf("expected no token when both providers are absent, got %q", got)
+		}
+		if _, err := os.Stat(filepath.Dir(absentPi)); !os.IsNotExist(err) {
+			t.Fatalf("Pi directory must not be created (stat err: %v)", err)
+		}
+		if _, err := os.Stat(absentPi); !os.IsNotExist(err) {
+			t.Fatalf("Pi auth file must not be created (stat err: %v)", err)
+		}
+	})
+
+	t.Run("present Pi is left byte-identical and unlocked", func(t *testing.T) {
+		t.Parallel()
+		dir := t.TempDir()
+		piAuthFile := filepath.Join(dir, "pi-auth.json")
+		original := `{"openai-codex":{"type":"oauth","access":"pi-token",` +
+			`"refresh":"pi-refresh","expires":1777014899000,"accountId":"acct-b"},` +
+			`"minimax":{"access":"keep-me"}}`
+		seedAuthFile(t, piAuthFile, original)
+
+		if got := currentAccountToken(config{
+			AuthFile:   filepath.Join(dir, "missing", "auth.json"),
+			PiAuthFile: piAuthFile,
+		}); got != "pi-token" {
+			t.Fatalf("expected the Pi token, got %q", got)
+		}
+
+		after, err := os.ReadFile(piAuthFile)
+		if err != nil {
+			t.Fatalf("read Pi auth file: %v", err)
+		}
+		if string(after) != original {
+			t.Fatalf("Pi auth file was rewritten:\n got %s\nwant %s", after, original)
+		}
+		// The read takes the proper-lockfile lock; it must also release it,
+		// or the next writer deadlocks against a stale lock directory.
+		if _, err := os.Stat(piAuthFile + ".lock"); !os.IsNotExist(err) {
+			t.Fatalf("Pi lock must be released (stat err: %v)", err)
+		}
+	})
+
+	t.Run("absent OpenCode creates neither the file nor its directory", func(t *testing.T) {
+		t.Parallel()
+		dir := t.TempDir()
+		absentOC := filepath.Join(dir, "no-opencode", "auth.json")
+		piAuthFile := filepath.Join(dir, "pi-auth.json")
+		seedAuthFile(t, piAuthFile, `{"openai-codex":{"type":"oauth","access":"pi-token",`+
+			`"refresh":"pi-refresh","expires":1777014899000,"accountId":"acct-b"}}`)
+
+		if got := currentAccountToken(config{AuthFile: absentOC, PiAuthFile: piAuthFile}); got != "pi-token" {
+			t.Fatalf("expected the Pi token, got %q", got)
+		}
+		if _, err := os.Stat(filepath.Dir(absentOC)); !os.IsNotExist(err) {
+			t.Fatalf("OpenCode directory must not be created (stat err: %v)", err)
+		}
+	})
+}
