@@ -449,6 +449,172 @@ esperas de 20 ms; nunca borra un lock que no creó. El lock cubre la
 secuencia completa de lectura/modificación/escritura y se libera al
 retornar, incluso en error.
 
+## Renovación reactiva de OAuth (refresh)
+
+Los comandos que consultan el endpoint de uso (`codex-usage-cli` sin
+argumentos y `accounts`/`list`) ejecutan una **renovación OAuth reactiva**
+cuando la primera llamada al endpoint devuelve **HTTP 401 Unauthorized**.
+La CLI interpreta ese 401 como la señal del endpoint de que el access
+token está vencido o es inválido. No consulta `expires` para decidir el
+refresh: este solo ocurre a partir de un 401 real.
+
+`use <selector>` no consulta el endpoint de uso, así que su camino de
+refresh quedó vaciado: el comando solo activa la cuenta seleccionada vía
+`activateAccount` y nunca envía un POST al endpoint de token, ni siquiera
+cuando el `expires` almacenado está vencido.
+
+Reglas operativas:
+
+- **Disparador**: el primer fetch de uso devuelve `401`. Ninguna otra
+  respuesta (`400`, `403`, `429`, `500`, ...) contacta al endpoint de
+  token; el error existente se propaga verbatim. El refresh nunca se
+  dispara de forma proactiva, ni inspecciona `expires`, `cfg.Now`, ni
+  tiempo transcurrido.
+- **Endpoint y parámetros**: cuando hay 401, la CLI hace un único POST
+  `application/x-www-form-urlencoded` a
+  `https://auth.openai.com/oauth/token` con `grant_type=refresh_token`,
+  el `refresh_token` almacenado y el `client_id` público
+  `app_EMoamEEZ73f0CkXaXp7hrann`. La ruta es inyectable vía
+  `cfg.TokenURL` para tests (un `httptest.Server`); el valor de
+  producción sigue siendo el endpoint de OpenAI.
+- **Timeout y cancelación**: cada POST de refresh está acotado a **15 s**
+  con `context.WithTimeout`. El `context` del comando se propaga, así que
+  una cancelación del proceso o de la pipeline aborta el POST
+  inmediatamente con un error de contexto (no de timeout) y deja ambos
+  archivos de auth intactos.
+- **Campos rotados**: la respuesta válida produce una copia nueva del
+  mapa de cuenta con `access`, `refresh` y `expires` actualizados. Si el
+  JWT del nuevo `access_token` decodifica y trae el claim
+  `https://api.openai.com/auth` como **objeto** con la clave
+  `chatgpt_account_id` (la forma que Pi emite hoy), `accountId` se
+  reemplaza por ese valor. Como fallback de compatibilidad, un claim
+  plano `https://api.openai.com/auth.chatgpt_account_id` también se
+  acepta. Cuando ninguno decodifica o el campo viene vacío/tipado-mal,
+  se conserva el `accountId` previo. El input nunca se muta.
+- **Comandos afectados**: el refresh reactivo corre después de un 401 en
+  el comando sin argumentos (tanto camino OpenCode como Pi-only) y
+  dentro del bucle por fila de `accounts`/`list`. `use <selector>` ya
+  no participa del flujo de refresh. Los subcomandos `config` no tocan
+  tokens.
+- **Secuencia documentada**: el refresh exitoso va seguido de la
+  persistencia del tuple rotado en los stores instalados y luego del
+  retry del endpoint de uso, **una sola vez**. No se hace un segundo
+  refresh (no hay recursión) ni un segundo retry. Un segundo 401 del
+  endpoint de uso se reporta como error y deja la fila en `ERR` en
+  `accounts`/`list`.
+- **Lock de Pi y coherencia entre archivos**: la escritura del tuple
+  rotado al `auth.json` de Pi pasa por el lock `${auth.json}.lock`
+  (protocolo `proper-lockfile`). En el camino de refresh (comando sin
+  argumentos y fila activa de `accounts`/`list`) la CLI evalúa primero
+  la identidad de Pi **antes** de tocar cualquier archivo de auth: Pi
+  debe estar instalado **y** su `openai-codex` debe ser demostrablemente
+  la misma cuenta que el tuple rotado (`accountId` no vacío igual, o
+  `access` no vacío igual). La evaluación distingue dos modos de fallo
+  y nunca los colapsa en un mismo "skip silencioso":
+    - **Identidad de Pi malformada, ilegible o bloqueada** (JSON
+      malformado, entrada que no es objeto, parse de credencial
+      fallido, contención del lock que impide leer): la CLI **aborta la
+      sincronización antes de modificar cualquier archivo de auth**.
+      OpenCode y Pi quedan byte-idénticos a su estado previo y se
+      devuelve un error claro que nombra el motivo.
+    - **Identidad de Pi limpia pero demostrablemente de otra cuenta**
+      (la entrada parsea y la comparación de `accountId`/`access`
+      resuelve a no-igual): la CLI escribe **solo OpenCode** y deja el
+      `auth.json` de Pi byte-idéntico a su estado previo, sin tomar el
+      lock de Pi. Es la única forma en la que un Pi presente pero de
+      cuenta distinta produce una sincronización OpenCode-only.
+  Cuando la comprobación pasa y ambos stores están instalados, la CLI
+  intenta tomar el lock de Pi **antes** de tocar cualquier archivo de
+  auth: si otro proceso lo tiene tomado, la sincronización falla con
+  un error claro y **ambos** archivos de auth quedan byte-idénticos a
+  su estado previo. Tras la escritura, si la escritura de Pi falla
+  después de que la de OpenCode tuvo éxito, OpenCode se restaura
+  byte-por-byte desde una captura previa a la mutación; el error
+  devuelto nombra el store que falló y, cuando la restauración misma
+  falla, une ambos diagnósticos. La activación por `use <selector>` y la
+  rotación automática fuera del refresh conservan su contrato
+  documentado: validación previa al primer archivo, error claro de
+  sincronización parcial sin rollback. El camino Pi-only (sin OpenCode)
+  usa `syncAccountToPiAuth` directamente: ese helper siempre persiste
+  su propio tuple rotado, incluso cuando la credencial rotada no trae
+  `accountId`, porque allí no existe la ambigüedad de "cuenta distinta"
+  que el guard de `syncRefreshedCredentialToBoth` está protegiendo.
+- **Errores sin secretos**: los mensajes de error del refresh nombran el
+  campo o el código HTTP (`OAuth refresh endpoint returned 400`) pero
+  **nunca** incluyen el access token, el refresh token ni el cuerpo de la
+  respuesta, ni siquiera cuando el endpoint los refleja. Un 401 con
+  `refresh` faltante o vacío devuelve un error claro y libre de
+  credenciales (`refresh required but refresh token is missing`) y deja
+  los archivos de auth intactos. Un fallo del POST de refresh deja los
+  bytes de auth/store sin modificar.
+- **Refresh inválido**: si el endpoint devuelve `400`/`invalid_grant` u
+  otro error no recuperable, la CLI devuelve el error al usuario y deja
+  el `auth.json` de OpenCode y Pi sin modificar. Es señal de que hay que
+  volver a iniciar sesión en el proveedor correspondiente y reejecutar la
+  CLI para que registre la credencial nueva.
+- **Paridad HTTP con pi-main**: la CLI no añade `client_secret`, `scope`,
+  `redirect_uri` ni ningún campo extra al POST de refresh. El cuerpo del
+      request es exactamente `grant_type=refresh_token&refresh_token=<token>&client_id=app_EMoamEEZ73f0CkXaXp7hrann`
+      en ese orden de inserción (con `url.QueryEscape` para los valores, el
+      mismo primitivo que usa `url.Values.Encode` internamente), con
+      `Content-Type: application/x-www-form-urlencoded` y sin encabezado
+      `Accept`. La CLI tampoco reintenta: un único POST por cada 401 del
+      endpoint de uso. El orden de campos es relevante y se fija con un
+      test dedicado (`TestRefreshOAuthRequestExactPiParity`) que asserta
+      los bytes exactos del cuerpo y los encabezados que produce el
+      código. El runtime de Go puede agregar `Accept-Encoding: gzip` por
+      defecto en el `http.Transport`; ese encabezado es un default del
+      runtime fuera del request explícito que genera la CLI y no se
+      controla sin deshabilitar la compresión del transporte (lo que
+      cambiaría el comportamiento de respuesta, así que no se hace).
+- **Recuperación Pi-source (guardada)**: cuando el endpoint de uso
+  devuelve el **401 inicial**, la CLI consulta el `openai-codex` de Pi
+  **inmediatamente después** de ese 401 y **antes** del único POST de
+  refresh de OAuth; si la tupla de Pi es demostrablemente la misma
+  cuenta y más nueva/segura, la usa como fuente del POST. Pi **no** se
+  vuelve a consultar cuando el endpoint de OAuth rechaza el POST de
+  refresh con `401` (refresh revocado/expirado): ese caso se reporta
+  con el error accionable `OAuth refresh token was rejected; sign in
+  again` y deja ambos archivos de auth byte-idénticos a su estado
+  previo. La regla de selección de Pi: mismo `access` no vacío, o mismo
+  `accountId` no vacío; se prefiere Pi cuando su `expires` (entero
+  exacto) es estrictamente mayor al de OpenCode, o cuando el `access`
+  es idéntico pero el `refresh` difiere (Pi es el lock-protected
+  rotating store). Solo se proyectan campos OAuth (`type`, `access`,
+  `refresh`, `expires`, `accountId` opcional); `user_id`, `email` y
+  metadatos custom de OpenCode se preservan. Las credenciales de Pi de
+  una cuenta distinta o desconocida **nunca** se sustituyen: la
+  verificación de misma cuenta es un guard obligatorio antes de
+  cualquier proyección. Cuando no hay mejor candidato en Pi, la CLI
+  reusa el `refresh_token` de OpenCode exactamente como antes. El
+  mismo guard se aplica a la fila `CURRENT` de `accounts`/`list`; las
+  filas no-activas siguen usando su propio `refresh` almacenado y
+  nunca importan credenciales de Pi.
+- **Refresh revocado o expirado requiere login**: cuando el endpoint de
+  OAuth devuelve `401` para el POST de refresh (el `refresh_token`
+  almacenado fue revocado, rotó sin reemisión o expiró), la CLI devuelve
+  el error accionable `OAuth refresh token was rejected; sign in again`
+  sin filtrar el cuerpo de la respuesta, el `refresh_token`, el
+  `access_token` ni ningún otro material sensible. Este mensaje es
+  específico del 401; los demás estados no-200 conservan el formato
+  `OAuth refresh endpoint returned N`. En `accounts`/`list` el mensaje
+  accionable aparece como `[ERR: OAuth refresh token was rejected; sign
+  in again]` en la fila afectada y las demás filas se siguen
+  renderizando; en el comando sin argumentos se propaga antes de tocar
+  cualquier archivo de auth. En cualquier caso, los archivos de auth y
+  el store quedan byte-idénticos a su estado previo.
+- **Errores por fila en `accounts`/`list`**: una fila cuyo refresh o
+  sincronización falle (incluido el caso de 401 sin `refresh` o un
+  segundo 401) se imprime con `ERR` y un sufijo `[ERR: ...]`, pero las
+  demás filas se siguen renderizando. Si falla la sincronización de los
+  archivos de auth para la cuenta activa, el comando también devuelve un
+  error explícito de sincronización parcial y no cuenta esa fila como una
+  persistencia exitosa. Los demás fallos de refresh permanecen aislados a
+  la fila mientras al menos otra cuenta pueda consultarse correctamente.
+- **Errores en el comando sin argumentos**: un fallo de refresh se
+  propaga inmediatamente, antes de tocar cualquier archivo de auth.
+  El camino Pi-only aplica el mismo contrato de no-mutación.
+
 ### Cuándo falla la sincronización
 
 La sincronización valida la cuenta seleccionada **antes** de modificar

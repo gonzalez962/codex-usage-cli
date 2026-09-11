@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -10,6 +11,7 @@ import (
 	"math"
 	"math/big"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -20,6 +22,34 @@ import (
 )
 
 const defaultUsageURL = "https://chatgpt.com/backend-api/wham/usage"
+
+// defaultOAuthRefreshTokenURL is the production OAuth refresh endpoint. It is
+// exposed as config.TokenURL so tests can substitute a httptest.Server URL.
+const defaultOAuthRefreshTokenURL = "https://auth.openai.com/oauth/token"
+
+// oauthRefreshRequestTimeout caps every refresh POST so a slow endpoint
+// cannot block the CLI indefinitely. The caller's context is layered on top
+// via context.WithTimeout, so cancellation still propagates.
+const oauthRefreshRequestTimeout = 15 * time.Second
+
+// oauthRefreshClientID is the public OpenAI client id used by the OAuth
+// refresh flow. Rotating this literal would invalidate every existing
+// refresh token, so it is intentionally hard-coded.
+const oauthRefreshClientID = "app_EMoamEEZ73f0CkXaXp7hrann"
+
+// chatGPTAccountIDNamespace / chatGPTAccountIDField are the JWT keys Pi uses
+// to carry the account identity inside its rotated access tokens (the value
+// is a JSON object whose chatgpt_account_id field stores the id).
+// chatGPTAccountIDClaim keeps the legacy flat claim
+// (https://api.openai.com/auth.chatgpt_account_id) as a fallback so older
+// issuers keep working. When any of these resolves to a non-empty string it
+// replaces the stored accountId in the rotated tuple; when none parse, the
+// prior accountId is preserved.
+const (
+	chatGPTAccountIDNamespace = "https://api.openai.com/auth"
+	chatGPTAccountIDField     = "chatgpt_account_id"
+	chatGPTAccountIDClaim     = "https://api.openai.com/auth.chatgpt_account_id"
+)
 
 // defaultWeeklyThreshold gates the WEEKLY usage window. It is always applied to
 // `secondary_window` when 5h mode is active, and to `primary_window` when 5h
@@ -60,8 +90,12 @@ type config struct {
 	FiveHourThreshold float64
 	WeeklyThreshold   float64
 	UsageURL          string
-	HTTPClient        *http.Client
-	Now               func() time.Time
+	// TokenURL is the OAuth refresh endpoint. The default points at the
+	// production OpenAI refresh endpoint; tests override it with a
+	// httptest.Server URL to keep credentials off the network.
+	TokenURL   string
+	HTTPClient *http.Client
+	Now        func() time.Time
 }
 
 type usageWindow struct {
@@ -149,6 +183,7 @@ func defaultConfig() config {
 		AccountsFile: accountsFile,
 		ConfigFile:   configFile,
 		UsageURL:     defaultUsageURL,
+		TokenURL:     defaultOAuthRefreshTokenURL,
 		HTTPClient:   http.DefaultClient,
 		Now:          time.Now,
 	}
@@ -225,7 +260,7 @@ func runWithArgs(ctx context.Context, cfg config, stdout io.Writer, args []strin
 			if len(args) < 2 {
 				return errors.New("use command requires an account identifier (index, user_id, or email)")
 			}
-			return runUseCommand(cfg, stdout, strings.TrimSpace(args[1]))
+			return runUseCommand(ctx, cfg, stdout, strings.TrimSpace(args[1]))
 		default:
 			return fmt.Errorf("unknown command %q (available: accounts, list, use <id>, config <feature> [value])", command)
 		}
@@ -283,11 +318,54 @@ func runDefaultCommand(ctx context.Context, cfg config, stdout io.Writer) error 
 // fetchUsageWindow is the ONLY fallback-eligible stage (wrapped in
 // ocInitialFetchError); later stages return errors unwrapped so partial-
 // sync states stay visible.
+//
+// Refresh: OAuth rotation is REACTIVE, not proactive. The current
+// OpenCode credential is queried first; an HTTP 401 from the usage
+// endpoint triggers a single OAuth refresh, the rotated credential is
+// propagated to the installed auth stores (syncRefreshedCredentialToBoth
+// preserves the existing Pi lock preflight + OC rollback semantics), and
+// the usage call is retried exactly once with the new token. The helper
+// never inspects `expires`, `cfg.Now`, or any time-based threshold; a
+// 401 with missing/empty refresh metadata returns a value-free error and
+// leaves auth/store bytes unchanged. Non-401 responses (400, 403, 429,
+// 500, ...) bypass the token endpoint entirely.
+//
+// Guarded Pi-source recovery: BEFORE the single refresh POST, when Pi is
+// installed the helper consults Pi's openai-codex tuple and swaps the
+// refresh source to Pi's OAuth fields only when Pi is demonstrably the
+// same account AND newer/safer (same non-empty access OR same non-empty
+// accountId, AND Pi expires > OC expires OR identical access with a
+// different refresh). Pi credentials from a different or unknown account
+// are NEVER substituted; when the swap does not apply, OC's refresh
+// token is reused verbatim. Only OAuth fields are projected into a copy
+// of the OC account so user_id/email/custom metadata are preserved.
+//
+// When Pi is installed and shares the OpenCode pre-refresh access, the
+// rotated tuple is mirrored into the in-memory piInfo so the later
+// reconcilePiInboundFromPayload call observes the rotated access rather
+// than the stale snapshot.
 func runDefaultCommandOpenCodePath(ctx context.Context, cfg config, stdout io.Writer, account map[string]any, piInfo *piAuthInfo, piAvailable bool) error {
 	token, _ := account["access"].(string)
-	usage, err := fetchUsageWindow(ctx, cfg.HTTPClient, cfg.UsageURL, token)
+
+	usage, rotatedAccount, err := fetchUsageWithReactiveRefresh(ctx, cfg, account, token, func(refreshed map[string]any) error {
+		// syncRefreshedCredentialToBoth preserves the documented Pi lock
+		// preflight and post-mutation OC rollback; a pre-mutation Pi lock
+		// contention leaves both auth files untouched and a post-mutation Pi
+		// failure restores OC byte-for-byte from the pre-mutation snapshot.
+		return syncRefreshedCredentialToBoth(cfg, refreshed, false)
+	}, piInfo)
 	if err != nil {
 		return &ocInitialFetchError{Err: err}
+	}
+	if rotatedAccount != nil {
+		account = rotatedAccount
+		// Mirror the rotated tuple into the in-memory piInfo so the later
+		// reconcilePiInboundFromPayload call sees the rotated access rather
+		// than the stale pre-refresh snapshot; otherwise the inbound pass
+		// would still observe Pi's pre-refresh token and could re-import the
+		// stale value. The mirror only touches OAuth fields and never invents
+		// identity/usage metadata.
+		overwritePiAuthInfoOAuth(piInfo, account)
 	}
 
 	usage, fiveHourMode := normalizeUsageForToggle(usage, cfg.FiveHourEnabled)
@@ -335,21 +413,40 @@ func runDefaultCommandOpenCodePath(ctx context.Context, cfg config, stdout io.Wr
 }
 
 // runDefaultCommandPiOnlyPath runs the default command when only Pi is
-// available. MUST NOT touch OpenCode auth.json and MUST NOT rotate (Pi-only
-// is single-account); the persisted shape matches the OC path.
+// available. MUST NOT touch OpenCode auth.json; the persisted shape matches
+// the OC path.
+//
+// Refresh: OAuth rotation is REACTIVE. The first usage call is attempted
+// with the stored Pi access token; an HTTP 401 triggers ONE OAuth refresh,
+// the rotated credential is persisted via syncAccountToPiAuth (which keeps
+// the Pi lock preflight + rollback semantics), and the usage call is
+// retried exactly once. A 401 with missing/empty refresh metadata, a
+// refresh POST failure, or a second 401 surfaces an error and leaves the
+// Pi auth file unchanged. Non-401 responses bypass the token endpoint
+// entirely.
 func runDefaultCommandPiOnlyPath(ctx context.Context, cfg config, stdout io.Writer, piInfo *piAuthInfo) error {
-	piToken, _ := piInfo.CredMap["access"].(string)
+	piAccount, piParseErr := parsePiOpenAICodexEntry(piInfo.CredMap)
+	if piParseErr != nil {
+		return piParseErr
+	}
+
+	piToken, _ := piAccount["access"].(string)
 	if strings.TrimSpace(piToken) == "" {
 		return errors.New("Pi openai-codex credential is missing a non-empty access token")
 	}
 
-	usage, err := fetchUsageWindow(ctx, cfg.HTTPClient, cfg.UsageURL, piToken)
+	usage, rotatedAccount, err := fetchUsageWithReactiveRefresh(ctx, cfg, piAccount, piToken, func(refreshed map[string]any) error {
+		return syncAccountToPiAuth(cfg, refreshed)
+	}, piInfo)
 	if err != nil {
 		return err
 	}
+	if rotatedAccount != nil {
+		piAccount = rotatedAccount
+	}
 
 	usage, fiveHourMode := normalizeUsageForToggle(usage, cfg.FiveHourEnabled)
-	persisted := accountWithUsage(piInfo.CredMap, usage, fiveHourMode, rotationThresholds{FiveHour: cfg.FiveHourThreshold, Weekly: cfg.WeeklyThreshold})
+	persisted := accountWithUsage(piAccount, usage, fiveHourMode, rotationThresholds{FiveHour: cfg.FiveHourThreshold, Weekly: cfg.WeeklyThreshold})
 
 	// Persist ONLY into the store. OpenCode's auth.json is intentionally not
 	// touched here: Pi-only mode must never create or rewrite it.
@@ -474,6 +571,12 @@ func runAccountsCommand(ctx context.Context, cfg config, stdout io.Writer) error
 	// listed in full either way, so `accounts` stays useful on a Pi-only
 	// (or store-only) install; currentAccountToken decides whether any row
 	// can still be marked with `*`.
+	//
+	// piInfo is loaded once for the guarded CURRENT-row source selection
+	// (selectRefreshSourceFromPi). On a Pi-only or store-only install the
+	// load yields (nil, false) and the CURRENT row falls back to its own
+	// stored refresh, matching the documented non-CURRENT behavior.
+	piInfo, piAvailable := loadPiAuthIfUsable(cfg.PiAuthFile)
 	currentToken := currentAccountToken(cfg)
 
 	store, err := readAccountsStore(cfg.AccountsFile)
@@ -496,6 +599,13 @@ func runAccountsCommand(ctx context.Context, cfg config, stdout io.Writer) error
 	rows := make([]accountUsageRow, 0, len(keys))
 	successCount := 0
 	currentUserID := ""
+	// currentCoherent tracks whether the CURRENT row's auth-synchronization
+	// step (refresh + sync to installed auth stores) completed cleanly.
+	// A failure here must not be hidden as "overall success" because the
+	// rotated credential is now in memory but not necessarily on disk; we
+	// skip the successCount++ for that row and surface the failure as an
+	// explicit error after the table is rendered.
+	currentCoherent := true
 	for idx, userID := range keys {
 		account := copyAccountData(store[userID])
 		access, _ := account["access"].(string)
@@ -526,15 +636,75 @@ func runAccountsCommand(ctx context.Context, cfg config, stdout io.Writer) error
 			continue
 		}
 
-		usage, fetchErr := fetchUsageWindow(ctx, cfg.HTTPClient, cfg.UsageURL, access)
+		// Reactive OAuth refresh: the first usage call attempts with the
+		// stored access token. An HTTP 401 triggers ONE OAuth refresh; on a
+		// successful refresh of the CURRENT row the rotated credential is
+		// mirrored to the installed auth stores via syncRefreshedCredentialToBoth
+		// (Pi lock preflight + post-mutation OC rollback preserved). The usage
+		// call is then retried exactly once with the new token. A second 401,
+		// a refresh POST failure, a 401 with missing refresh metadata, or any
+		// sync failure leaves auth/store bytes unchanged and renders the row as
+		// ERR. Row-local failures stay row-local so other rows are still
+		// rendered; only when the CURRENT row's auth sync fails do we flag the
+		// entire command as incoherent so successCount is not inflated and the
+		// caller sees a clear error.
+		//
+		// Non-401 responses (400, 403, 429, 500, ...) bypass the token endpoint
+		// entirely and surface their existing errors. CURRENT was computed
+		// against the pre-refresh token above, so a reactive rotation on the
+		// current row does not silently un-mark it: the rotation only ever
+		// runs when the pre-refresh token was rejected by the usage endpoint.
+		//
+		// Guarded Pi-source recovery for the CURRENT row: when OpenCode's
+		// current token matches the row (the `current` flag above) and Pi
+		// holds a demonstrably same-account newer tuple, the reactive helper
+		// consults Pi before the single refresh POST and swaps the refresh
+		// source to Pi's tuple when it is demonstrably newer/safer. The swap
+		// only triggers when the usage endpoint returned 401; non-CURRENT
+		// rows continue using their own stored refresh so they stay isolated
+		// from any out-of-band Pi rotation that is unrelated to the active
+		// session. We pass piInfo only for the CURRENT row; other rows pass
+		// nil so the helper cannot pick up a Pi tuple unrelated to them.
+		var rowPiInfo *piAuthInfo
+		if current && piAvailable {
+			rowPiInfo = piInfo
+		}
+		rowSyncFailed := false
+		var persistFn func(map[string]any) error
+		if current {
+			persistFn = func(refreshed map[string]any) error {
+				return syncRefreshedCredentialToBoth(cfg, refreshed, false)
+			}
+		}
+		usage, rotatedAccount, fetchErr := fetchUsageWithReactiveRefresh(ctx, cfg, account, access, persistFn, rowPiInfo)
 		if fetchErr != nil {
 			row.Email = accountEmailFallback(account, row.UserID)
 			row.UsedPercent = "ERR"
 			row.ResetDisplay = "-"
 			// See comment above: error rows must not determine table mode.
 			row.Err = fetchErr
+			// A reactive sync failure on the CURRENT row (a 401 followed by a
+			// successful refresh POST whose auth-store sync failed) must mark
+			// the whole command as incoherent so the caller never sees a
+			// silent "success" while the current credential diverges from the
+			// installed stores. Other failure modes (refresh POST error,
+			// missing refresh metadata, second 401) stay row-local.
+			var syncErr *refreshSyncError
+			if current && errors.As(fetchErr, &syncErr) {
+				rowSyncFailed = true
+			}
+			if rowSyncFailed {
+				currentCoherent = false
+			}
 			rows = append(rows, row)
 			continue
+		}
+		if rowSyncFailed {
+			currentCoherent = false
+		}
+		if rotatedAccount != nil {
+			account = rotatedAccount
+			access, _ = account["access"].(string)
 		}
 
 		// Apply the 5h toggle once: with 5h off and a dual response this
@@ -562,11 +732,19 @@ func runAccountsCommand(ctx context.Context, cfg config, stdout io.Writer) error
 			currentUserID = row.UserID
 		}
 
-		updated := accountWithUsage(account, usage, fiveHourMode, rotationThresholds{FiveHour: cfg.FiveHourThreshold, Weekly: cfg.WeeklyThreshold})
-		if persistErr := persistOpenAIAccount(cfg.AccountsFile, updated); persistErr != nil {
-			row.Err = persistErr
-		} else {
-			successCount++
+		// A failed current-row auth sync is NOT counted as a successful
+		// persisted refresh: the rotated credential may not be on disk in
+		// the installed auth stores, so claiming a coherent persistence
+		// would be misleading. The row is still rendered (row.Err already
+		// names the failing sync step) so the user can see exactly what
+		// happened; we just skip both the persist and the successCount.
+		if !rowSyncFailed {
+			updated := accountWithUsage(account, usage, fiveHourMode, rotationThresholds{FiveHour: cfg.FiveHourThreshold, Weekly: cfg.WeeklyThreshold})
+			if persistErr := persistOpenAIAccount(cfg.AccountsFile, updated); persistErr != nil {
+				row.Err = persistErr
+			} else {
+				successCount++
+			}
 		}
 
 		rows = append(rows, row)
@@ -582,6 +760,15 @@ func runAccountsCommand(ctx context.Context, cfg config, stdout io.Writer) error
 	// callers that want to reference them from `use <id>`.
 	if err := printAccountsTable(stdout, rows); err != nil {
 		return err
+	}
+
+	// Current-account auth-synchronization failure takes priority over the
+	// generic "all rows failed" diagnostic: it is more specific and actionable
+	// for the caller, and it fires regardless of successCount so the user
+	// never sees "success" while the current credential is incoherent across
+	// the installed auth stores.
+	if !currentCoherent {
+		return errors.New("current account auth synchronization failed; one or more installed auth stores did not converge with the refreshed credential")
 	}
 
 	if successCount == 0 {
@@ -747,7 +934,12 @@ func printAccountsTable(stdout io.Writer, rows []accountUsageRow) error {
 	return nil
 }
 
-func runUseCommand(cfg config, stdout io.Writer, identifier string) error {
+func runUseCommand(ctx context.Context, cfg config, stdout io.Writer, identifier string) error {
+	// `use` does NOT query the usage endpoint, so OAuth refresh is out of
+	// scope: the reactive 401-driven refresh flow lives in the default and
+	// `accounts`/`list` commands only. Activation propagates the stored
+	// OAuth tuple to OpenCode + Pi auth.json via activateAccount (which
+	// preserves its documented validate-first / partial-sync-error contract).
 	if strings.TrimSpace(identifier) == "" {
 		return errors.New("use command requires an account identifier (index, user_id, or email)")
 	}
@@ -1484,6 +1676,611 @@ func extractAccountID(payload map[string]any) (string, bool) {
 	return accountID, true
 }
 
+// refreshOAuthAccount rotates account's OAuth tuple by POSTing the stored
+// refresh token to the OpenAI token endpoint. The helper is the reactive
+// refresh primitive: callers invoke it ONLY after the usage endpoint has
+// returned 401 to signal that the current access token is expired or
+// invalid. It never inspects `expires`, `cfg.Now`, or any time-based
+// threshold; that policy lives entirely at the call sites.
+//
+// The returned map is a fresh copy on success; the input map is NEVER
+// mutated. On any failure (missing refresh token, non-200 response,
+// transport error, malformed JSON, missing fields, positive
+// expires_in) the helper returns (nil, err) and the caller MUST treat the
+// original account as unchanged. Errors never echo credential values, JWT
+// payload, or response bodies.
+//
+// In-memory only: the helper neither reads nor writes any auth or accounts
+// file. Callers that need the rotated tuple persisted to disk must invoke
+// the existing store/auth writers themselves after a nil error.
+func refreshOAuthAccount(ctx context.Context, cfg config, account map[string]any) (map[string]any, error) {
+	if account == nil {
+		return nil, errors.New("refresh target is nil")
+	}
+
+	refreshToken, _ := account["refresh"].(string)
+	if strings.TrimSpace(refreshToken) == "" {
+		return nil, errors.New("refresh required but refresh token is missing")
+	}
+
+	newAccess, newRefresh, expiresIn, err := performOAuthRefreshRequest(ctx, cfg, refreshToken)
+	if err != nil {
+		return nil, err
+	}
+
+	if cfg.Now == nil {
+		cfg.Now = time.Now
+	}
+	nowMs := cfg.Now().UnixMilli()
+
+	rotated := copyAccountData(account)
+	rotated["access"] = newAccess
+	rotated["refresh"] = newRefresh
+	rotated["expires"] = nowMs + int64(expiresIn)*1000
+
+	// accountId is derived from the JWT claim when valid; otherwise the
+	// existing accountId (preserved by copyAccountData) is kept verbatim.
+	if accountID, ok := extractChatGPTAccountIDFromJWT(newAccess); ok {
+		rotated["accountId"] = accountID
+	}
+
+	return rotated, nil
+}
+
+// overwritePiAuthInfoOAuth mirrors a successfully-rotated Pi credential into
+// the in-memory piInfo snapshot so the subsequent reconcilePiInboundFromPayload
+// call reads the rotated tuple instead of the stale pre-refresh snapshot. The
+// helper keeps piInfo.Payload["openai-codex"] pointing at the same underlying
+// map as piInfo.CredMap so callers that read either view stay consistent. It
+// only touches OAuth fields (access, refresh, expires, optional accountId, type)
+// and never invents identity/usage metadata.
+func overwritePiAuthInfoOAuth(piInfo *piAuthInfo, refreshed map[string]any) {
+	if piInfo == nil || refreshed == nil || piInfo.CredMap == nil {
+		return
+	}
+	if v, ok := refreshed["access"]; ok {
+		piInfo.CredMap["access"] = v
+	}
+	if v, ok := refreshed["refresh"]; ok {
+		piInfo.CredMap["refresh"] = v
+	}
+	if v, ok := refreshed["expires"]; ok {
+		piInfo.CredMap["expires"] = v
+	}
+	if aid, ok := refreshed["accountId"].(string); ok && strings.TrimSpace(aid) != "" {
+		piInfo.CredMap["accountId"] = aid
+	} else {
+		delete(piInfo.CredMap, "accountId")
+	}
+	if rawType, ok := refreshed["type"].(string); ok && strings.TrimSpace(rawType) != "" {
+		piInfo.CredMap["type"] = rawType
+	}
+	if piInfo.Payload != nil {
+		piInfo.Payload["openai-codex"] = piInfo.CredMap
+	}
+}
+
+// selectRefreshSourceFromPi decides whether Pi's openai-codex credential is a
+// demonstrably safer/newer refresh source for the same account as ocAccount,
+// and when so returns a copy of ocAccount with Pi's OAuth fields merged in
+// (user_id/email/custom metadata preserved). Otherwise it returns ocAccount
+// unchanged so callers fall back to the OpenCode refresh. It NEVER substitutes
+// Pi credentials from a different or unknown account.
+//
+// Selection rules (reactive refresh only — invoked after the usage endpoint
+// already returned 401, so the OC credential is provably stale from the
+// endpoint's perspective):
+//
+//  1. Same-account match: same non-empty access token OR same non-empty
+//     accountId. Without that, Pi is treated as a different/unknown account
+//     and the OC account is returned untouched.
+//  2. Prefer Pi when it is demonstrably newer/safer: its exact-integer
+//     `expires` is strictly greater than OC's, OR the access tokens are
+//     identical but the refresh tokens differ (Pi is the lock-protected
+//     rotating store and the canonical refresh source when access has not
+//     changed).
+//
+// Pi's openai-codex tuple is parsed through parsePiOpenAICodexEntry, so a
+// malformed/missing Pi entry returns ocAccount unchanged. When OC's expires
+// is missing or fails exact-int64 parsing, Pi wins whenever the "Pi is
+// newer" condition can be demonstrated (refresh differs on identical access,
+// or Pi's parsed expires is valid) — an OC expires that is unparseable is
+// not a signal that Pi is stale.
+//
+// The returned map is a fresh copy on substitution; ocAccount is never
+// mutated. No-merge paths return ocAccount unchanged so the caller's
+// original input is reused verbatim.
+func selectRefreshSourceFromPi(ocAccount map[string]any, piInfo *piAuthInfo) map[string]any {
+	if ocAccount == nil || piInfo == nil || piInfo.CredMap == nil {
+		return ocAccount
+	}
+
+	piAccount, err := parsePiOpenAICodexEntry(piInfo.CredMap)
+	if err != nil {
+		return ocAccount
+	}
+
+	ocAccess, _ := ocAccount["access"].(string)
+	piAccess, _ := piAccount["access"].(string)
+	ocAccountID, _ := ocAccount["accountId"].(string)
+	piAccountID, _ := piAccount["accountId"].(string)
+
+	// Same-account match guard. Empty/blank values on either side disqualify
+	// the equality (so Pi is never substituted when OC carries no token
+	// metadata at all, even if Pi happens to match a blank string).
+	sameAccess := strings.TrimSpace(ocAccess) != "" && strings.TrimSpace(ocAccess) == strings.TrimSpace(piAccess)
+	sameAccountID := strings.TrimSpace(ocAccountID) != "" && strings.TrimSpace(ocAccountID) == strings.TrimSpace(piAccountID)
+	if !sameAccess && !sameAccountID {
+		return ocAccount
+	}
+
+	ocRefresh, _ := ocAccount["refresh"].(string)
+	piRefresh, _ := piAccount["refresh"].(string)
+
+	// Lock-protected rotating store: identical access + different refresh is
+	// enough to prefer Pi even when expires match. Pi only mutates the refresh
+	// through its ${auth.json}.lock-protected writer, so any divergence on an
+	// identical access string is authoritative.
+	if sameAccess && ocRefresh != piRefresh {
+		return mergePiOAuthFieldsIntoOC(ocAccount, piAccount)
+	}
+
+	// Newer expires (strictly greater, parsed as exact int64) is the other
+	// demonstration of "Pi has been refreshed since OC was last synced". A
+	// missing or non-int64 OC expires does not block the substitution: Pi's
+	// parsed expires is authoritative.
+	piExpires, piErr := parseExactInt64(piAccount["expires"])
+	if piErr != nil {
+		return ocAccount
+	}
+	ocExpires, ocErr := parseExactInt64(ocAccount["expires"])
+	if ocErr != nil || piExpires > ocExpires {
+		return mergePiOAuthFieldsIntoOC(ocAccount, piAccount)
+	}
+
+	return ocAccount
+}
+
+// mergePiOAuthFieldsIntoOC projects only the OAuth fields from piAccount into
+// a copy of ocAccount, preserving OC's user_id/email/custom metadata. Fields
+// projected: type, access, refresh, expires, and accountId WHEN Pi has a
+// non-empty value (a blank Pi accountId leaves OC's existing accountId
+// untouched so we never erase a known identity during a pre-refresh merge).
+// The merged map is always a fresh allocation; ocAccount is never mutated.
+func mergePiOAuthFieldsIntoOC(ocAccount, piAccount map[string]any) map[string]any {
+	merged := copyAccountData(ocAccount)
+	if v, ok := piAccount["type"]; ok {
+		merged["type"] = v
+	}
+	if v, ok := piAccount["access"]; ok {
+		merged["access"] = v
+	}
+	if v, ok := piAccount["refresh"]; ok {
+		merged["refresh"] = v
+	}
+	if v, ok := piAccount["expires"]; ok {
+		merged["expires"] = v
+	}
+	if aid, ok := piAccount["accountId"].(string); ok && strings.TrimSpace(aid) != "" {
+		merged["accountId"] = aid
+	}
+	return merged
+}
+
+// oauthRefreshRejectedError is returned when the OAuth refresh endpoint
+// itself responds with HTTP 401 Unauthorized. The actionable message tells
+// the user the refresh token is no longer accepted without echoing the
+// token, the response body, or any other credential material. Callers
+// detect it via errors.As to surface the re-login instruction; non-401
+// statuses continue to use the generic "OAuth refresh endpoint returned N"
+// phrasing.
+type oauthRefreshRejectedError struct{}
+
+func (e *oauthRefreshRejectedError) Error() string {
+	return "OAuth refresh token was rejected; sign in again"
+}
+
+// performOAuthRefreshRequest POSTs to the OAuth refresh endpoint with the
+// required form fields and validates the response shape. The access and
+// refresh tokens are NEVER included in the returned error so a hostile
+// endpoint cannot exfiltrate them through the CLI's user-visible output.
+//
+// The wire format is pinned to byte-level parity with pi-main: the body is
+// emitted in the documented insertion order
+// `grant_type`, `refresh_token`, `client_id` using
+// `application/x-www-form-urlencoded` percent-escaping via url.QueryEscape
+// (the same primitive url.Values.Encode uses internally, so each value is
+// encoded exactly as the canonical form would encode it). url.Values.Encode
+// is NOT used directly because it sorts keys alphabetically and would emit
+// the body in the order `client_id`, `grant_type`, `refresh_token` — that
+// byte-level divergence from pi-main is what an independent reviewer would
+// catch. The Content-Type is `application/x-www-form-urlencoded` and the
+// request intentionally does NOT carry an Accept header; Go's net/http
+// package would otherwise add its own `Accept-Encoding` defaults, which
+// would also diverge from pi-main.
+func performOAuthRefreshRequest(ctx context.Context, cfg config, refreshToken string) (string, string, int64, error) {
+	tokenURL := strings.TrimSpace(cfg.TokenURL)
+	if tokenURL == "" {
+		tokenURL = defaultOAuthRefreshTokenURL
+	}
+
+	var body strings.Builder
+	body.WriteString("grant_type=refresh_token&refresh_token=")
+	body.WriteString(url.QueryEscape(refreshToken))
+	body.WriteString("&client_id=")
+	body.WriteString(url.QueryEscape(oauthRefreshClientID))
+
+	reqCtx, cancel := context.WithTimeout(ctx, oauthRefreshRequestTimeout)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodPost, tokenURL, strings.NewReader(body.String()))
+	if err != nil {
+		return "", "", 0, fmt.Errorf("building OAuth refresh request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	// Intentionally no Accept header: stay byte-equivalent to pi-main.
+
+	client := cfg.HTTPClient
+	if client == nil {
+		client = http.DefaultClient
+	}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", "", 0, fmt.Errorf("OAuth refresh request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		// Drain (but never echo) the response body so the bearer token cannot
+		// be smuggled back through a 4xx/5xx message.
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
+		if resp.StatusCode == http.StatusUnauthorized {
+			// 401 from the OAuth refresh endpoint means the supplied refresh
+			// token is no longer accepted (rotated or revoked upstream). Surface
+			// the actionable re-login instruction instead of the raw status so
+			// the user is told to sign in again without echoing the token,
+			// response body, or any other credential material.
+			return "", "", 0, &oauthRefreshRejectedError{}
+		}
+		return "", "", 0, fmt.Errorf("OAuth refresh endpoint returned %d", resp.StatusCode)
+	}
+
+	decoder := json.NewDecoder(resp.Body)
+	decoder.UseNumber()
+
+	var payload map[string]any
+	if err := decoder.Decode(&payload); err != nil {
+		return "", "", 0, fmt.Errorf("parsing OAuth refresh response JSON: %w", err)
+	}
+
+	newAccess, ok := payload["access_token"].(string)
+	if !ok || strings.TrimSpace(newAccess) == "" {
+		return "", "", 0, errors.New("OAuth refresh response missing non-empty access_token")
+	}
+	newRefresh, ok := payload["refresh_token"].(string)
+	if !ok || strings.TrimSpace(newRefresh) == "" {
+		return "", "", 0, errors.New("OAuth refresh response missing non-empty refresh_token")
+	}
+
+	rawExpiresIn, ok := payload["expires_in"]
+	if !ok || rawExpiresIn == nil {
+		return "", "", 0, errors.New("OAuth refresh response missing expires_in")
+	}
+	expiresIn, err := parseExactInt64(rawExpiresIn)
+	if err != nil {
+		return "", "", 0, fmt.Errorf("parsing OAuth refresh expires_in: %w", err)
+	}
+	if expiresIn <= 0 {
+		return "", "", 0, errors.New("OAuth refresh response expires_in must be positive")
+	}
+
+	return newAccess, newRefresh, expiresIn, nil
+}
+
+// extractChatGPTAccountIDFromJWT decodes the JWT payload and returns the
+// chatgpt_account_id when it is a non-empty string. Pi's real rotated access
+// tokens nest the identity under https://api.openai.com/auth as a JSON object
+// whose chatgpt_account_id field carries the id. A legacy flat claim under
+// https://api.openai.com/auth.chatgpt_account_id is still accepted as a
+// fallback so older issuers keep working. Returns ("", false) for any
+// malformed token, malformed payload, missing/empty/wrong-typed claim, or a
+// claim nested under a non-object value. Errors are intentionally swallowed:
+// the helper is best-effort and never surfaces credential material; callers
+// must preserve the existing accountId when this returns false.
+func extractChatGPTAccountIDFromJWT(token string) (string, bool) {
+	parts := strings.Split(token, ".")
+	if len(parts) != 3 {
+		return "", false
+	}
+	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		payload, err = base64.URLEncoding.DecodeString(parts[1])
+		if err != nil {
+			return "", false
+		}
+	}
+	var claims map[string]any
+	if err := json.Unmarshal(payload, &claims); err != nil {
+		return "", false
+	}
+	if raw, ok := claims[chatGPTAccountIDNamespace]; ok && raw != nil {
+		// Pi's real shape: a JSON object with a chatgpt_account_id field. We
+		// only honor the object form here; a string at the namespace key is
+		// not the documented shape and falls through to the legacy flat claim.
+		if nested, ok := raw.(map[string]any); ok {
+			if v, ok := nested[chatGPTAccountIDField]; ok && v != nil {
+				if s, ok := v.(string); ok && strings.TrimSpace(s) != "" {
+					return s, true
+				}
+			}
+		}
+	}
+	if raw, ok := claims[chatGPTAccountIDClaim]; ok && raw != nil {
+		if s, ok := raw.(string); ok && strings.TrimSpace(s) != "" {
+			return s, true
+		}
+	}
+	return "", false
+}
+
+// syncAccountToOpenCodeAuth writes account's OAuth tuple to OpenCode's
+// auth.json when the provider is installed (file exists on disk). Returns
+// nil when the provider is absent; callers must not invent an auth file on
+// a host where OpenCode has never been installed.
+func syncAccountToOpenCodeAuth(cfg config, account map[string]any) error {
+	if strings.TrimSpace(cfg.AuthFile) == "" || !regularFileExists(cfg.AuthFile) {
+		return nil
+	}
+	return updateOpenAIAuthFile(cfg.AuthFile, account)
+}
+
+// syncAccountToPiAuth writes account's OAuth tuple to Pi's auth.json when
+// the Pi directory is installed, reusing the existing ${auth.json}.lock
+// update machinery under updatePiAuthFile. Returns nil when Pi is absent.
+//
+// This helper is the Pi-only persistence primitive: the caller has already
+// authenticated against the Pi session and is propagating its own rotated
+// tuple back to disk. It MUST always persist the rotated credential —
+// including credentials without an accountId — so a Pi-only refresh that
+// loses its accountId during rotation still converges back into Pi's
+// auth.json. Account-identity guards belong at the OpenCode/default/
+// accounts refresh call sites (see syncRefreshedCredentialToBoth) where a
+// DIFFERENT account's rotated OC tuple must NEVER bleed into Pi's session;
+// the Pi-only refresh path never has that ambiguity because there is no
+// "other account" to protect Pi from — the rotated tuple IS the active Pi
+// session.
+//
+// Concurrency note: this writes through updatePiAuthFile's existing lock
+// protocol. The reactive refresh path within a single process is naturally
+// single-flight: a 401-driven refresh runs once and the rotated tuple is
+// reused by the same caller, but two concurrent CLI processes racing the
+// same Pi file can both observe a 401 from the usage endpoint and POST a
+// refresh. The lock only serializes the file write; the per-process
+// refresh decision is racy by design and surfaces as a "second CLI run
+// picked up the rotated tuple" symptom, not a credential corruption.
+func syncAccountToPiAuth(cfg config, account map[string]any) error {
+	if strings.TrimSpace(cfg.PiAuthFile) == "" || !directoryExists(filepath.Dir(cfg.PiAuthFile)) {
+		return nil
+	}
+	cred, err := buildPiCredential(account)
+	if err != nil {
+		return err
+	}
+	return updatePiAuthFile(cfg.PiAuthFile, cred)
+}
+
+// piAuthMatchesAccount reports whether Pi's currently-installed
+// openai-codex tuple is the same account as account. The match mirrors
+// selectRefreshSourceFromPi: same non-empty accountId OR same non-empty
+// access token. A blank/empty value on either side disqualifies the
+// equality.
+//
+// The return contract distinguishes a CLEAN "Pi is not the same account"
+// answer from an UNKNOWN outcome so the dual-provider refresh path never
+// collapses an unreadable Pi identity into a silent Pi-skip:
+//   - (false, nil): Pi is not installed (errPiAuthMissing from the read
+//     helper), OR Pi is installed but carries no openai-codex entry, OR
+//     Pi's openai-codex entry parsed cleanly and demonstrably does NOT
+//     match account. The caller may safely treat Pi as absent for this
+//     refresh and write only the eligible single store.
+//   - (true, nil): Pi is installed and its openai-codex is demonstrably
+//     the same account as account. The caller may proceed with the
+//     dual-write protocol.
+//   - (false, err): Pi identity could not be read (lock contention,
+//     malformed JSON, an entry that is not a JSON object, or a parse
+//     failure). The caller MUST surface the error BEFORE mutating any
+//     auth file; both stores must remain byte-identical to their pre-call
+//     state so an UNKNOWN Pi identity can never bleed a rotated
+//     credential into Pi.
+func piAuthMatchesAccount(cfg config, account map[string]any) (bool, error) {
+	if account == nil {
+		return false, nil
+	}
+	payload, err := readPiAuthUnderLock(cfg.PiAuthFile)
+	if err != nil {
+		if errors.Is(err, errPiAuthMissing) {
+			// Pi is not installed. Clean signal: caller may skip Pi.
+			return false, nil
+		}
+		// Unknown: lock contention, malformed IO, parse error, ...
+		// The caller MUST surface this before touching either auth file.
+		return false, fmt.Errorf("reading Pi auth identity: %w", err)
+	}
+	rawCred, present := payload["openai-codex"]
+	if !present || rawCred == nil {
+		// Pi installed but no openai-codex credential. Clean signal:
+		// caller may skip Pi.
+		return false, nil
+	}
+	credMap, ok := rawCred.(map[string]any)
+	if !ok {
+		return false, fmt.Errorf("Pi openai-codex entry is not a JSON object (got %T)", rawCred)
+	}
+	piAccount, err := parsePiOpenAICodexEntry(credMap)
+	if err != nil {
+		return false, fmt.Errorf("parsing Pi openai-codex credential: %w", err)
+	}
+
+	ocAccountID, _ := account["accountId"].(string)
+	piAccountID, _ := piAccount["accountId"].(string)
+	if strings.TrimSpace(ocAccountID) != "" && strings.TrimSpace(ocAccountID) == strings.TrimSpace(piAccountID) {
+		return true, nil
+	}
+
+	ocAccess, _ := account["access"].(string)
+	piAccess, _ := piAccount["access"].(string)
+	if strings.TrimSpace(ocAccess) != "" && strings.TrimSpace(ocAccess) == strings.TrimSpace(piAccess) {
+		return true, nil
+	}
+	return false, nil
+}
+
+// syncRefreshedCredentialToBoth propagates a refreshed OAuth credential to
+// the installed auth stores (OpenCode, Pi Agent) under the safest available
+// cross-file coherence. It is reserved for the OAuth-refresh path so the
+// rotated credential never leaves the on-disk stores out of sync.
+// Account-identity guard for Pi: when Pi is installed AND its currently-
+// stored openai-codex credential is NOT demonstrably the same account as
+// the rotated tuple, the helper treats Pi as absent for THIS refresh: it
+// writes only to OpenCode and leaves Pi's auth.json byte-identical to its
+// pre-call state, without ever acquiring the Pi lock. The identity check
+// mirrors selectRefreshSourceFromPi / piAuthMatchesAccount (same
+// non-empty accountId, OR same non-empty access token). This is the only
+// place the dual-provider refresh path protects Pi from a DIFFERENT
+// account's rotated OpenCode credential — the underlying
+// syncAccountToPiAuth helper is the Pi-only persistence primitive and
+// intentionally always persists its own rotated tuple.
+//
+// Unknown Pi identity aborts the refresh sync with both files untouched:
+// piAuthMatchesAccount distinguishes (false, nil) "Pi is a clean
+// different account" from (false, err) "Pi identity could not be read"
+// (lock contention, malformed JSON, parse error, ...). When the result
+// is the unknown case the helper returns the error BEFORE writing to
+// either auth store so a locked or malformed Pi can never cause the OC
+// write to leak a rotated credential while Pi stays out of sync.
+//
+// When BOTH eligible stores (OC and Pi-installed-and-same-account) the
+// helper:
+//   - Snapshots the file written FIRST (so a SECOND-store failure can
+//     restore it byte-for-byte).
+//   - Takes the Pi ${auth.json}.lock as a preflight; if contention is
+//     detected BEFORE any mutation it returns a clear error and leaves
+//     both files untouched. (The lock probe is acquired and immediately
+//     released so the real updatePiAuthFile call can re-acquire cleanly.)
+//   - Writes the FIRST store, then the SECOND. If the SECOND write fails
+//     after the FIRST succeeded, the FIRST is rolled back from the
+//     snapshot. The returned error names both the failing store and
+//     whether the rollback succeeded; when the rollback itself fails,
+//     both diagnostics are joined so the operator can see the cross-file
+//     inconsistency instead of having it masked.
+//
+// When ONLY ONE eligible store exists the helper delegates to the matching
+// single-store helper so the documented "absent provider is a no-op"
+// semantics for the refresh path are preserved. When NEITHER store is
+// installed (or both are filtered out by the identity guard) it returns
+// nil without touching any file.
+//
+// ActivateAccount (used by `use <selector>` and rotation) is intentionally
+// untouched: activation already validates the OAuth tuple before mutating
+// either file and is documented to surface partial-sync errors without
+// rolling back, so the broader activation contract is preserved.
+func syncRefreshedCredentialToBoth(cfg config, account map[string]any, piFirst bool) error {
+	ocFile := strings.TrimSpace(cfg.AuthFile)
+	piFile := strings.TrimSpace(cfg.PiAuthFile)
+	ocEnabled := ocFile != "" && regularFileExists(ocFile)
+	piInstalled := piFile != "" && directoryExists(filepath.Dir(piFile))
+
+	// Pi is eligible for this sync only when (a) it is installed and (b)
+	// its currently-stored openai-codex credential is demonstrably the same
+	// account as the rotated tuple. The Pi-only refresh path uses
+	// syncAccountToPiAuth directly and is unaffected by this guard.
+	//
+	// The identity check is performed BEFORE any file is touched. A CLEAN
+	// "different account" answer is collapsed into the OC-only path below;
+	// an UNKNOWN answer (lock contention, malformed JSON, parse error,
+	// non-object entry) aborts the refresh sync with both auth files left
+	// byte-identical to their pre-call state — see piAuthMatchesAccount.
+	piEligible := false
+	if piInstalled {
+		match, err := piAuthMatchesAccount(cfg, account)
+		if err != nil {
+			return fmt.Errorf("Pi auth identity check before refresh sync: %w", err)
+		}
+		piEligible = match
+	}
+
+	if !ocEnabled && !piEligible {
+		return nil
+	}
+	if ocEnabled != piEligible {
+		if ocEnabled {
+			return syncAccountToOpenCodeAuth(cfg, account)
+		}
+		return syncAccountToPiAuth(cfg, account)
+	}
+
+	firstFile := ocFile
+	if piFirst {
+		firstFile = piFile
+	}
+	otherLabel := "Pi"
+	if piFirst {
+		otherLabel = "OpenCode"
+	}
+	firstLabel := "OpenCode"
+	if piFirst {
+		firstLabel = "Pi"
+	}
+
+	// Snapshot the FIRST file so a SECOND-store failure can restore it.
+	firstSnapshot, snapshotErr := os.ReadFile(firstFile)
+	snapshotOK := snapshotErr == nil
+
+	// Preflight the Pi lock so contention is detected BEFORE any mutation.
+	// Probing acquire+release is the cleanest signal: updatePiAuthFile can
+	// re-acquire the lock cleanly during the real write below.
+	lockPath := piFile + ".lock"
+	if err := acquirePiLock(lockPath); err != nil {
+		return fmt.Errorf("Pi auth lock contention before refresh sync: %w", err)
+	}
+	if relErr := releasePiLock(lockPath); relErr != nil {
+		return fmt.Errorf("Pi auth lock probe release failed before refresh sync: %w", relErr)
+	}
+
+	var firstSyncErr error
+	if piFirst {
+		firstSyncErr = syncAccountToPiAuth(cfg, account)
+	} else {
+		firstSyncErr = syncAccountToOpenCodeAuth(cfg, account)
+	}
+	if firstSyncErr != nil {
+		// SECOND file was never targeted; no rollback needed.
+		return firstSyncErr
+	}
+
+	var secondSyncErr error
+	if piFirst {
+		secondSyncErr = syncAccountToOpenCodeAuth(cfg, account)
+	} else {
+		secondSyncErr = syncAccountToPiAuth(cfg, account)
+	}
+	if secondSyncErr == nil {
+		return nil
+	}
+
+	if !snapshotOK {
+		return fmt.Errorf("%s auth sync failed: %w (%s auth file could not be snapshotted for rollback; the %s auth file was written before the failure)",
+			otherLabel, secondSyncErr, firstLabel, firstLabel)
+	}
+	if restoreErr := os.WriteFile(firstFile, firstSnapshot, 0o600); restoreErr != nil {
+		return fmt.Errorf("%s auth sync failed: %w (rollback of %s auth file also failed: %v; cross-file auth state may be inconsistent)",
+			otherLabel, secondSyncErr, firstLabel, restoreErr)
+	}
+	return fmt.Errorf("%s auth sync failed: %w (%s auth file restored from pre-mutation snapshot)",
+		otherLabel, secondSyncErr, firstLabel)
+}
+
 // accountDerivedFieldKeys lists every account key whose value reflects only
 // the latest usage refresh and is owned by accountWithUsage. Persisted records
 // must NOT carry these forward when an incoming refresh omits them: a toggle
@@ -1639,6 +2436,23 @@ func redactBearerToken(msg, token string) string {
 	return strings.ReplaceAll(msg, token, "[REDACTED]")
 }
 
+// usageEndpointError carries the HTTP status the usage endpoint returned so
+// callers can branch on it (e.g. trigger a reactive OAuth refresh on 401).
+// The Error() string preserves the historical `usage endpoint returned N`
+// phrasing so user-visible output and existing substring assertions stay
+// stable.
+type usageEndpointError struct {
+	StatusCode int
+	Body       string
+}
+
+func (e *usageEndpointError) Error() string {
+	if e.Body != "" {
+		return fmt.Sprintf("usage endpoint returned %d: %s", e.StatusCode, e.Body)
+	}
+	return fmt.Sprintf("usage endpoint returned %d", e.StatusCode)
+}
+
 func fetchUsageWindow(ctx context.Context, client *http.Client, usageURL, token string) (usageWindow, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, usageURL, nil)
 	if err != nil {
@@ -1660,10 +2474,7 @@ func fetchUsageWindow(ctx context.Context, client *http.Client, usageURL, token 
 		if token != "" {
 			msg = redactBearerToken(msg, token)
 		}
-		if msg != "" {
-			return usageWindow{}, fmt.Errorf("usage endpoint returned %d: %s", resp.StatusCode, msg)
-		}
-		return usageWindow{}, fmt.Errorf("usage endpoint returned %d", resp.StatusCode)
+		return usageWindow{}, &usageEndpointError{StatusCode: resp.StatusCode, Body: msg}
 	}
 
 	decoder := json.NewDecoder(resp.Body)
@@ -1680,6 +2491,100 @@ func fetchUsageWindow(ctx context.Context, client *http.Client, usageURL, token 
 	}
 
 	return window, nil
+}
+
+// refreshSyncError wraps an error returned by the caller's persistFn in
+// fetchUsageWithReactiveRefresh. Callers detect it via errors.As to tell
+// the post-refresh auth-store sync apart from a refresh POST failure or a
+// retry that still returned 401. Only the auth-sync path attaches this
+// marker, so a wrap implies the refresh POST itself succeeded and the
+// rotated credential is in memory but may not be on disk.
+type refreshSyncError struct{ Err error }
+
+func (e *refreshSyncError) Error() string { return e.Err.Error() }
+func (e *refreshSyncError) Unwrap() error { return e.Err }
+
+// fetchUsageWithReactiveRefresh queries the usage endpoint with the supplied
+// access token. When the first call returns HTTP 401 it issues ONE OAuth
+// refresh, persists the rotated credential via persistFn (when non-nil),
+// and retries the usage call exactly once with the new token. A second
+// 401, any other non-200, or a refresh POST failure aborts without further
+// retries; the auth/store bytes are left unchanged on a refresh failure
+// because persistFn was never invoked.
+//
+// Non-401 responses (400, 403, 429, 500, ...) are returned without invoking
+// the token endpoint, preserving their existing error semantics.
+//
+// A 401 with missing or empty `refresh` metadata returns a clear value-free
+// error; the token endpoint is NOT contacted and auth/store bytes stay
+// unchanged. Errors from refreshOAuthAccount are returned as-is. Errors
+// from persistFn are wrapped in *refreshSyncError so callers can branch
+// on the auth-sync failure mode (e.g. `accounts`/`list` row-local
+// coherence).
+//
+// persistFn is the caller's chosen persistence strategy. Dual-provider
+// callers pass syncRefreshedCredentialToBoth; Pi-only callers pass
+// syncAccountToPiAuth; in-memory-only callers (and tests) pass nil.
+//
+// piInfo is an OPTIONAL hook for guarded Pi-source recovery: when non-nil
+// and Pi is installed, the helper consults Pi's openai-codex tuple AFTER
+// the 401 is detected and BEFORE the single refresh POST, swapping the
+// refresh source to Pi's tuple when it is demonstrably the same account
+// and newer/safer (see selectRefreshSourceFromPi). When piInfo is nil or
+// the swap does not apply, account is reused unchanged. The swap only
+// triggers when the usage endpoint already returned 401, so the OC refresh
+// token is never replaced with Pi's when OC's credential is still valid.
+//
+// The returned account is the rotated copy ONLY when a refresh actually
+// occurred; on a non-refresh success path the returned account is nil so
+// callers can use the presence-of-refresh as a signal to mirror the
+// rotated tuple into in-memory snapshots.
+func fetchUsageWithReactiveRefresh(
+	ctx context.Context,
+	cfg config,
+	account map[string]any,
+	token string,
+	persistFn func(map[string]any) error,
+	piInfo *piAuthInfo,
+) (usageWindow, map[string]any, error) {
+	usage, err := fetchUsageWindow(ctx, cfg.HTTPClient, cfg.UsageURL, token)
+	if err == nil {
+		return usage, nil, nil
+	}
+	var usageErr *usageEndpointError
+	if !errors.As(err, &usageErr) || usageErr.StatusCode != http.StatusUnauthorized {
+		return usageWindow{}, nil, err
+	}
+
+	// Guarded Pi-source recovery: swap the refresh source to Pi's tuple
+	// only AFTER the 401 is detected, only when the helper has a piInfo,
+	// and only when Pi is demonstrably the same account and newer/safer.
+	// When the swap does not apply, account is reused unchanged so the OC
+	// refresh token is the only refresh attempted.
+	refreshSource := account
+	if piInfo != nil {
+		refreshSource = selectRefreshSourceFromPi(account, piInfo)
+	}
+
+	rotated, refreshErr := refreshOAuthAccount(ctx, cfg, refreshSource)
+	if refreshErr != nil {
+		return usageWindow{}, nil, refreshErr
+	}
+	if persistFn != nil {
+		if persistErr := persistFn(rotated); persistErr != nil {
+			return usageWindow{}, rotated, &refreshSyncError{Err: persistErr}
+		}
+	}
+
+	newToken, _ := rotated["access"].(string)
+	if strings.TrimSpace(newToken) == "" {
+		return usageWindow{}, nil, errors.New("refresh succeeded but rotated access token is empty")
+	}
+	usage, err = fetchUsageWindow(ctx, cfg.HTTPClient, cfg.UsageURL, newToken)
+	if err != nil {
+		return usageWindow{}, rotated, err
+	}
+	return usage, rotated, nil
 }
 
 func extractUsageWindow(payload map[string]any) (usageWindow, error) {
