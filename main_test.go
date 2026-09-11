@@ -2,12 +2,15 @@ package main
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"math"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -255,12 +258,57 @@ func TestRunDoesNotDuplicateExistingAccountAcrossRepeatedChecks(t *testing.T) {
 	}
 }
 
-func TestRunReturnsErrorOnNon200(t *testing.T) {
+// TestRunReturnsErrorOnNon401Non200Response is the post-refresh-rework
+// regression for non-200 responses on the usage endpoint. The reactive flow
+// only kicks in for HTTP 401; every other non-200 status (e.g. 500) bypasses
+// the token endpoint and surfaces the existing error verbatim. The error
+// must remain value-free (no bearer token, no account metadata).
+func TestRunReturnsErrorOnNon401Non200Response(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = w.Write([]byte("server boom"))
+	}))
+	defer server.Close()
+
+	dir := t.TempDir()
+	authFile := filepath.Join(dir, "auth.json")
+	if err := os.WriteFile(authFile, []byte(`{"openai.access":"test-token","openai.accountId":"acct-2","openai.refresh":"test-refresh","openai.expires":4070908800000,"openai.type":"oauth"}`), 0o600); err != nil {
+		t.Fatalf("write auth file: %v", err)
+	}
+	accountsFile := filepath.Join(dir, "accounts.json")
+
+	err := run(context.Background(), config{
+		AuthFile:     authFile,
+		AccountsFile: accountsFile,
+		UsageURL:     server.URL,
+		HTTPClient:   server.Client(),
+	}, &strings.Builder{})
+	if err == nil {
+		t.Fatalf("expected error for non-200 response")
+	}
+
+	if !strings.Contains(err.Error(), "500") {
+		t.Fatalf("expected status code in error, got: %v", err)
+	}
+	for _, secret := range []string{"test-token", "test-refresh", "acct-2"} {
+		if strings.Contains(err.Error(), secret) {
+			t.Fatalf("error leaked secret %q: %v", secret, err)
+		}
+	}
+}
+
+// TestRunReturnsClearErrorWhen401MissingRefreshMetadata pins the
+// 401-driven reactive path: when the usage endpoint returns 401 and the
+// stored credential has no usable refresh metadata, the error is clear,
+// value-free, and leaves auth/store bytes unchanged. The CLI must NEVER
+// silently succeed or echo credential values.
+func TestRunReturnsClearErrorWhen401MissingRefreshMetadata(t *testing.T) {
 	t.Parallel()
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusUnauthorized)
-		_, _ = w.Write([]byte("unauthorized"))
 	}))
 	defer server.Close()
 
@@ -278,11 +326,18 @@ func TestRunReturnsErrorOnNon200(t *testing.T) {
 		HTTPClient:   server.Client(),
 	}, &strings.Builder{})
 	if err == nil {
-		t.Fatalf("expected error for non-200 response")
+		t.Fatalf("expected error from 401 with missing refresh metadata")
 	}
-
-	if !strings.Contains(err.Error(), "401") {
-		t.Fatalf("expected status code in error, got: %v", err)
+	if !strings.Contains(err.Error(), "refresh required but refresh token is missing") {
+		t.Fatalf("expected clear value-free refresh-metadata error, got %v", err)
+	}
+	for _, secret := range []string{"test-token", "acct-2"} {
+		if strings.Contains(err.Error(), secret) {
+			t.Fatalf("error leaked secret %q: %v", secret, err)
+		}
+	}
+	if got := string(mustReadFile(t, authFile)); got != `{"openai.access":"test-token","openai.accountId":"acct-2"}` {
+		t.Fatalf("auth file must remain byte-identical, got %q", got)
 	}
 }
 
@@ -1976,7 +2031,7 @@ func TestRunUseCommandSwitchesAuthFileByIndex(t *testing.T) {
 	}
 
 	var out strings.Builder
-	err = runUseCommand(config{
+	err = runUseCommand(context.Background(), config{
 		AuthFile:     authFile,
 		AccountsFile: accountsFile,
 	}, &out, "#2")
@@ -2050,7 +2105,7 @@ func TestRunUseCommandAcceptsEmailAndUserID(t *testing.T) {
 		}
 
 		var out strings.Builder
-		if err := runUseCommand(config{
+		if err := runUseCommand(context.Background(), config{
 			AuthFile:     authFile,
 			AccountsFile: accountsFile,
 		}, &out, "user-target"); err != nil {
@@ -2074,7 +2129,7 @@ func TestRunUseCommandAcceptsEmailAndUserID(t *testing.T) {
 		}
 
 		var out strings.Builder
-		if err := runUseCommand(config{
+		if err := runUseCommand(context.Background(), config{
 			AuthFile:     authFile,
 			AccountsFile: accountsFile,
 		}, &out, "TARGET@example.com"); err != nil {
@@ -2116,7 +2171,7 @@ func TestRunUseCommandRejectsUnknownIdentifier(t *testing.T) {
 		t.Fatalf("write accounts file: %v", err)
 	}
 
-	err = runUseCommand(config{
+	err = runUseCommand(context.Background(), config{
 		AuthFile:     authFile,
 		AccountsFile: accountsFile,
 	}, &strings.Builder{}, "user-missing")
@@ -3954,6 +4009,7 @@ func TestActivateAccountAndRuntimeFlow(t *testing.T) {
 		err := runWithArgs(context.Background(), config{
 			AuthFile: oc, PiAuthFile: pi, AccountsFile: accounts,
 			UsageURL: "http://unused.local", HTTPClient: http.DefaultClient,
+			Now: func() time.Time { return time.UnixMilli(1770000000000) },
 		}, &out, []string{"use", "other@example.com"})
 		if err != nil {
 			t.Fatalf("use: %v", err)
@@ -4005,9 +4061,10 @@ func TestActivateAccountAndRuntimeFlow(t *testing.T) {
 		defer server.Close()
 		oc, pi, accounts := piSyncFixture(t)
 		seedAuthFile(t, oc, `{"openai.access":"active-access","openai.refresh":"active-refresh","openai.expires":1777014899000,"openai.accountId":"active-acct"}`)
-		piSeed := `{"openai-codex":{"access":"keep-pi","refresh":"keep-pi-r","expires":100,"accountId":"keep-pi-acct"},"anthropic":{"k":"v"}}`
+		piSeed := `{"openai-codex":{"access":"keep-pi","refresh":"keep-pi-r","expires":9999999999999,"accountId":"keep-pi-acct"},"anthropic":{"k":"v"}}`
 		seedAuthFile(t, pi, piSeed)
-		cfg := config{AuthFile: oc, PiAuthFile: pi, AccountsFile: accounts, UsageURL: server.URL, HTTPClient: server.Client()}
+		cfg := config{AuthFile: oc, PiAuthFile: pi, AccountsFile: accounts, UsageURL: server.URL, HTTPClient: server.Client(),
+			Now: func() time.Time { return time.UnixMilli(1770000000000) }}
 		for _, sub := range []struct {
 			name string
 			args []string
@@ -4227,7 +4284,8 @@ func TestReconcilePiInbound(t *testing.T) {
 			responses[piAccess] = piBodyStr
 		}
 		server, reqs := newPiServer(t, responses)
-		cfg := config{AuthFile: authFile, PiAuthFile: piAuthFile, AccountsFile: accountsFile, UsageURL: server.URL, HTTPClient: server.Client()}
+		cfg := config{AuthFile: authFile, PiAuthFile: piAuthFile, AccountsFile: accountsFile, UsageURL: server.URL, HTTPClient: server.Client(),
+			Now: func() time.Time { return time.UnixMilli(1770000000000) }}
 		acct := map[string]any{"access": ocAccess, "refresh": ocRefresh, "expires": ocExpires, "type": "oauth"}
 		if omitOc {
 			delete(acct, "expires")
@@ -4352,7 +4410,8 @@ func TestReconcilePiInbound(t *testing.T) {
 		t.Cleanup(func() { _ = os.Chmod(accountsFile, 0o600) })
 		responses := piResponses{ocAccess: piPayload(curUser, "55", ""), piAccess: piPayload(curUser, "55", "")}
 		server, _ := newPiServer(t, responses)
-		cfg := config{AuthFile: authFile, PiAuthFile: piAuthFile, AccountsFile: accountsFile, UsageURL: server.URL, HTTPClient: server.Client()}
+		cfg := config{AuthFile: authFile, PiAuthFile: piAuthFile, AccountsFile: accountsFile, UsageURL: server.URL, HTTPClient: server.Client(),
+			Now: func() time.Time { return time.UnixMilli(1770000000000) }}
 		_, _, _, err := reconcilePiInbound(context.Background(), cfg,
 			map[string]any{"access": ocAccess, "refresh": ocRefresh, "expires": oldExpires, "type": "oauth"},
 			usageWindow{UserID: curUser, UsedPercent: "55"}, true)
@@ -4377,7 +4436,8 @@ func TestReconcilePiInbound(t *testing.T) {
 		t.Cleanup(func() { _ = os.Chmod(authFile, 0o600) })
 		responses := piResponses{ocAccess: piPayload(curUser, "55", ""), piAccess: piPayload(curUser, "55", "")}
 		server, _ := newPiServer(t, responses)
-		cfg := config{AuthFile: authFile, PiAuthFile: piAuthFile, AccountsFile: accountsFile, UsageURL: server.URL, HTTPClient: server.Client()}
+		cfg := config{AuthFile: authFile, PiAuthFile: piAuthFile, AccountsFile: accountsFile, UsageURL: server.URL, HTTPClient: server.Client(),
+			Now: func() time.Time { return time.UnixMilli(1770000000000) }}
 		_, _, _, err := reconcilePiInbound(context.Background(), cfg,
 			map[string]any{"access": ocAccess, "refresh": ocRefresh, "expires": oldExpires, "type": "oauth"},
 			usageWindow{UserID: curUser, UsedPercent: "55"}, true)
@@ -4402,7 +4462,8 @@ func TestRunDefaultPiInboundReconciliation(t *testing.T) {
 		writeStore(t, accountsFile, map[string]any{"user_id": "user-cur", "access": shared, "expires": int64(1776000000000), "type": "oauth"})
 		server, requests := newPiServer(t, piResponses{shared: piPayload("user-cur", "42", "")})
 		var out strings.Builder
-		if err := runWithArgs(context.Background(), config{AuthFile: authFile, PiAuthFile: piAuthFile, AccountsFile: accountsFile, UsageURL: server.URL, HTTPClient: server.Client()}, &out, nil); err != nil {
+		if err := runWithArgs(context.Background(), config{AuthFile: authFile, PiAuthFile: piAuthFile, AccountsFile: accountsFile, UsageURL: server.URL, HTTPClient: server.Client(),
+			Now: func() time.Time { return time.UnixMilli(1770000000000) }}, &out, nil); err != nil {
 			t.Fatalf("runWithArgs: %v", err)
 		}
 		if out.String() != "42" || requests.Load() != 1 {
@@ -4423,7 +4484,8 @@ func TestRunDefaultPiInboundReconciliation(t *testing.T) {
 			t.Fatalf("seed cfg: %v", err)
 		}
 		var out strings.Builder
-		if err := runWithArgs(context.Background(), config{AuthFile: authFile, PiAuthFile: piAuthFile, AccountsFile: accountsFile, ConfigFile: cfgFile, UsageURL: server.URL, HTTPClient: server.Client()}, &out, nil); err != nil {
+		if err := runWithArgs(context.Background(), config{AuthFile: authFile, PiAuthFile: piAuthFile, AccountsFile: accountsFile, ConfigFile: cfgFile, UsageURL: server.URL, HTTPClient: server.Client(),
+			Now: func() time.Time { return time.UnixMilli(1770000000000) }}, &out, nil); err != nil {
 			t.Fatalf("runWithArgs: %v", err)
 		}
 		if out.String() != "10" {
@@ -4443,7 +4505,8 @@ func TestRunDefaultPiInboundReconciliation(t *testing.T) {
 		responses := piResponses{"oc-access": piPayload("user-cur", "55", ""), "pi-access": piPayload("user-cur", "55", "")}
 		server, _ := newPiServer(t, responses)
 		var out strings.Builder
-		if err := runWithArgs(context.Background(), config{AuthFile: authFile, PiAuthFile: piAuthFile, AccountsFile: accountsFile, UsageURL: server.URL, HTTPClient: server.Client()}, &out, nil); err != nil {
+		if err := runWithArgs(context.Background(), config{AuthFile: authFile, PiAuthFile: piAuthFile, AccountsFile: accountsFile, UsageURL: server.URL, HTTPClient: server.Client(),
+			Now: func() time.Time { return time.UnixMilli(1770000000000) }}, &out, nil); err != nil {
 			t.Fatalf("runWithArgs: %v", err)
 		}
 		saved := mustReadStore(t, accountsFile)["user-cur"]
@@ -4510,7 +4573,8 @@ func TestRunNonDefaultCommandsDoNotImportPi(t *testing.T) {
 			t.Parallel()
 			a, p, acc, server, requests := setup(t)
 			var out strings.Builder
-			if err := runWithArgs(context.Background(), config{AuthFile: a, PiAuthFile: p, AccountsFile: acc, UsageURL: server.URL, HTTPClient: server.Client()}, &out, tc.args); err != nil {
+			if err := runWithArgs(context.Background(), config{AuthFile: a, PiAuthFile: p, AccountsFile: acc, UsageURL: server.URL, HTTPClient: server.Client(),
+				Now: func() time.Time { return time.UnixMilli(1770000000000) }}, &out, tc.args); err != nil {
 				t.Fatalf("runWithArgs %v: %v", tc.args, err)
 			}
 			tc.expect(t, a, p, requests)
@@ -4615,7 +4679,8 @@ func TestRunDefaultCommand(t *testing.T) {
 				seedAuthFile(t, piAuthFile, tc.seed.pi)
 			}
 			server, requests := newPiServer(t, tc.resp)
-			cfg := config{AuthFile: authFile, PiAuthFile: piAuthFile, AccountsFile: accountsFile, UsageURL: server.URL, HTTPClient: server.Client()}
+			cfg := config{AuthFile: authFile, PiAuthFile: piAuthFile, AccountsFile: accountsFile, UsageURL: server.URL, HTTPClient: server.Client(),
+				Now: func() time.Time { return time.UnixMilli(1770000000000) }}
 			if tc.emptyPi {
 				cfg.PiAuthFile = ""
 			}
@@ -4734,7 +4799,8 @@ func TestPiOnlyNoRotation(t *testing.T) {
 	)
 	server, _ := newPiServer(t, piResponses{"pi-a": piPayload("user-cur", "99", "")})
 	var out strings.Builder
-	if err := runWithArgs(context.Background(), config{AuthFile: authFile, PiAuthFile: piAuthFile, AccountsFile: accountsFile, UsageURL: server.URL, HTTPClient: server.Client()}, &out, nil); err != nil {
+	if err := runWithArgs(context.Background(), config{AuthFile: authFile, PiAuthFile: piAuthFile, AccountsFile: accountsFile, UsageURL: server.URL, HTTPClient: server.Client(),
+		Now: func() time.Time { return time.UnixMilli(1770000000000) }}, &out, nil); err != nil {
 		t.Fatalf("run: %v", err)
 	}
 	if out.String() != "99" {
@@ -5782,4 +5848,2247 @@ func TestCurrentAccountTokenIsReadOnly(t *testing.T) {
 			t.Fatalf("OpenCode directory must not be created (stat err: %v)", err)
 		}
 	})
+}
+
+// ---------------------------------------------------------------------------------------
+// OAuth refresh: reactive 401-driven flow (fetchUsageWithReactiveRefresh +
+// refreshOAuthAccount) plus command-level wiring.
+// ---------------------------------------------------------------------------------------
+
+// makeTestJWT encodes an unsigned JWT whose payload mirrors the nested
+// account-identity object Pi emits on its rotated access tokens (the
+// `https://api.openai.com/auth` claim carries a JSON object whose
+// `chatgpt_account_id` field stores the id) so refreshOAuthAccount can
+// derive accountId from the rotated access token. The signature segment is
+// opaque.
+func makeTestJWT(accountID string) string {
+	header := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"none","typ":"JWT"}`))
+	payloadBytes, _ := json.Marshal(map[string]any{
+		"https://api.openai.com/auth": map[string]any{
+			"chatgpt_account_id": accountID,
+		},
+	})
+	payload := base64.RawURLEncoding.EncodeToString(payloadBytes)
+	return header + "." + payload + ".sig"
+}
+
+// makeFlatTestJWT is the legacy flat-claim variant (used only by the
+// extractChatGPTAccountIDFromJWT regression tests; production Pi traffic has
+// switched to the nested form).
+func makeFlatTestJWT(accountID string) string {
+	header := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"none","typ":"JWT"}`))
+	payloadBytes, _ := json.Marshal(map[string]any{
+		"https://api.openai.com/auth.chatgpt_account_id": accountID,
+	})
+	payload := base64.RawURLEncoding.EncodeToString(payloadBytes)
+	return header + "." + payload + ".sig"
+}
+
+// TestExtractChatGPTAccountIDFromJWTNestedClaim is the regression for the
+// real Pi JWT shape: the chatgpt_account_id lives inside an object under
+// the `https://api.openai.com/auth` namespace, not as a flat top-level claim.
+func TestExtractChatGPTAccountIDFromJWTNestedClaim(t *testing.T) {
+	t.Parallel()
+
+	got, ok := extractChatGPTAccountIDFromJWT(makeTestJWT("nested-acct-id"))
+	if !ok {
+		t.Fatalf("extractChatGPTAccountIDFromJWT did not extract the nested chatgpt_account_id")
+	}
+	if got != "nested-acct-id" {
+		t.Fatalf("extracted id: got %q, want %q", got, "nested-acct-id")
+	}
+}
+
+// TestExtractChatGPTAccountIDFromJWTLegacyFlatFallback keeps the old flat
+// claim working so issuers that have not switched yet still drive the
+// accountId derivation.
+func TestExtractChatGPTAccountIDFromJWTLegacyFlatFallback(t *testing.T) {
+	t.Parallel()
+
+	got, ok := extractChatGPTAccountIDFromJWT(makeFlatTestJWT("legacy-acct-id"))
+	if !ok {
+		t.Fatalf("extractChatGPTAccountIDFromJWT did not extract the legacy flat claim")
+	}
+	if got != "legacy-acct-id" {
+		t.Fatalf("extracted id: got %q, want %q", got, "legacy-acct-id")
+	}
+}
+
+// TestExtractChatGPTAccountIDFromJWTMissingReturnsEmpty preserves the prior
+// contract that a token lacking any usable claim leaves the existing
+// accountId untouched (refreshOAuthAccount relies on this).
+func TestExtractChatGPTAccountIDFromJWTMissingReturnsEmpty(t *testing.T) {
+	t.Parallel()
+
+	token := makeTestJWT("")
+	if _, ok := extractChatGPTAccountIDFromJWT(token); ok {
+		t.Fatalf("empty nested chatgpt_account_id must not be reported as present")
+	}
+	header := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"none","typ":"JWT"}`))
+	empty := base64.RawURLEncoding.EncodeToString([]byte(`{}`))
+	if _, ok := extractChatGPTAccountIDFromJWT(header + "." + empty + ".sig"); ok {
+		t.Fatalf("missing claim must not be reported as present")
+	}
+	if _, ok := extractChatGPTAccountIDFromJWT("not-a-jwt"); ok {
+		t.Fatalf("malformed token must not be reported as present")
+	}
+}
+
+// newRefreshServer wraps an http.HandlerFunc, increments a per-call counter,
+// and registers t.Cleanup so callers never leak the listener.
+func newRefreshServer(t *testing.T, handler http.HandlerFunc) (*httptest.Server, *atomic.Int32) {
+	t.Helper()
+	var hits atomic.Int32
+	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		handler(w, r)
+	}))
+	t.Cleanup(s.Close)
+	return s, &hits
+}
+
+// TestRefreshOAuthAccountRotatesAndPreservesInput is the positive path of
+// the reactive helper: when called by a 401-driven flow, the helper POSTs
+// to the configured token URL with the required form fields, validates the
+// response shape, rotates the OAuth tuple, derives accountId from the new
+// JWT claim when valid, and computes the new expires via cfg.Now. The
+// helper never inspects the stored `expires`; time-based policies live
+// exclusively at the call sites.
+//
+// The input map is never mutated: it remains the same object that the
+// caller passed in, with its pre-refresh values intact.
+func TestRefreshOAuthAccountRotatesAndPreservesInput(t *testing.T) {
+	t.Parallel()
+
+	fixedNow := time.Unix(1_700_000_000, 0)
+	var capturedForm url.Values
+	newAccess := makeTestJWT("rotated-acct-id")
+	server, hits := newRefreshServer(t, func(w http.ResponseWriter, r *http.Request) {
+		if err := r.ParseForm(); err != nil {
+			t.Fatalf("parse form: %v", err)
+		}
+		capturedForm = r.PostForm
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprintf(w, `{"access_token":%q,"refresh_token":"rotated-refresh-token","expires_in":3600,"token_type":"Bearer"}`, newAccess)
+	})
+
+	// Use a stale-looking expires (within the obsolete 5-minute window) so
+	// the test also proves the helper rotates even when a proactive policy
+	// would have called it. This is the documented reactive contract.
+	expiresMs := fixedNow.Add(30 * time.Second).UnixMilli()
+	account := map[string]any{
+		"access":    "stale-access-token",
+		"refresh":   "stale-refresh-token",
+		"expires":   int64(expiresMs),
+		"accountId": "stale-acct-id",
+		"email":     "preserved@example.com",
+	}
+
+	got, err := refreshOAuthAccount(context.Background(), config{
+		TokenURL:   server.URL,
+		HTTPClient: server.Client(),
+		Now:        func() time.Time { return fixedNow },
+	}, account)
+	if err != nil {
+		t.Fatalf("refreshOAuthAccount: %v", err)
+	}
+	if hits.Load() != 1 {
+		t.Fatalf("expected 1 POST, got %d", hits.Load())
+	}
+
+	if v := capturedForm.Get("grant_type"); v != "refresh_token" {
+		t.Fatalf("grant_type: got %q", v)
+	}
+	if v := capturedForm.Get("refresh_token"); v != "stale-refresh-token" {
+		t.Fatalf("refresh_token: got %q", v)
+	}
+	if v := capturedForm.Get("client_id"); v != "app_EMoamEEZ73f0CkXaXp7hrann" {
+		t.Fatalf("client_id: got %q", v)
+	}
+
+	if got["access"] != newAccess {
+		t.Fatalf("access: got %q, want %q", got["access"], newAccess)
+	}
+	if got["refresh"] != "rotated-refresh-token" {
+		t.Fatalf("refresh: got %v", got["refresh"])
+	}
+	wantExpires := fixedNow.Add(time.Hour).UnixMilli()
+	if v, ok := valueToInt64(got["expires"]); !ok || v != wantExpires {
+		t.Fatalf("expires: got %v, want %d", got["expires"], wantExpires)
+	}
+	if got["accountId"] != "rotated-acct-id" {
+		t.Fatalf("accountId not derived from JWT claim: got %v", got["accountId"])
+	}
+	if got["email"] != "preserved@example.com" {
+		t.Fatalf("unrelated metadata lost: got %v", got["email"])
+	}
+	if account["access"] != "stale-access-token" || account["refresh"] != "stale-refresh-token" {
+		t.Fatalf("input map was mutated: %#v", account)
+	}
+}
+
+// TestRefreshOAuthAccountIgnoresExpiresWindow pins the reactive contract:
+// the helper rotates regardless of the stored `expires`. A credential with
+// an hour of remaining lifetime still rotates when a 401-driven caller
+// invokes it; a missing `expires` field does not block rotation either.
+// This is the regression against any future reintroduction of proactive
+// due-window logic.
+func TestRefreshOAuthAccountIgnoresExpiresWindow(t *testing.T) {
+	t.Parallel()
+
+	fixedNow := time.Unix(1_700_000_000, 0)
+	server, hits := newRefreshServer(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"access_token":"rotated-fresh","refresh_token":"rotated-fresh-r","expires_in":3600}`)
+	})
+
+	t.Run("fresh expires still rotates", func(t *testing.T) {
+		t.Parallel()
+		account := map[string]any{
+			"access":  "fresh-access",
+			"refresh": "fresh-refresh",
+			"expires": int64(fixedNow.Add(time.Hour).UnixMilli()),
+		}
+		got, err := refreshOAuthAccount(context.Background(), config{
+			TokenURL:   server.URL,
+			HTTPClient: server.Client(),
+			Now:        func() time.Time { return fixedNow },
+		}, account)
+		if err != nil {
+			t.Fatalf("refreshOAuthAccount: %v", err)
+		}
+		if got["access"] != "rotated-fresh" {
+			t.Fatalf("expected rotation, got access=%v", got["access"])
+		}
+		if account["access"] != "fresh-access" {
+			t.Fatalf("input mutated: %v", account)
+		}
+	})
+
+	t.Run("missing expires still rotates", func(t *testing.T) {
+		t.Parallel()
+		account := map[string]any{
+			"access":  "legacy-access",
+			"refresh": "legacy-refresh",
+		}
+		got, err := refreshOAuthAccount(context.Background(), config{
+			TokenURL:   server.URL,
+			HTTPClient: server.Client(),
+			Now:        func() time.Time { return fixedNow },
+		}, account)
+		if err != nil {
+			t.Fatalf("refreshOAuthAccount: %v", err)
+		}
+		if got["access"] != "rotated-fresh" {
+			t.Fatalf("expected rotation, got access=%v", got["access"])
+		}
+		if hits.Load() < 1 {
+			t.Fatalf("expected refresh POSTs to have been counted, got %d", hits.Load())
+		}
+	})
+}
+
+// TestRefreshOAuthAccountMissingRefreshReturnsClearError pins the failure
+// contract: when the helper is invoked (by a 401-driven caller) but the
+// account has no usable refresh metadata, it returns a value-free error
+// without contacting the token endpoint. The input map stays unchanged so
+// the caller's auth/store bytes are never mutated.
+func TestRefreshOAuthAccountMissingRefreshReturnsClearError(t *testing.T) {
+	t.Parallel()
+
+	server, hits := newRefreshServer(t, func(w http.ResponseWriter, _ *http.Request) {
+		t.Errorf("refresh endpoint must not be called when refresh metadata is missing")
+		w.WriteHeader(http.StatusOK)
+	})
+
+	account := map[string]any{
+		"access": "no-refresh-access",
+		// no "refresh" field at all
+	}
+	got, err := refreshOAuthAccount(context.Background(), config{
+		TokenURL:   server.URL,
+		HTTPClient: server.Client(),
+	}, account)
+	if err == nil {
+		t.Fatalf("expected error on missing refresh metadata, got nil; got=%#v", got)
+	}
+	if got != nil {
+		t.Fatalf("expected nil map on failure, got %#v", got)
+	}
+	if hits.Load() != 0 {
+		t.Fatalf("expected 0 POSTs, got %d", hits.Load())
+	}
+	msg := err.Error()
+	for _, secret := range []string{"no-refresh-access"} {
+		if strings.Contains(msg, secret) {
+			t.Fatalf("error leaked %q: %v", secret, err)
+		}
+	}
+	if account["access"] != "no-refresh-access" {
+		t.Fatalf("input mutated on failure: %v", account)
+	}
+}
+
+// TestRefreshOAuthAccountFailurePreservesInputAndNoLeak is the failure
+// path: a non-200 response with echoed credential material must return a
+// value-free error and leave the input map byte-identical. The bearer
+// tokens never appear in the error so they never reach user-visible output.
+func TestRefreshOAuthAccountFailurePreservesInputAndNoLeak(t *testing.T) {
+	t.Parallel()
+
+	server, _ := newRefreshServer(t, func(w http.ResponseWriter, _ *http.Request) {
+		// Echo back what the client sent so we can prove the helper doesn't
+		// include any of it in the returned error.
+		w.WriteHeader(http.StatusInternalServerError)
+		fmt.Fprint(w, `error="invalid_request" detail="refresh_token leaked: SECRET-REFRESH-XYZ access=SECRET-ACCESS-ABC"`)
+	})
+
+	account := map[string]any{
+		"access":  "SECRET-ACCESS-ABC",
+		"refresh": "SECRET-REFRESH-XYZ",
+		"expires": int64(time.Unix(1_700_000_000, 0).Add(30 * time.Second).UnixMilli()),
+	}
+
+	got, err := refreshOAuthAccount(context.Background(), config{
+		TokenURL:   server.URL,
+		HTTPClient: server.Client(),
+	}, account)
+	if err == nil {
+		t.Fatalf("expected error on non-200 refresh response")
+	}
+	if got != nil {
+		t.Fatalf("expected nil map on failure, got %#v", got)
+	}
+	msg := err.Error()
+	for _, secret := range []string{"SECRET-ACCESS-ABC", "SECRET-REFRESH-XYZ", "new-access"} {
+		if strings.Contains(msg, secret) {
+			t.Fatalf("error leaked %q: %v", secret, err)
+		}
+	}
+	if account["access"] != "SECRET-ACCESS-ABC" || account["refresh"] != "SECRET-REFRESH-XYZ" {
+		t.Fatalf("input mutated on failure: %#v", account)
+	}
+}
+
+// TestRunAccountsCommandRefreshesOnUnauthorizedAndRetainsCurrentMarker
+// exercises the reactive accounts wiring: the usage endpoint returns 401
+// for the CURRENT row and 200 for the second row; only the 401 row
+// triggers a single refresh POST and a single retry that succeeds. The
+// CURRENT marker is preserved (computed against the pre-refresh access),
+// the rotated credential is mirrored to the installed auth stores, and the
+// non-current row is left untouched.
+func TestRunAccountsCommandRefreshesOnUnauthorizedAndRetainsCurrentMarker(t *testing.T) {
+	t.Parallel()
+
+	fixedNow := time.Unix(1_700_000_000, 0)
+	farExpiresMs := fixedNow.Add(2 * time.Hour).UnixMilli()
+	rotatedExpiresMs := fixedNow.Add(time.Hour).UnixMilli()
+
+	refreshServer, refreshHits := newRefreshServer(t, func(w http.ResponseWriter, r *http.Request) {
+		if err := r.ParseForm(); err != nil {
+			t.Fatalf("parse form: %v", err)
+		}
+		if r.PostForm.Get("refresh_token") != "current-refresh" {
+			t.Errorf("unexpected refresh_token: %q", r.PostForm.Get("refresh_token"))
+		}
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprintf(w, `{"access_token":"rotated-current-access","refresh_token":"rotated-current-refresh","expires_in":3600}`)
+	})
+
+	// Usage server: first call with the CURRENT row's pre-refresh access
+	// returns 401; second call (after refresh) with the rotated access
+	// returns 200; the second row's single call returns 200 immediately.
+	usageHits := atomic.Int32{}
+	usageServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		usageHits.Add(1)
+		auth := r.Header.Get("Authorization")
+		switch {
+		case strings.Contains(auth, "rotated-current-access"):
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"user_id":"user-current","email":"current@example.com","rate_limit":{"primary_window":{"used_percent":50,"reset_at":1777414800}}}`))
+		case strings.Contains(auth, "current-access"):
+			w.WriteHeader(http.StatusUnauthorized)
+		case strings.Contains(auth, "other-access"):
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"user_id":"user-other","email":"other@example.com","rate_limit":{"primary_window":{"used_percent":60,"reset_at":1777414800}}}`))
+		default:
+			t.Errorf("unexpected Authorization header: %q", auth)
+			w.WriteHeader(http.StatusUnauthorized)
+		}
+	}))
+	t.Cleanup(usageServer.Close)
+
+	authFile, _, accountsFile := piSyncFixture(t)
+	seedAuthFile(t, authFile, ocAuthBody("current-access", "current-refresh", farExpiresMs, "current-acct"))
+
+	writeStore(t, accountsFile,
+		map[string]any{"user_id": "user-current", "access": "current-access", "refresh": "current-refresh",
+			"expires": int64(farExpiresMs), "type": "oauth", "accountId": "current-acct"},
+		map[string]any{"user_id": "user-other", "access": "other-access", "refresh": "other-refresh",
+			"expires": int64(farExpiresMs), "type": "oauth", "accountId": "other-acct"},
+	)
+
+	var out strings.Builder
+	err := runAccountsCommand(context.Background(), config{
+		AuthFile:     authFile,
+		AccountsFile: accountsFile,
+		UsageURL:     usageServer.URL,
+		TokenURL:     refreshServer.URL,
+		HTTPClient:   usageServer.Client(),
+		Now:          func() time.Time { return fixedNow },
+	}, &out)
+	if err != nil {
+		t.Fatalf("runAccountsCommand: %v", err)
+	}
+	if v := refreshHits.Load(); v != 1 {
+		t.Fatalf("expected exactly 1 refresh POST, got %d", v)
+	}
+	// Usage: 1 (initial 401) + 1 (retry) for the current row + 1 for the
+	// other row = 3.
+	if v := usageHits.Load(); v != 3 {
+		t.Fatalf("expected exactly 3 usage calls (one initial 401, one retry, one for the other row), got %d", v)
+	}
+	if !strings.Contains(out.String(), "*") {
+		t.Fatalf("expected CURRENT marker to be retained, got %q", out.String())
+	}
+	assertOCAuth(t, authFile, "rotated-current-access", "rotated-current-refresh", rotatedExpiresMs, "current-acct")
+
+	store := mustReadStore(t, accountsFile)
+	if v, _ := store["user-current"]["access"].(string); v != "rotated-current-access" {
+		t.Fatalf("store user-current access not rotated: %v", store["user-current"]["access"])
+	}
+	if v, _ := store["user-other"]["access"].(string); v != "other-access" {
+		t.Fatalf("user-other access mutated: %v", store["user-other"]["access"])
+	}
+}
+
+// TestRunAccountsCommandSecondUnauthorizedStopsAfterOneRefresh pins the
+// retry-once contract: after a successful OAuth refresh, a second 401
+// from the usage endpoint aborts without a second refresh POST. The
+// current row is rendered as ERR and the table still includes the other
+// rows (row-local isolation).
+func TestRunAccountsCommandSecondUnauthorizedStopsAfterOneRefresh(t *testing.T) {
+	t.Parallel()
+
+	fixedNow := time.Unix(1_700_000_000, 0)
+	farExpiresMs := fixedNow.Add(2 * time.Hour).UnixMilli()
+	rotatedMs := fixedNow.Add(time.Hour).UnixMilli()
+
+	refreshServer, refreshHits := newRefreshServer(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"access_token":"rotated-still-bad-access","refresh_token":"rotated-still-bad-refresh","expires_in":3600}`)
+	})
+
+	var usageHits atomic.Int32
+	usageServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		// Every call returns 401 (initial and post-refresh retry). The
+		// reactive helper must stop after one retry; the second 401 from the
+		// usage endpoint is surfaced as the row error.
+		usageHits.Add(1)
+		w.WriteHeader(http.StatusUnauthorized)
+	}))
+	t.Cleanup(usageServer.Close)
+
+	authFile, _, accountsFile := piSyncFixture(t)
+	seedAuthFile(t, authFile, ocAuthBody("current-access", "current-refresh", farExpiresMs, "current-acct"))
+
+	writeStore(t, accountsFile,
+		map[string]any{"user_id": "user-current", "access": "current-access", "refresh": "current-refresh",
+			"expires": int64(farExpiresMs), "type": "oauth", "accountId": "current-acct"},
+	)
+
+	var out strings.Builder
+	err := runAccountsCommand(context.Background(), config{
+		AuthFile:     authFile,
+		AccountsFile: accountsFile,
+		UsageURL:     usageServer.URL,
+		TokenURL:     refreshServer.URL,
+		HTTPClient:   usageServer.Client(),
+		Now:          func() time.Time { return fixedNow },
+	}, &out)
+	if err == nil {
+		t.Fatalf("expected error from second 401, got nil; stdout=%q", out.String())
+	}
+	if !strings.Contains(err.Error(), "failed to fetch usage for all saved accounts") {
+		t.Fatalf("expected overall-failure error, got %v", err)
+	}
+	if v := refreshHits.Load(); v != 1 {
+		t.Fatalf("expected exactly 1 refresh POST (no recursive refresh), got %d", v)
+	}
+	if v := usageHits.Load(); v != 2 {
+		t.Fatalf("expected exactly 2 usage calls (initial 401 + one retry), got %d", v)
+	}
+	if !strings.Contains(out.String(), "ERR") {
+		t.Fatalf("row must render as ERR, got %q", out.String())
+	}
+	// The sync ran BEFORE the retry (documented sequence: refresh →
+	// persist → retry). On a second 401 the auth file already carries the
+	// rotated (still bad) tuple. The next run treats it as just another
+	// 401 and refreshes again — that is across-run behavior, not recursion
+	// within a single run.
+	assertOCAuth(t, authFile, "rotated-still-bad-access", "rotated-still-bad-refresh", rotatedMs, "current-acct")
+}
+
+// TestRunAccountsCommandNon401DoesNotInvokeRefresh pins the contract that
+// non-401 responses (400, 403, 429, 500) bypass the token endpoint. The
+// reactive helper must return the existing error verbatim and never POST
+// to the refresh endpoint.
+func TestRunAccountsCommandNon401DoesNotInvokeRefresh(t *testing.T) {
+	t.Parallel()
+
+	fixedNow := time.Unix(1_700_000_000, 0)
+	farExpiresMs := fixedNow.Add(2 * time.Hour).UnixMilli()
+
+	refreshServer, refreshHits := newRefreshServer(t, func(w http.ResponseWriter, _ *http.Request) {
+		t.Errorf("refresh endpoint must not be called for non-401 responses")
+		w.WriteHeader(http.StatusOK)
+	})
+
+	cases := []struct {
+		name       string
+		statusCode int
+		body       string
+	}{
+		{"400", http.StatusBadRequest, "bad request"},
+		{"403", http.StatusForbidden, "forbidden"},
+		{"429", http.StatusTooManyRequests, "rate limited"},
+		{"500", http.StatusInternalServerError, "server error"},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			usageServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(tc.statusCode)
+				_, _ = fmt.Fprint(w, tc.body)
+			}))
+			t.Cleanup(usageServer.Close)
+
+			authFile, _, accountsFile := piSyncFixture(t)
+			seedAuthFile(t, authFile, ocAuthBody("current-access", "current-refresh", farExpiresMs, "current-acct"))
+			writeStore(t, accountsFile,
+				map[string]any{"user_id": "user-current", "access": "current-access", "refresh": "current-refresh",
+					"expires": int64(farExpiresMs), "type": "oauth", "accountId": "current-acct"},
+			)
+
+			var out strings.Builder
+			err := runAccountsCommand(context.Background(), config{
+				AuthFile:     authFile,
+				AccountsFile: accountsFile,
+				UsageURL:     usageServer.URL,
+				TokenURL:     refreshServer.URL,
+				HTTPClient:   usageServer.Client(),
+				Now:          func() time.Time { return fixedNow },
+			}, &out)
+			if err == nil {
+				t.Fatalf("expected error from %d response, got nil", tc.statusCode)
+			}
+			if !strings.Contains(err.Error(), "failed to fetch usage for all saved accounts") {
+				t.Fatalf("expected overall-failure error, got %v", err)
+			}
+			if v := refreshHits.Load(); v != 0 {
+				t.Fatalf("expected 0 refresh POSTs for %d response, got %d", tc.statusCode, v)
+			}
+		})
+	}
+}
+
+// TestRunAccountsCommandMissingRefreshMetadataIsRowLocal pins the row-local
+// behavior: a row whose 401-driven refresh fails because the stored
+// refresh token is missing renders as ERR, but other rows are still
+// rendered. The token endpoint is contacted for that row's refresh attempt
+// (via the reactive helper) but the missing-refresh error short-circuits
+// before any POST.
+func TestRunAccountsCommandMissingRefreshMetadataIsRowLocal(t *testing.T) {
+	t.Parallel()
+
+	fixedNow := time.Unix(1_700_000_000, 0)
+	farExpiresMs := fixedNow.Add(2 * time.Hour).UnixMilli()
+
+	refreshServer, refreshHits := newRefreshServer(t, func(w http.ResponseWriter, _ *http.Request) {
+		t.Errorf("refresh endpoint must not be called when stored refresh token is empty")
+		w.WriteHeader(http.StatusOK)
+	})
+
+	usageServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		auth := r.Header.Get("Authorization")
+		if strings.Contains(auth, "current-access") {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"user_id":"user-other","email":"other@example.com","rate_limit":{"primary_window":{"used_percent":60,"reset_at":1777414800}}}`))
+	}))
+	t.Cleanup(usageServer.Close)
+
+	authFile, _, accountsFile := piSyncFixture(t)
+	seedAuthFile(t, authFile, ocAuthBody("current-access", "current-refresh", farExpiresMs, "current-acct"))
+
+	// First row has no `refresh` field: a 401-driven refresh attempt must
+	// surface a value-free error and never contact the token endpoint.
+	writeStore(t, accountsFile,
+		map[string]any{"user_id": "user-current", "access": "current-access",
+			"expires": int64(farExpiresMs), "type": "oauth", "accountId": "current-acct"},
+		map[string]any{"user_id": "user-other", "access": "other-access", "refresh": "other-refresh",
+			"expires": int64(farExpiresMs), "type": "oauth", "accountId": "other-acct"},
+	)
+
+	var out strings.Builder
+	err := runAccountsCommand(context.Background(), config{
+		AuthFile:     authFile,
+		AccountsFile: accountsFile,
+		UsageURL:     usageServer.URL,
+		TokenURL:     refreshServer.URL,
+		HTTPClient:   usageServer.Client(),
+		Now:          func() time.Time { return fixedNow },
+	}, &out)
+	if err != nil {
+		t.Fatalf("runAccountsCommand: %v", err)
+	}
+	if v := refreshHits.Load(); v != 0 {
+		t.Fatalf("expected 0 refresh POSTs (missing refresh metadata), got %d", v)
+	}
+	if !strings.Contains(out.String(), "ERR") {
+		t.Fatalf("expected ERR row, got %q", out.String())
+	}
+	if !strings.Contains(out.String(), "other@example.com") {
+		t.Fatalf("expected the other row to render despite the first row's failure, got %q", out.String())
+	}
+	for _, secret := range []string{"current-access", "current-refresh", "current-acct"} {
+		if strings.Contains(out.String(), secret) {
+			t.Fatalf("row error leaked secret %q: %q", secret, out.String())
+		}
+	}
+}
+
+// TestRunAccountsCommandRefreshFailureLeavesFilesUnchanged pins the
+// contract: a 401-driven refresh POST that fails (e.g. the token endpoint
+// returns 400) leaves auth/store bytes byte-identical to the pre-call
+// state. Errors never echo credential values, JWT claims, or response
+// bodies.
+func TestRunAccountsCommandRefreshFailureLeavesFilesUnchanged(t *testing.T) {
+	t.Parallel()
+
+	fixedNow := time.Unix(1_700_000_000, 0)
+	farExpiresMs := fixedNow.Add(2 * time.Hour).UnixMilli()
+
+	refreshServer, refreshHits := newRefreshServer(t, func(w http.ResponseWriter, _ *http.Request) {
+		// Echo back the caller's credential material so the test can prove
+		// the surfaced row error never includes it.
+		w.WriteHeader(http.StatusBadRequest)
+		fmt.Fprint(w, `error="invalid_grant" refresh_token=SECRET-REFRESH-XYZ access=SECRET-ACCESS-ABC`)
+	})
+
+	usageServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.Header.Get("Authorization"), "current-access") {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(usageServer.Close)
+
+	authFile, _, accountsFile := piSyncFixture(t)
+	seedAuthFile(t, authFile, ocAuthBody("current-access", "current-refresh", farExpiresMs, "current-acct"))
+	writeStore(t, accountsFile,
+		map[string]any{"user_id": "user-current", "access": "current-access", "refresh": "current-refresh",
+			"expires": int64(farExpiresMs), "type": "oauth", "accountId": "current-acct"},
+	)
+
+	var out strings.Builder
+	err := runAccountsCommand(context.Background(), config{
+		AuthFile:     authFile,
+		AccountsFile: accountsFile,
+		UsageURL:     usageServer.URL,
+		TokenURL:     refreshServer.URL,
+		HTTPClient:   usageServer.Client(),
+		Now:          func() time.Time { return fixedNow },
+	}, &out)
+	if err == nil {
+		t.Fatalf("expected overall error from refresh failure, got nil; stdout=%q", out.String())
+	}
+	if v := refreshHits.Load(); v != 1 {
+		t.Fatalf("expected exactly 1 refresh POST, got %d", v)
+	}
+	if !strings.Contains(out.String(), "ERR") {
+		t.Fatalf("row must render as ERR, got %q", out.String())
+	}
+	// Auth/store bytes must remain byte-identical because the refresh POST
+	// failed: persistFn was never invoked, so no sync touched any file.
+	assertOCAuth(t, authFile, "current-access", "current-refresh", farExpiresMs, "current-acct")
+	store := mustReadStore(t, accountsFile)
+	if v, _ := store["user-current"]["access"].(string); v != "current-access" {
+		t.Fatalf("store must NOT carry rotated access on refresh failure: got %v", v)
+	}
+	// No secret may leak through the row error.
+	rendered := out.String()
+	for _, secret := range []string{"SECRET-ACCESS-ABC", "SECRET-REFRESH-XYZ", "current-refresh"} {
+		if strings.Contains(rendered, secret) {
+			t.Fatalf("row error leaked secret %q: %q", secret, rendered)
+		}
+	}
+}
+
+// TestRunUseCommandDoesNotInvokeRefresh pins the reactive contract: `use`
+// does NOT query the usage endpoint, so OAuth refresh is out of scope.
+// The token endpoint is never contacted even when the stored `expires`
+// would have qualified under the obsolete 5-minute proactive window. The
+// active auth file simply receives the stored OAuth tuple from the
+// selected account via activateAccount.
+func TestRunUseCommandDoesNotInvokeRefresh(t *testing.T) {
+	t.Parallel()
+
+	fixedNow := time.Unix(1_700_000_000, 0)
+	dueExpiresMs := fixedNow.Add(30 * time.Second).UnixMilli()
+	farExpiresMs := fixedNow.Add(2 * time.Hour).UnixMilli()
+
+	refreshServer, refreshHits := newRefreshServer(t, func(w http.ResponseWriter, _ *http.Request) {
+		t.Errorf("refresh endpoint must not be called from `use`")
+		w.WriteHeader(http.StatusOK)
+	})
+
+	authFile, _, accountsFile := piSyncFixture(t)
+	seedAuthFile(t, authFile, ocAuthBody("current-access", "current-refresh", farExpiresMs, "current-acct"))
+
+	writeStore(t, accountsFile,
+		map[string]any{"user_id": "user-current", "access": "current-access", "refresh": "current-refresh",
+			"expires": int64(farExpiresMs), "type": "oauth", "accountId": "current-acct"},
+		map[string]any{"user_id": "user-target", "access": "target-access", "refresh": "target-refresh",
+			"expires": int64(dueExpiresMs), "type": "oauth", "accountId": "target-acct"},
+	)
+
+	var out strings.Builder
+	if err := runUseCommand(context.Background(), config{
+		AuthFile:     authFile,
+		AccountsFile: accountsFile,
+		TokenURL:     refreshServer.URL,
+		Now:          func() time.Time { return fixedNow },
+	}, &out, "user-target"); err != nil {
+		t.Fatalf("runUseCommand: %v", err)
+	}
+	if v := refreshHits.Load(); v != 0 {
+		t.Fatalf("expected 0 refresh POSTs from `use`, got %d", v)
+	}
+	p := readJSONObject(t, authFile)
+	if p["openai.access"] != "target-access" {
+		t.Fatalf("active auth access must carry the stored target access (not rotated), got %v", p["openai.access"])
+	}
+	if p["openai.refresh"] != "target-refresh" {
+		t.Fatalf("active auth refresh must carry the stored target refresh, got %v", p["openai.refresh"])
+	}
+	if v, ok := valueToInt64(p["openai.expires"]); !ok || v != dueExpiresMs {
+		t.Fatalf("active auth expires must carry the stored target expires, got %v", p["openai.expires"])
+	}
+	store := mustReadStore(t, accountsFile)
+	if v, _ := store["user-target"]["access"].(string); v != "target-access" {
+		t.Fatalf("store target access must remain on the pre-rotation token, got %v", store["user-target"]["access"])
+	}
+	// Sanity: unrelated rows are untouched.
+	if v, _ := store["user-current"]["access"].(string); v != "current-access" {
+		t.Fatalf("current row mutated: %v", store["user-current"]["access"])
+	}
+}
+
+// TestRunUseCommandExpiredMetadataDoesNotInvokeRefresh pins the contract
+// that `use` ignores the stored `expires` field. Even when the target
+// account has a near-expiry metadata that would have triggered the
+// obsolete proactive refresh, the token endpoint is never contacted.
+func TestRunUseCommandExpiredMetadataDoesNotInvokeRefresh(t *testing.T) {
+	t.Parallel()
+
+	fixedNow := time.Unix(1_700_000_000, 0)
+	expiredMs := fixedNow.Add(-1 * time.Hour).UnixMilli()
+
+	refreshServer, refreshHits := newRefreshServer(t, func(w http.ResponseWriter, _ *http.Request) {
+		t.Errorf("refresh endpoint must not be called from `use` even with expired metadata")
+		w.WriteHeader(http.StatusOK)
+	})
+
+	authFile, _, accountsFile := piSyncFixture(t)
+	seedAuthFile(t, authFile, ocAuthBody("current-access", "current-refresh",
+		fixedNow.Add(2*time.Hour).UnixMilli(), "current-acct"))
+
+	writeStore(t, accountsFile,
+		map[string]any{"user_id": "user-current", "access": "current-access", "refresh": "current-refresh",
+			"expires": int64(fixedNow.Add(2 * time.Hour).UnixMilli()), "type": "oauth", "accountId": "current-acct"},
+		map[string]any{"user_id": "user-target", "access": "target-access", "refresh": "target-refresh",
+			"expires": int64(expiredMs), "type": "oauth", "accountId": "target-acct"},
+	)
+
+	var out strings.Builder
+	if err := runUseCommand(context.Background(), config{
+		AuthFile:     authFile,
+		AccountsFile: accountsFile,
+		TokenURL:     refreshServer.URL,
+		Now:          func() time.Time { return fixedNow },
+	}, &out, "user-target"); err != nil {
+		t.Fatalf("runUseCommand: %v", err)
+	}
+	if v := refreshHits.Load(); v != 0 {
+		t.Fatalf("expected 0 refresh POSTs from `use` with expired metadata, got %d", v)
+	}
+	p := readJSONObject(t, authFile)
+	if p["openai.access"] != "target-access" {
+		t.Fatalf("active auth access must carry the stored (expired-metadata) target access, got %v", p["openai.access"])
+	}
+}
+
+// TestRunAccountsCommandCurrentSyncFailureReturnsClearError pins the
+// reactive coherence contract: a 401-driven refresh of the CURRENT row
+// whose sync to an installed auth store fails must (a) keep the row
+// visible with its per-row error, (b) NOT be counted as a successful
+// persisted refresh (successCount), and (c) cause the command to return a
+// clear error so the caller does not silently see overall success. Auth/
+// store bytes are unchanged because syncRefreshedCredentialToBoth's
+// preflight / rollback path keeps the post-mutation failure from leaking.
+func TestRunAccountsCommandCurrentSyncFailureReturnsClearError(t *testing.T) {
+	t.Parallel()
+
+	fixedNow := time.Unix(1_700_000_000, 0)
+	farExpiresMs := fixedNow.Add(2 * time.Hour).UnixMilli()
+
+	refreshServer, _ := newRefreshServer(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"access_token":"rotated-current-access","refresh_token":"rotated-current-refresh","expires_in":3600}`)
+	})
+	usageServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.Header.Get("Authorization"), "current-access") {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		w.WriteHeader(http.StatusUnauthorized)
+	}))
+	t.Cleanup(usageServer.Close)
+
+	dir := t.TempDir()
+	authFile := filepath.Join(dir, "opencode.json")
+	accountsFile := filepath.Join(dir, "accounts.json")
+	if err := os.WriteFile(authFile, []byte(`{"openai.access":"current-access"}`), 0o600); err != nil {
+		t.Fatalf("seed auth: %v", err)
+	}
+	// Make the OC auth file un-writable so syncAccountToOpenCodeAuth errors.
+	if err := os.Chmod(authFile, 0o400); err != nil {
+		t.Fatalf("chmod auth: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(authFile, 0o600) })
+
+	writeStore(t, accountsFile,
+		map[string]any{"user_id": "user-current", "access": "current-access", "refresh": "current-refresh",
+			"expires": int64(farExpiresMs), "type": "oauth", "accountId": "current-acct"},
+	)
+
+	var out strings.Builder
+	err := runAccountsCommand(context.Background(), config{
+		AuthFile:     authFile,
+		AccountsFile: accountsFile,
+		UsageURL:     usageServer.URL,
+		TokenURL:     refreshServer.URL,
+		HTTPClient:   usageServer.Client(),
+		Now:          func() time.Time { return fixedNow },
+	}, &out)
+	if err == nil {
+		t.Fatalf("expected current-sync-failure error, got nil; stdout=%q", out.String())
+	}
+	if !strings.Contains(err.Error(), "current account auth synchronization failed") {
+		t.Fatalf("expected current-account-coherence error, got %v", err)
+	}
+	if !strings.Contains(out.String(), "ERR") {
+		t.Fatalf("row-local error must still render in the table, got %q", out.String())
+	}
+	// The coherence failure must not inflate successCount into "fetched at
+	// least one row"; persistence was skipped for the failed row, so the
+	// store must still carry the pre-refresh tuple.
+	store := mustReadStore(t, accountsFile)
+	if v, _ := store["user-current"]["access"].(string); v != "current-access" {
+		t.Fatalf("store must NOT claim a successful persisted refresh on failed sync: got %v", v)
+	}
+	// Auth file: must remain on the pre-rotation token. The sync failed
+	// (write to a chmod-0o400 file), so the OC file is untouched byte-for-byte.
+	if got := string(mustReadFile(t, authFile)); got != `{"openai.access":"current-access"}` {
+		t.Fatalf("auth file must remain byte-identical to its pre-call state, got %q", got)
+	}
+}
+
+// TestRunDefaultCommandReactiveRefreshCoherence is the consolidated
+// reactive-flow regression. The helper issues a refresh POST ONLY when the
+// usage endpoint returns 401 for the current access token; the rotated
+// credential is mirrored into the in-memory piInfo snapshot so the later
+// reconcilePiInboundFromPayload call observes the rotated access instead of
+// the stale pre-refresh token. Rotation is suppressed with thresholds = 100
+// so the assertions isolate the refresh path itself.
+func TestRunDefaultCommandReactiveRefreshCoherence(t *testing.T) {
+	t.Parallel()
+
+	fixedNow := time.Unix(1_700_000_000, 0)
+	farMs := fixedNow.Add(2 * time.Hour).UnixMilli()
+	rotatedMs := fixedNow.Add(time.Hour).UnixMilli()
+
+	type seed struct {
+		name        string
+		shared      bool   // OC and Pi carry the same access token
+		refreshBody string // empty when no refresh should happen
+		usageTokens map[string]string
+		// usageStatus: optional map from access token to HTTP status. Absent
+		// entries default to 200 (success). Used to simulate 401 + retry.
+		usageStatus  map[string]int
+		wantHits     int32
+		wantOCAccess string
+		wantPiAccess string
+		wantStdout   string
+	}
+	cases := []seed{
+		{
+			// Different access; OC gets 401 once, retry 200; Pi is left
+			// untouched (no Pi usage call when OC has the active row). One
+			// POST; both stores converge on the rotated access; stdout uses
+			// the rotated usage; piInfo mirrors the rotated access.
+			name:         "shared_access_converges_after_401",
+			shared:       true,
+			refreshBody:  `{"access_token":"rotated-shared-access","refresh_token":"rotated-shared-refresh","expires_in":3600}`,
+			usageStatus:  map[string]int{"shared-access": http.StatusUnauthorized},
+			usageTokens:  map[string]string{"rotated-shared-access": "33"},
+			wantHits:     1,
+			wantOCAccess: "rotated-shared-access",
+			wantPiAccess: "rotated-shared-access",
+			wantStdout:   "33",
+		},
+		{
+			// Different access; OC and Pi carry different access tokens; OC
+			// gets 401 once. The reactive helper refreshes OC, syncs both
+			// stores (since OC is the active row), and retries with the
+			// rotated access. The Pi auth file is also synced because OC is
+			// the active row.
+			name:         "different_access_oc_401_converges",
+			refreshBody:  `{"access_token":"rotated-oc-access","refresh_token":"rotated-oc-refresh","expires_in":3600}`,
+			usageStatus:  map[string]int{"oc-access": http.StatusUnauthorized},
+			usageTokens:  map[string]string{"rotated-oc-access": "44"},
+			wantHits:     1,
+			wantOCAccess: "rotated-oc-access",
+			wantPiAccess: "rotated-oc-access",
+			wantStdout:   "44",
+		},
+		{
+			// No 401 from the usage endpoint: zero refresh POSTs; both
+			// stores and stdout remain on the pre-refresh access.
+			name:         "no_401_no_refresh",
+			shared:       true,
+			usageTokens:  map[string]string{"shared-access": "12"},
+			wantHits:     0,
+			wantOCAccess: "shared-access",
+			wantPiAccess: "shared-access",
+			wantStdout:   "12",
+		},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			ocAccess := "oc-access"
+			piAccess := "pi-access"
+			if tc.shared {
+				ocAccess, piAccess = "shared-access", "shared-access"
+			}
+			ocRefresh, piRefresh := "oc-refresh", "pi-refresh"
+			if tc.shared {
+				ocRefresh, piRefresh = "shared-refresh", "shared-refresh"
+			}
+
+			refreshServer, refreshHits := newRefreshServer(t, func(w http.ResponseWriter, _ *http.Request) {
+				if tc.wantHits == 0 {
+					t.Errorf("refresh POST must NOT run for case %q", tc.name)
+					w.WriteHeader(http.StatusOK)
+					return
+				}
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(tc.refreshBody))
+			})
+
+			usageServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				auth := r.Header.Get("Authorization")
+				if status, ok := tc.usageStatus[extractBearer(auth)]; ok && status == http.StatusUnauthorized {
+					w.WriteHeader(http.StatusUnauthorized)
+					return
+				}
+				used, ok := tc.usageTokens[extractBearer(auth)]
+				if !ok {
+					t.Errorf("unexpected usage call with auth %q", auth)
+					w.WriteHeader(http.StatusUnauthorized)
+					return
+				}
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(piPayload("user-cur", used, "")))
+			}))
+			t.Cleanup(usageServer.Close)
+
+			authFile, piAuthFile, accountsFile := piSyncFixture(t)
+			seedAuthFile(t, authFile, ocAuthBody(ocAccess, ocRefresh, farMs, "shared-acct"))
+			seedAuthFile(t, piAuthFile, piAuthBody(piAccess, piRefresh, farMs, "shared-acct"))
+			writeStore(t, accountsFile,
+				map[string]any{"user_id": "user-cur", "access": ocAccess, "refresh": ocRefresh,
+					"expires": int64(farMs), "type": "oauth", "accountId": "shared-acct"},
+			)
+			credMap := map[string]any{
+				"type":      "oauth",
+				"access":    piAccess,
+				"refresh":   piRefresh,
+				"expires":   int64(farMs),
+				"accountId": "shared-acct",
+			}
+			piInfo := &piAuthInfo{Payload: map[string]any{"openai-codex": credMap}, CredMap: credMap}
+			ocAccount := map[string]any{
+				"access":    ocAccess,
+				"refresh":   ocRefresh,
+				"expires":   int64(farMs),
+				"type":      "oauth",
+				"accountId": "shared-acct",
+			}
+
+			var out strings.Builder
+			if err := runDefaultCommandOpenCodePath(context.Background(), config{
+				AuthFile:          authFile,
+				PiAuthFile:        piAuthFile,
+				AccountsFile:      accountsFile,
+				UsageURL:          usageServer.URL,
+				TokenURL:          refreshServer.URL,
+				HTTPClient:        usageServer.Client(),
+				Now:               func() time.Time { return fixedNow },
+				FiveHourThreshold: 100,
+				WeeklyThreshold:   100,
+			}, &out, ocAccount, piInfo, true); err != nil {
+				t.Fatalf("runDefaultCommandOpenCodePath: %v", err)
+			}
+
+			if v := refreshHits.Load(); v != tc.wantHits {
+				t.Fatalf("refresh POSTs: got %d, want %d", v, tc.wantHits)
+			}
+			// After a reactive 401-driven refresh, both stores carry the
+			// rotated tuple (access + refresh + rotated expires). Without a
+			// refresh, both keep their original farMs expiry and their
+			// original refresh tokens.
+			wantOCExpires := farMs
+			wantPiExpires := farMs
+			wantOCRefresh := ocRefresh
+			wantPiRefresh := piRefresh
+			if tc.wantHits > 0 {
+				wantOCExpires = rotatedMs
+				wantPiExpires = rotatedMs
+				wantOCRefresh = "rotated-shared-refresh"
+				if !tc.shared {
+					wantOCRefresh = "rotated-oc-refresh"
+				}
+				wantPiRefresh = wantOCRefresh
+			}
+			assertOCAuth(t, authFile, tc.wantOCAccess, wantOCRefresh, wantOCExpires, "shared-acct")
+			if tc.wantPiAccess != "" {
+				assertPiCodex(t, readJSONObject(t, piAuthFile), tc.wantPiAccess, wantPiRefresh, wantPiExpires, "shared-acct")
+			}
+			if out.String() != tc.wantStdout {
+				t.Fatalf("stdout=%q, want %q", out.String(), tc.wantStdout)
+			}
+			// After a reactive rotation the in-memory piInfo must reflect the
+			// rotated access so reconcilePiInboundFromPayload does not
+			// reintroduce the stale credential.
+			if tc.wantHits > 0 {
+				if got, _ := piInfo.CredMap["access"].(string); got != tc.wantOCAccess {
+					t.Fatalf("piInfo.CredMap access: got %q, want %q", got, tc.wantOCAccess)
+				}
+			}
+		})
+	}
+}
+
+// extractBearer returns the access token from a "Bearer <token>" header value.
+// Empty input yields "".
+func extractBearer(authHeader string) string {
+	return strings.TrimSpace(strings.TrimPrefix(authHeader, "Bearer "))
+}
+
+// farFuture returns a UnixMilli timestamp well past any sensible test "due"
+// window. Used by tests that need a non-due baseline without baking magic
+// numbers into every fixture.
+func farFuture(now time.Time) int64 {
+	return now.Add(2 * time.Hour).UnixMilli()
+}
+
+// TestSyncRefreshedCredentialToBothPiLockHeldExternallyLeavesBothUntouched
+// is the regression for the dual-provider refresh path when Pi identity
+// cannot be read: when Pi's `${auth.json}.lock` is held by an external
+// actor BEFORE the refresh sync runs, the helper cannot verify the
+// same-account identity (the identity read also goes through the lock)
+// and must abort the refresh sync BEFORE mutating either auth file. The
+// helper returns a clear error, both auth files remain byte-identical
+// to their pre-call state, and the external lock is never deleted.
+//
+// A clean different-account refresh (no lock contention, Pi identity read
+// succeeds, Pi's accountId/access does not match the rotated tuple) is
+// the orthogonal contract and is pinned by
+// TestSyncRefreshedCredentialToBothDifferentAccountSkipsPiWithoutTouchingLock:
+// that path returns nil, writes only OC, and leaves Pi byte-identical
+// to its pre-call state without acquiring the Pi lock. The error
+// returned here is for the UNKNOWN-identity path only, where the safe
+// default is to leave BOTH stores untouched so an unreadable Pi can
+// never leak a rotated credential.
+func TestSyncRefreshedCredentialToBothPiLockHeldExternallyLeavesBothUntouched(t *testing.T) {
+	t.Parallel()
+
+	d := t.TempDir()
+	authFile := filepath.Join(d, "opencode.json")
+	piAuthFile := filepath.Join(d, "pi.json")
+
+	// Same accountId on both stores AND on the rotated credential so the
+	// helper would normally enter the dual-write branch if Pi identity were
+	// readable.
+	const sharedAcct = "shared-acct"
+	originalOC := fmt.Sprintf(`{"openai.access":"old-oc","openai.refresh":"old-oc-r","openai.expires":1700003600000,"openai.type":"oauth","openai.accountId":%q}`, sharedAcct)
+	originalPi := fmt.Sprintf(`{"openai-codex":{"type":"oauth","access":"old-pi","refresh":"old-pi-r","expires":1700003600000,"accountId":%q}}`, sharedAcct)
+	seedAuthFile(t, authFile, originalOC)
+	seedAuthFile(t, piAuthFile, originalPi)
+
+	// External actor (e.g. another CLI process) holds the Pi lock. Because
+	// the identity read goes through the same lock, piAuthMatchesAccount
+	// returns an UNKNOWN result; the helper must abort the refresh sync
+	// before touching either auth file.
+	lockPath := piAuthFile + ".lock"
+	if err := os.Mkdir(lockPath, 0o700); err != nil {
+		t.Fatalf("seed lock dir: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Remove(lockPath) })
+
+	refreshed := map[string]any{
+		"access":    "rotated-access",
+		"refresh":   "rotated-refresh",
+		"expires":   int64(1700007200000),
+		"type":      "oauth",
+		"accountId": sharedAcct,
+	}
+
+	err := syncRefreshedCredentialToBoth(config{
+		AuthFile:   authFile,
+		PiAuthFile: piAuthFile,
+	}, refreshed, false)
+	if err == nil {
+		t.Fatalf("identity read contention must surface as a clear error, not nil")
+	}
+	if !strings.Contains(err.Error(), "Pi auth identity check before refresh sync") {
+		t.Fatalf("expected Pi-identity-check error prefix, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "Pi auth lock") {
+		t.Fatalf("expected error to name the underlying Pi lock contention, got %v", err)
+	}
+
+	// OC MUST remain byte-identical to its pre-call state: the helper
+	// aborted before any file was touched.
+	if got := string(mustReadFile(t, authFile)); got != originalOC {
+		t.Fatalf("OC auth file was mutated despite identity-verification failure; got %q", got)
+	}
+	// Pi MUST remain byte-identical to its pre-call state.
+	if got := string(mustReadFile(t, piAuthFile)); got != originalPi {
+		t.Fatalf("Pi auth file was mutated despite identity-verification failure; got %q", got)
+	}
+	// The external lock must still be present and owned by the original
+	// holder so the helper never deleted a lock it did not create.
+	if _, statErr := os.Stat(lockPath); statErr != nil {
+		t.Fatalf("external Pi lock was deleted by helper: %v", statErr)
+	}
+}
+
+// TestSyncRefreshedCredentialToBothMalformedPiIdentityLeavesBothUntouched
+// is the malformed-JSON counterpart to
+// TestSyncRefreshedCredentialToBothPiLockHeldExternallyLeavesBothUntouched:
+// when Pi's auth.json is present and the Pi directory exists but the
+// identity read fails because the JSON cannot be parsed, the helper must
+// return a clear error and leave BOTH auth files byte-identical to their
+// pre-call state. Same-account dual-write MUST NOT run when the identity
+// result is UNKNOWN.
+func TestSyncRefreshedCredentialToBothMalformedPiIdentityLeavesBothUntouched(t *testing.T) {
+	t.Parallel()
+
+	d := t.TempDir()
+	authFile := filepath.Join(d, "opencode.json")
+	piAuthFile := filepath.Join(d, "pi.json")
+
+	originalOC := `{"openai.access":"old-oc","openai.refresh":"old-oc-r","openai.expires":1700003600000,"openai.type":"oauth","openai.accountId":"shared-acct"}`
+	originalPi := `{not valid json`
+	seedAuthFile(t, authFile, originalOC)
+	seedAuthFile(t, piAuthFile, originalPi)
+
+	refreshed := map[string]any{
+		"access":    "rotated-access",
+		"refresh":   "rotated-refresh",
+		"expires":   int64(1700007200000),
+		"type":      "oauth",
+		"accountId": "shared-acct",
+	}
+
+	err := syncRefreshedCredentialToBoth(config{
+		AuthFile:   authFile,
+		PiAuthFile: piAuthFile,
+	}, refreshed, false)
+	if err == nil {
+		t.Fatalf("malformed Pi identity must surface as a clear error, not nil")
+	}
+	if !strings.Contains(err.Error(), "Pi auth identity check before refresh sync") {
+		t.Fatalf("expected Pi-identity-check error prefix, got %v", err)
+	}
+
+	if got := string(mustReadFile(t, authFile)); got != originalOC {
+		t.Fatalf("OC auth file was mutated despite identity-verification failure; got %q", got)
+	}
+	if got := string(mustReadFile(t, piAuthFile)); got != originalPi {
+		t.Fatalf("Pi auth file was mutated despite identity-verification failure; got %q", got)
+	}
+}
+
+// TestSyncRefreshedCredentialToBothRollsBackOCAfterPiFailure is the
+// regression for blocker 2's post-mutation rollback: when the OC write
+// succeeds and the Pi write fails (after the preflight passes), the helper
+// must restore OC byte-for-byte from the pre-mutation snapshot and surface a
+// joined partial-sync/rollback error. The "OC auth file restored" phrasing
+// proves the rollback happened; the joined error format proves the rollback
+// itself was reported.
+func TestSyncRefreshedCredentialToBothRollsBackOCAfterPiFailure(t *testing.T) {
+	t.Parallel()
+
+	d := t.TempDir()
+	authFile := filepath.Join(d, "opencode.json")
+	piAuthFile := filepath.Join(d, "pi.json")
+
+	originalOC := `{"openai.access":"old-oc","openai.refresh":"old-oc-r","openai.expires":1700003600000,"openai.type":"oauth"}`
+	seedAuthFile(t, authFile, originalOC)
+	// Both stores carry the SAME accountId so the account-identity guard
+	// passes the Pi write through (the guard is verified separately; this
+	// test focuses on the rollback mechanism when the Pi write FAILS).
+	const sharedAcct = "shared-acct"
+	seedAuthFile(t, piAuthFile, fmt.Sprintf(`{"openai-codex":{"type":"oauth","access":"old-pi","refresh":"r","expires":1700003600000,"accountId":%q}}`, sharedAcct))
+
+	// Force the Pi write to fail by making the Pi file path unwritable AFTER
+	// the preflight acquires and releases the lock. The OC write succeeds
+	// first (OC owns its own file), then the Pi write fails on chmod/write.
+	if err := os.Chmod(piAuthFile, 0o400); err != nil {
+		t.Fatalf("seed chmod: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(piAuthFile, 0o600) })
+
+	refreshed := map[string]any{
+		"access":    "rotated-access",
+		"refresh":   "rotated-refresh",
+		"expires":   int64(1700007200000),
+		"type":      "oauth",
+		"accountId": sharedAcct,
+	}
+
+	err := syncRefreshedCredentialToBoth(config{
+		AuthFile:   authFile,
+		PiAuthFile: piAuthFile,
+	}, refreshed, false)
+	if err == nil {
+		t.Fatalf("expected Pi auth sync failure, got nil")
+	}
+	if !strings.Contains(err.Error(), "Pi auth sync failed") {
+		t.Fatalf("expected Pi-sync-failed error phrasing, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "OpenCode auth file restored") {
+		t.Fatalf("expected rollback-from-snapshot phrasing in error, got %v", err)
+	}
+	// OC must be restored byte-for-byte to the pre-mutation snapshot.
+	if got := string(mustReadFile(t, authFile)); got != originalOC {
+		t.Fatalf("OC auth file was not rolled back; got %q", got)
+	}
+}
+
+// TestRunDefaultCommandReactiveRefreshRewritesInMemoryPiInfo is the
+// reactive regression for the in-memory piInfo update: when the OC usage
+// call returns 401, the rotated credential must be mirrored into the
+// in-memory piInfo snapshot BEFORE reconcilePiInboundFromPayload runs.
+// Otherwise the inbound pass observes the stale pre-refresh access and
+// either re-imports the stale value or triggers an unnecessary secondary
+// fetch.
+//
+// Deterministic assertion: with the in-memory piInfo updated, the inbound
+// reconciliation sees piInfo.piAccess == account["access"] == rotated
+// access, so it MUST NOT call fetchUsageWindow with the stale access
+// string. The test verifies this by returning 401 for the stale access
+// (deterministic mismatch with the rotated access) and asserting that the
+// helper is called with the rotated token and never the stale one.
+func TestRunDefaultCommandReactiveRefreshRewritesInMemoryPiInfo(t *testing.T) {
+	t.Parallel()
+
+	fixedNow := time.Unix(1_700_000_000, 0)
+	farMs := fixedNow.Add(2 * time.Hour).UnixMilli()
+	rotatedMs := fixedNow.Add(time.Hour).UnixMilli()
+
+	rotatedAccess := "rotated-shared-access"
+	refreshServer, refreshHits := newRefreshServer(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprintf(w, `{"access_token":%q,"refresh_token":"rotated-shared-refresh","expires_in":3600}`, rotatedAccess)
+	})
+	var usageHits atomic.Int32
+	usageServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		usageHits.Add(1)
+		auth := r.Header.Get("Authorization")
+		if !strings.Contains(auth, rotatedAccess) {
+			// Initial call with the stale access must return 401 so the
+			// reactive helper triggers the refresh.
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(piPayload("user-cur", "11", "")))
+	}))
+	t.Cleanup(usageServer.Close)
+
+	authFile, piAuthFile, accountsFile := piSyncFixture(t)
+	staleAccess := "stale-shared-access"
+	staleRefresh := "stale-shared-refresh"
+	seedAuthFile(t, authFile, ocAuthBody(staleAccess, staleRefresh, farMs, "shared-acct"))
+	seedAuthFile(t, piAuthFile, piAuthBody(staleAccess, staleRefresh, farMs, "shared-acct"))
+	writeStore(t, accountsFile,
+		map[string]any{
+			"user_id": "user-cur", "access": staleAccess, "refresh": staleRefresh,
+			"expires": int64(farMs), "type": "oauth", "accountId": "shared-acct",
+		},
+	)
+
+	credMap := map[string]any{
+		"type":      "oauth",
+		"access":    staleAccess,
+		"refresh":   staleRefresh,
+		"expires":   int64(farMs),
+		"accountId": "shared-acct",
+	}
+	piInfo := &piAuthInfo{Payload: map[string]any{"openai-codex": credMap}, CredMap: credMap}
+	ocAccount := map[string]any{
+		"access":    staleAccess,
+		"refresh":   staleRefresh,
+		"expires":   int64(farMs),
+		"type":      "oauth",
+		"accountId": "shared-acct",
+	}
+
+	var out strings.Builder
+	if err := runDefaultCommandOpenCodePath(context.Background(), config{
+		AuthFile:          authFile,
+		PiAuthFile:        piAuthFile,
+		AccountsFile:      accountsFile,
+		UsageURL:          usageServer.URL,
+		TokenURL:          refreshServer.URL,
+		HTTPClient:        usageServer.Client(),
+		Now:               func() time.Time { return fixedNow },
+		FiveHourThreshold: 100,
+		WeeklyThreshold:   100,
+	}, &out, ocAccount, piInfo, true); err != nil {
+		t.Fatalf("runDefaultCommandOpenCodePath: %v", err)
+	}
+
+	if v := refreshHits.Load(); v != 1 {
+		t.Fatalf("refresh POSTs: got %d, want 1", v)
+	}
+	// usageHits must be exactly 2 (the initial 401 + the retry with the
+	// rotated access). If the inbound reconciliation still saw the stale
+	// access it would have made a THIRD call and the server would have
+	// returned 401 again.
+	if v := usageHits.Load(); v != 2 {
+		t.Fatalf("usage POSTs: got %d, want exactly 2 (initial 401 + retry); inbound reconcile must NOT call with stale access", v)
+	}
+
+	assertOCAuth(t, authFile, rotatedAccess, "rotated-shared-refresh", rotatedMs, "shared-acct")
+	assertPiCodex(t, readJSONObject(t, piAuthFile), rotatedAccess, "rotated-shared-refresh", rotatedMs, "shared-acct")
+
+	if out.String() != "11" {
+		t.Fatalf("stdout=%q, want %q", out.String(), "11")
+	}
+
+	// In-memory piInfo must reflect the rotated tuple. Without the fix this
+	// would still carry the stale access string.
+	if got, _ := piInfo.CredMap["access"].(string); got != rotatedAccess {
+		t.Fatalf("piInfo.CredMap access: got %q, want %q (stale access would re-introduce the pre-refresh credential on the inbound pass)", got, rotatedAccess)
+	}
+}
+
+// ----------------------------------------------------------------------------
+// Guarded Pi-source recovery tests (selectRefreshSourceFromPi +
+// fetchUsageWithReactiveRefresh's piInfo hook). These pin the contract for the
+// 401-driven reactive refresh: when Pi holds a demonstrably same-account and
+// newer/safer OAuth tuple, the OC path must consume Pi's refresh token in the
+// single allowed refresh POST, and the rotated tuple must converge into both
+// installed auth stores. Different accounts MUST NOT be substituted.
+// ----------------------------------------------------------------------------
+
+// TestSelectRefreshSourceFromPiRules is the unit-level pin for the selection
+// rules. Each subtest seeds a distinct OC/Pi pair and asserts whether the
+// helper substitutes Pi (returns a fresh merged copy) or leaves OC untouched
+// (returns OC verbatim).
+func TestSelectRefreshSourceFromPiRules(t *testing.T) {
+	t.Parallel()
+
+	nowMs := int64(1_700_000_000_000)
+	later := nowMs + int64(time.Hour/time.Millisecond)
+	earlier := nowMs - int64(time.Hour/time.Millisecond)
+
+	mkOC := func(access, refresh, accountID string, expires int64) map[string]any {
+		return map[string]any{
+			"type":      "oauth",
+			"access":    access,
+			"refresh":   refresh,
+			"expires":   expires,
+			"accountId": accountID,
+			"user_id":   "user-oc",
+			"email":     "oc@example.com",
+		}
+	}
+
+	t.Run("same_access_identical_refresh_no_swap", func(t *testing.T) {
+		t.Parallel()
+		oc := mkOC("shared", "oc-r", "shared-acct", later)
+		credMap := map[string]any{
+			"type":      "oauth",
+			"access":    "shared",
+			"refresh":   "oc-r",
+			"expires":   later,
+			"accountId": "shared-acct",
+		}
+		piInfo := &piAuthInfo{Payload: map[string]any{"openai-codex": credMap}, CredMap: credMap}
+		got := selectRefreshSourceFromPi(oc, piInfo)
+		// Same access + same refresh + same expires -> nothing to swap.
+		if got["refresh"] != "oc-r" {
+			t.Fatalf("refresh unexpectedly swapped: got %v", got["refresh"])
+		}
+		if got["access"] != "shared" {
+			t.Fatalf("access mutated: got %v", got["access"])
+		}
+	})
+
+	t.Run("same_access_different_refresh_swaps_to_pi", func(t *testing.T) {
+		t.Parallel()
+		oc := mkOC("shared", "oc-r-stale", "oc-acct", later)
+		credMap := map[string]any{
+			"type":      "oauth",
+			"access":    "shared",
+			"refresh":   "pi-r-fresh",
+			"expires":   later,
+			"accountId": "pi-acct",
+		}
+		piInfo := &piAuthInfo{Payload: map[string]any{"openai-codex": credMap}, CredMap: credMap}
+		got := selectRefreshSourceFromPi(oc, piInfo)
+		if got["refresh"] != "pi-r-fresh" {
+			t.Fatalf("expected Pi refresh, got %v", got["refresh"])
+		}
+		if got["accountId"] != "pi-acct" {
+			t.Fatalf("expected Pi accountId merged, got %v", got["accountId"])
+		}
+		// OC metadata preserved.
+		if got["user_id"] != "user-oc" || got["email"] != "oc@example.com" {
+			t.Fatalf("OC metadata lost: got %v", got)
+		}
+		// OC input was never mutated.
+		if oc["refresh"] != "oc-r-stale" {
+			t.Fatalf("OC input mutated: %v", oc)
+		}
+	})
+
+	t.Run("same_accountId_pi_expires_strictly_greater_swaps_to_pi", func(t *testing.T) {
+		t.Parallel()
+		oc := mkOC("oc-a", "oc-r", "shared-acct", nowMs)
+		credMap := map[string]any{
+			"type":      "oauth",
+			"access":    "pi-a-rotated",
+			"refresh":   "pi-r",
+			"expires":   later,
+			"accountId": "shared-acct",
+		}
+		piInfo := &piAuthInfo{Payload: map[string]any{"openai-codex": credMap}, CredMap: credMap}
+		got := selectRefreshSourceFromPi(oc, piInfo)
+		if got["access"] != "pi-a-rotated" {
+			t.Fatalf("expected Pi access merged, got %v", got["access"])
+		}
+		if got["refresh"] != "pi-r" {
+			t.Fatalf("expected Pi refresh merged, got %v", got["refresh"])
+		}
+		if got["expires"] != later {
+			t.Fatalf("expected Pi expires merged, got %v", got["expires"])
+		}
+	})
+
+	t.Run("same_accountId_pi_expires_equal_no_swap", func(t *testing.T) {
+		t.Parallel()
+		oc := mkOC("oc-a", "oc-r", "shared-acct", later)
+		credMap := map[string]any{
+			"type":      "oauth",
+			"access":    "pi-a",
+			"refresh":   "pi-r",
+			"expires":   later,
+			"accountId": "shared-acct",
+		}
+		piInfo := &piAuthInfo{Payload: map[string]any{"openai-codex": credMap}, CredMap: credMap}
+		got := selectRefreshSourceFromPi(oc, piInfo)
+		if got["access"] != "oc-a" {
+			t.Fatalf("expected OC access unchanged, got %v", got["access"])
+		}
+		if got["refresh"] != "oc-r" {
+			t.Fatalf("expected OC refresh unchanged, got %v", got["refresh"])
+		}
+	})
+
+	t.Run("same_accountId_pi_expires_older_no_swap", func(t *testing.T) {
+		t.Parallel()
+		oc := mkOC("oc-a", "oc-r", "shared-acct", later)
+		credMap := map[string]any{
+			"type":      "oauth",
+			"access":    "pi-a",
+			"refresh":   "pi-r",
+			"expires":   earlier,
+			"accountId": "shared-acct",
+		}
+		piInfo := &piAuthInfo{Payload: map[string]any{"openai-codex": credMap}, CredMap: credMap}
+		got := selectRefreshSourceFromPi(oc, piInfo)
+		if got["access"] != "oc-a" {
+			t.Fatalf("expected OC access unchanged when Pi is older, got %v", got["access"])
+		}
+	})
+
+	t.Run("different_accountId_and_different_access_no_swap", func(t *testing.T) {
+		t.Parallel()
+		oc := mkOC("oc-a", "oc-r", "oc-acct", earlier)
+		credMap := map[string]any{
+			"type":      "oauth",
+			"access":    "pi-a",
+			"refresh":   "pi-r",
+			"expires":   later,
+			"accountId": "pi-acct",
+		}
+		piInfo := &piAuthInfo{Payload: map[string]any{"openai-codex": credMap}, CredMap: credMap}
+		got := selectRefreshSourceFromPi(oc, piInfo)
+		if got["access"] != "oc-a" {
+			t.Fatalf("expected OC unchanged for different accounts, got %v", got)
+		}
+		if got["refresh"] != "oc-r" {
+			t.Fatalf("expected OC refresh unchanged, got %v", got)
+		}
+	})
+
+	t.Run("nil_piInfo_returns_oc_unchanged", func(t *testing.T) {
+		t.Parallel()
+		oc := mkOC("oc-a", "oc-r", "oc-acct", nowMs)
+		got := selectRefreshSourceFromPi(oc, nil)
+		if got["access"] != "oc-a" || got["refresh"] != "oc-r" {
+			t.Fatalf("nil piInfo must return OC unchanged, got %v", got)
+		}
+	})
+
+	t.Run("nil_CredMap_returns_oc_unchanged", func(t *testing.T) {
+		t.Parallel()
+		oc := mkOC("oc-a", "oc-r", "oc-acct", nowMs)
+		piInfo := &piAuthInfo{Payload: map[string]any{}, CredMap: nil}
+		got := selectRefreshSourceFromPi(oc, piInfo)
+		if got["access"] != "oc-a" || got["refresh"] != "oc-r" {
+			t.Fatalf("nil CredMap must return OC unchanged, got %v", got)
+		}
+	})
+
+	t.Run("malformed_Pi_returns_oc_unchanged", func(t *testing.T) {
+		t.Parallel()
+		oc := mkOC("oc-a", "oc-r", "oc-acct", nowMs)
+		// Missing refresh makes Pi's parsePiOpenAICodexEntry fail.
+		credMap := map[string]any{
+			"type":    "oauth",
+			"access":  "oc-a",
+			"expires": nowMs,
+		}
+		piInfo := &piAuthInfo{Payload: map[string]any{"openai-codex": credMap}, CredMap: credMap}
+		got := selectRefreshSourceFromPi(oc, piInfo)
+		if got["refresh"] != "oc-r" {
+			t.Fatalf("malformed Pi must not substitute, got %v", got["refresh"])
+		}
+	})
+
+	t.Run("blank_accountId_does_not_match_blank_accountId", func(t *testing.T) {
+		t.Parallel()
+		oc := mkOC("oc-a", "oc-r", "", nowMs)
+		credMap := map[string]any{
+			"type":      "oauth",
+			"access":    "pi-a",
+			"refresh":   "pi-r",
+			"expires":   later,
+			"accountId": "",
+		}
+		piInfo := &piAuthInfo{Payload: map[string]any{"openai-codex": credMap}, CredMap: credMap}
+		got := selectRefreshSourceFromPi(oc, piInfo)
+		// Blank accountIds on both sides must NOT count as a match.
+		if got["access"] != "oc-a" {
+			t.Fatalf("blank accountIds must not match: got %v", got)
+		}
+	})
+
+	t.Run("pi_blank_accountId_does_not_overwrite_oc_accountId", func(t *testing.T) {
+		t.Parallel()
+		oc := mkOC("oc-a", "oc-r", "shared-acct", nowMs)
+		credMap := map[string]any{
+			"type":      "oauth",
+			"access":    "oc-a",
+			"refresh":   "pi-r-fresh",
+			"expires":   later,
+			"accountId": "", // Pi has no accountId; OC has one.
+		}
+		piInfo := &piAuthInfo{Payload: map[string]any{"openai-codex": credMap}, CredMap: credMap}
+		got := selectRefreshSourceFromPi(oc, piInfo)
+		// Same access + different refresh -> Pi wins. Blank Pi accountId must
+		// not clobber OC's accountId.
+		if got["accountId"] != "shared-acct" {
+			t.Fatalf("expected OC accountId preserved, got %v", got["accountId"])
+		}
+		if got["refresh"] != "pi-r-fresh" {
+			t.Fatalf("expected Pi refresh merged, got %v", got["refresh"])
+		}
+	})
+}
+
+// TestRunDefaultCommandPiRotatedRefreshUsesPiRefreshToken pins the
+// guarded-Pi-source recovery contract end-to-end for the OC default path:
+//  1. OpenCode's refresh token is stale (R1) but its access token is still
+//     the same string as Pi's (Pi rotated the refresh upstream).
+//  2. The OC usage fetch with that access token returns 401 (simulating
+//     OpenCode's session being invalidated).
+//  3. The reactive helper sees Pi holds the same access + a newer refresh,
+//     swaps the refresh source to Pi BEFORE the single refresh POST, and
+//     sends R2 to the OAuth endpoint.
+//  4. The refresh POST succeeds, the rotated tuple is persisted to both
+//     installed auth stores via syncRefreshedCredentialToBoth, and the
+//     usage retry succeeds with the rotated access.
+//
+// The contract: exactly ONE refresh POST, the POST sends R2 (not R1), and
+// both stores converge on the rotated tuple.
+func TestRunDefaultCommandPiRotatedRefreshUsesPiRefreshToken(t *testing.T) {
+	t.Parallel()
+
+	fixedNow := time.Unix(1_700_000_000, 0)
+	staleOCExpiresMs := fixedNow.Add(2 * time.Hour).UnixMilli()
+	piExpiresMs := fixedNow.Add(3 * time.Hour).UnixMilli()
+	rotatedExpiresMs := fixedNow.Add(time.Hour).UnixMilli()
+
+	const ocStaleRefresh = "OC-R1-STALE"
+	const piFreshRefresh = "PI-R2-FRESH"
+	const sharedAccess = "shared-access-xyz"
+
+	var capturedRefresh atomic.Value
+	refreshServer, refreshHits := newRefreshServer(t, func(w http.ResponseWriter, r *http.Request) {
+		if err := r.ParseForm(); err != nil {
+			t.Fatalf("parse form: %v", err)
+		}
+		capturedRefresh.Store(r.PostForm.Get("refresh_token"))
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprintf(w, `{"access_token":"rotated-access","refresh_token":"rotated-refresh","expires_in":3600}`)
+	})
+
+	var usageHits atomic.Int32
+	usageServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		usageHits.Add(1)
+		auth := r.Header.Get("Authorization")
+		if !strings.Contains(auth, "rotated-access") {
+			// Initial call with the stale OC access must return 401 so the
+			// reactive helper triggers the refresh flow.
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(piPayload("user-cur", "77", "")))
+	}))
+	t.Cleanup(usageServer.Close)
+
+	authFile, piAuthFile, accountsFile := piSyncFixture(t)
+	seedAuthFile(t, authFile, ocAuthBody(sharedAccess, ocStaleRefresh, staleOCExpiresMs, "shared-acct"))
+	seedAuthFile(t, piAuthFile, piAuthBody(sharedAccess, piFreshRefresh, piExpiresMs, "shared-acct"))
+	writeStore(t, accountsFile,
+		map[string]any{"user_id": "user-cur", "access": sharedAccess, "refresh": ocStaleRefresh,
+			"expires": int64(staleOCExpiresMs), "type": "oauth", "accountId": "shared-acct"},
+	)
+
+	credMap := map[string]any{
+		"type":      "oauth",
+		"access":    sharedAccess,
+		"refresh":   piFreshRefresh,
+		"expires":   int64(piExpiresMs),
+		"accountId": "shared-acct",
+	}
+	piInfo := &piAuthInfo{Payload: map[string]any{"openai-codex": credMap}, CredMap: credMap}
+	ocAccount := map[string]any{
+		"access":    sharedAccess,
+		"refresh":   ocStaleRefresh,
+		"expires":   int64(staleOCExpiresMs),
+		"type":      "oauth",
+		"accountId": "shared-acct",
+	}
+
+	var out strings.Builder
+	if err := runDefaultCommandOpenCodePath(context.Background(), config{
+		AuthFile:          authFile,
+		PiAuthFile:        piAuthFile,
+		AccountsFile:      accountsFile,
+		UsageURL:          usageServer.URL,
+		TokenURL:          refreshServer.URL,
+		HTTPClient:        usageServer.Client(),
+		Now:               func() time.Time { return fixedNow },
+		FiveHourThreshold: 100,
+		WeeklyThreshold:   100,
+	}, &out, ocAccount, piInfo, true); err != nil {
+		t.Fatalf("runDefaultCommandOpenCodePath: %v", err)
+	}
+
+	// Exactly ONE refresh POST: no recursion, no second attempt.
+	if v := refreshHits.Load(); v != 1 {
+		t.Fatalf("refresh POSTs: got %d, want 1", v)
+	}
+	// Usage calls: 1 initial 401 + 1 retry with rotated access = 2.
+	if v := usageHits.Load(); v != 2 {
+		t.Fatalf("usage POSTs: got %d, want 2 (initial 401 + retry)", v)
+	}
+	// The refresh POST must have used Pi's fresh refresh token R2 (NOT OC's
+	// stale R1). This is the guarded Pi-source recovery: the OC refresh was
+	// demonstrably stale, Pi's was demonstrably newer/safer (same access +
+	// different refresh on the lock-protected rotating store).
+	if got, _ := capturedRefresh.Load().(string); got != piFreshRefresh {
+		t.Fatalf("refresh token sent to OAuth endpoint: got %q, want Pi fresh %q (stale OC %q would 401 the OAuth endpoint)", got, piFreshRefresh, ocStaleRefresh)
+	}
+	if out.String() != "77" {
+		t.Fatalf("stdout=%q, want %q", out.String(), "77")
+	}
+	// Both stores converge on the rotated tuple.
+	assertOCAuth(t, authFile, "rotated-access", "rotated-refresh", rotatedExpiresMs, "shared-acct")
+	assertPiCodex(t, readJSONObject(t, piAuthFile), "rotated-access", "rotated-refresh", rotatedExpiresMs, "shared-acct")
+	// The captured refresh token must NOT appear in any error/stdout surface
+	// the test can read; sanity-check the rotated refresh is also absent.
+	rendered := out.String()
+	for _, secret := range []string{ocStaleRefresh, piFreshRefresh, "rotated-refresh"} {
+		if strings.Contains(rendered, secret) {
+			t.Fatalf("stdout leaked secret %q: %q", secret, rendered)
+		}
+	}
+}
+
+// TestRunAccountsCommandCurrentRowPiRotatedUsesPiRefreshToken pins the
+// guarded-Pi-source recovery contract for a CURRENT row in accounts/list:
+// when OC's current token matches the row AND Pi holds a demonstrably
+// same-account newer tuple, the refresh POST uses Pi's refresh token
+// (R2), the rotated tuple is mirrored to both installed stores via
+// syncRefreshedCredentialToBoth, and the CURRENT marker is preserved.
+//
+// Non-CURRENT rows continue using their own stored refresh so they stay
+// isolated from any out-of-band Pi rotation unrelated to the active session.
+func TestRunAccountsCommandCurrentRowPiRotatedUsesPiRefreshToken(t *testing.T) {
+	t.Parallel()
+
+	fixedNow := time.Unix(1_700_000_000, 0)
+	staleOCExpiresMs := fixedNow.Add(2 * time.Hour).UnixMilli()
+	piExpiresMs := fixedNow.Add(3 * time.Hour).UnixMilli()
+	rotatedExpiresMs := fixedNow.Add(time.Hour).UnixMilli()
+
+	const ocStaleRefresh = "OC-R1-STALE-CURRENT"
+	const piFreshRefresh = "PI-R2-FRESH-CURRENT"
+	const sharedAccess = "shared-access-current"
+
+	var capturedRefresh atomic.Value
+	refreshServer, refreshHits := newRefreshServer(t, func(w http.ResponseWriter, r *http.Request) {
+		if err := r.ParseForm(); err != nil {
+			t.Fatalf("parse form: %v", err)
+		}
+		capturedRefresh.Store(r.PostForm.Get("refresh_token"))
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprintf(w, `{"access_token":"rotated-c-access","refresh_token":"rotated-c-refresh","expires_in":3600}`)
+	})
+
+	var usageHits atomic.Int32
+	usageServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		usageHits.Add(1)
+		auth := r.Header.Get("Authorization")
+		switch {
+		case strings.Contains(auth, "rotated-c-access"):
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"user_id":"user-cur","email":"cur@example.com","rate_limit":{"primary_window":{"used_percent":55,"reset_at":1777414800}}}`))
+		case strings.Contains(auth, sharedAccess):
+			// CURRENT row initial call: stale access must 401.
+			w.WriteHeader(http.StatusUnauthorized)
+		case strings.Contains(auth, "other-access"):
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"user_id":"user-other","email":"other@example.com","rate_limit":{"primary_window":{"used_percent":66,"reset_at":1777414800}}}`))
+		default:
+			t.Errorf("unexpected usage Authorization: %q", auth)
+			w.WriteHeader(http.StatusUnauthorized)
+		}
+	}))
+	t.Cleanup(usageServer.Close)
+
+	authFile, piAuthFile, accountsFile := piSyncFixture(t)
+	seedAuthFile(t, authFile, ocAuthBody(sharedAccess, ocStaleRefresh, staleOCExpiresMs, "shared-acct"))
+	seedAuthFile(t, piAuthFile, piAuthBody(sharedAccess, piFreshRefresh, piExpiresMs, "shared-acct"))
+	writeStore(t, accountsFile,
+		map[string]any{"user_id": "user-cur", "access": sharedAccess, "refresh": ocStaleRefresh,
+			"expires": int64(staleOCExpiresMs), "type": "oauth", "accountId": "shared-acct"},
+		map[string]any{"user_id": "user-other", "access": "other-access", "refresh": "other-refresh",
+			"expires": int64(staleOCExpiresMs), "type": "oauth", "accountId": "other-acct"},
+	)
+
+	var out strings.Builder
+	if err := runAccountsCommand(context.Background(), config{
+		AuthFile:     authFile,
+		PiAuthFile:   piAuthFile,
+		AccountsFile: accountsFile,
+		UsageURL:     usageServer.URL,
+		TokenURL:     refreshServer.URL,
+		HTTPClient:   usageServer.Client(),
+		Now:          func() time.Time { return fixedNow },
+	}, &out); err != nil {
+		t.Fatalf("runAccountsCommand: %v", err)
+	}
+
+	if v := refreshHits.Load(); v != 1 {
+		t.Fatalf("refresh POSTs: got %d, want exactly 1 (single reactive POST)", v)
+	}
+	// The POST sent Pi's fresh refresh (R2), NOT OC's stale R1.
+	if got, _ := capturedRefresh.Load().(string); got != piFreshRefresh {
+		t.Fatalf("refresh token: got %q, want Pi fresh %q", got, piFreshRefresh)
+	}
+	// Both stores converge on the rotated tuple.
+	assertOCAuth(t, authFile, "rotated-c-access", "rotated-c-refresh", rotatedExpiresMs, "shared-acct")
+	assertPiCodex(t, readJSONObject(t, piAuthFile), "rotated-c-access", "rotated-c-refresh", rotatedExpiresMs, "shared-acct")
+	if !strings.Contains(out.String(), "*") {
+		t.Fatalf("CURRENT marker must be preserved across reactive refresh: %q", out.String())
+	}
+	// Non-current row must not be touched.
+	store := mustReadStore(t, accountsFile)
+	if v, _ := store["user-other"]["access"].(string); v != "other-access" {
+		t.Fatalf("non-current row mutated: %v", store["user-other"])
+	}
+	// Sanity: no secret leaks through stdout.
+	rendered := out.String()
+	for _, secret := range []string{ocStaleRefresh, piFreshRefresh, "rotated-c-refresh"} {
+		if strings.Contains(rendered, secret) {
+			t.Fatalf("stdout leaked secret %q: %q", secret, rendered)
+		}
+	}
+}
+
+// TestRunAccountsCommandCurrentRowDifferentAccountNeverUsesPi pins the
+// "different account" guard: when OC's CURRENT row matches the OC auth file
+// by access token but Pi holds a different accountId AND a different access
+// token, the helper MUST NOT substitute Pi's refresh. Pi's credentials are
+// the active session of a DIFFERENT account and must never bleed into the
+// current row's refresh.
+func TestRunAccountsCommandCurrentRowDifferentAccountNeverUsesPi(t *testing.T) {
+	t.Parallel()
+
+	fixedNow := time.Unix(1_700_000_000, 0)
+	farMs := fixedNow.Add(2 * time.Hour).UnixMilli()
+
+	var capturedRefresh atomic.Value
+	refreshServer, refreshHits := newRefreshServer(t, func(w http.ResponseWriter, r *http.Request) {
+		if err := r.ParseForm(); err != nil {
+			t.Fatalf("parse form: %v", err)
+		}
+		capturedRefresh.Store(r.PostForm.Get("refresh_token"))
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprintf(w, `{"access_token":"rotated-cur-access","refresh_token":"rotated-cur-refresh","expires_in":3600}`)
+	})
+
+	usageServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		auth := r.Header.Get("Authorization")
+		if !strings.Contains(auth, "rotated-cur-access") {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"user_id":"user-cur","email":"cur@example.com","rate_limit":{"primary_window":{"used_percent":11,"reset_at":1777414800}}}`))
+	}))
+	t.Cleanup(usageServer.Close)
+
+	authFile, piAuthFile, accountsFile := piSyncFixture(t)
+	const ocAccess = "oc-cur-access"
+	const piAccess = "pi-other-access" // different access
+	const ocAcct = "oc-acct"
+	const piAcct = "pi-acct" // different accountId
+	seedAuthFile(t, authFile, ocAuthBody(ocAccess, "oc-r-cur", farMs, ocAcct))
+	seedAuthFile(t, piAuthFile, piAuthBody(piAccess, "pi-r-other", farMs, piAcct))
+	writeStore(t, accountsFile,
+		map[string]any{"user_id": "user-cur", "access": ocAccess, "refresh": "oc-r-cur",
+			"expires": int64(farMs), "type": "oauth", "accountId": ocAcct},
+	)
+
+	var out strings.Builder
+	if err := runAccountsCommand(context.Background(), config{
+		AuthFile:     authFile,
+		PiAuthFile:   piAuthFile,
+		AccountsFile: accountsFile,
+		UsageURL:     usageServer.URL,
+		TokenURL:     refreshServer.URL,
+		HTTPClient:   usageServer.Client(),
+		Now:          func() time.Time { return fixedNow },
+	}, &out); err != nil {
+		t.Fatalf("runAccountsCommand: %v", err)
+	}
+	if v := refreshHits.Load(); v != 1 {
+		t.Fatalf("refresh POSTs: got %d, want 1", v)
+	}
+	// The POST must have used OC's refresh, NOT Pi's. Different accounts
+	// must NEVER be substituted: pi-r-other is a credential for a different
+	// identity and using it would silently log the current row into Pi's
+	// account.
+	if got, _ := capturedRefresh.Load().(string); got != "oc-r-cur" {
+		t.Fatalf("refresh token: got %q, want OC's %q (Pi's %q belongs to a different account and must NOT be substituted)", got, "oc-r-cur", "pi-r-other")
+	}
+	// OC auth file must carry the rotated tuple.
+	assertOCAuth(t, authFile, "rotated-cur-access", "rotated-cur-refresh", fixedNow.Add(time.Hour).UnixMilli(), ocAcct)
+	// Pi auth file must remain UNTOUCHED (different account, never
+	// substituted).
+	assertPiCodex(t, readJSONObject(t, piAuthFile), piAccess, "pi-r-other", farMs, piAcct)
+}
+
+// TestRefreshOAuthEndpointReturns401IsActionableNoLeak pins the actionable
+// re-login contract: when the OAuth refresh endpoint itself returns 401
+// (the supplied refresh token is rejected), the CLI must surface a clear
+// "sign in again" error without echoing the response body, the refresh
+// token, the access token, or any other credential material. Other
+// non-200 statuses continue to use the generic "OAuth refresh endpoint
+// returned N" phrasing.
+func TestRefreshOAuthEndpointReturns401IsActionableNoLeak(t *testing.T) {
+	t.Parallel()
+
+	fixedNow := time.Unix(1_700_000_000, 0)
+	rotatedExpiresMs := fixedNow.Add(time.Hour).UnixMilli()
+
+	const ocAccess = "oc-cur-access"
+	const ocRefresh = "OC-REFRESH-SECRET-XYZ"
+	const ocAcct = "oc-acct"
+
+	// OAuth endpoint echoes back the secret refresh token in the body to
+	// prove the helper swallows it.
+	refreshServer, refreshHits := newRefreshServer(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = fmt.Fprintf(w, `{"error":"invalid_grant","refresh_token":%q,"access_token":%q}`, ocRefresh, ocAccess)
+	})
+
+	usageServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+	}))
+	t.Cleanup(usageServer.Close)
+
+	authFile, _, accountsFile := piSyncFixture(t)
+	seedAuthFile(t, authFile, ocAuthBody(ocAccess, ocRefresh, rotatedExpiresMs, ocAcct))
+	writeStore(t, accountsFile,
+		map[string]any{"user_id": "user-cur", "access": ocAccess, "refresh": ocRefresh,
+			"expires": int64(rotatedExpiresMs), "type": "oauth", "accountId": ocAcct},
+	)
+
+	var out strings.Builder
+	err := runAccountsCommand(context.Background(), config{
+		AuthFile:     authFile,
+		AccountsFile: accountsFile,
+		UsageURL:     usageServer.URL,
+		TokenURL:     refreshServer.URL,
+		HTTPClient:   usageServer.Client(),
+		Now:          func() time.Time { return fixedNow },
+	}, &out)
+	if err == nil {
+		t.Fatalf("expected overall error from refresh 401, got nil; stdout=%q", out.String())
+	}
+	// The user-visible surfaces (the rendered row error + overall error)
+	// MUST carry the actionable re-login phrase and MUST NOT leak
+	// credential material. The phrase appears in the row.Err rendered into
+	// stdout via `[ERR: ...]`; the overall error is the generic
+	// "all rows failed" diagnostic.
+	const wantPhrase = "OAuth refresh token was rejected; sign in again"
+	if !strings.Contains(out.String(), wantPhrase) {
+		t.Fatalf("stdout must carry %q, got %q", wantPhrase, out.String())
+	}
+	if !strings.Contains(err.Error(), "failed to fetch usage for all saved accounts") {
+		t.Fatalf("expected overall-failure diagnostic, got %q", err.Error())
+	}
+	for _, secret := range []string{ocAccess, ocRefresh, "invalid_grant"} {
+		for _, surface := range []string{err.Error(), out.String()} {
+			if strings.Contains(surface, secret) {
+				t.Fatalf("surface leaked %q: %q", secret, surface)
+			}
+		}
+	}
+	// The OAuth endpoint was hit exactly once; no retry, no recursion.
+	if v := refreshHits.Load(); v != 1 {
+		t.Fatalf("refresh POSTs: got %d, want exactly 1", v)
+	}
+	// Auth bytes must remain unchanged on a refresh failure (persistFn was
+	// never invoked).
+	assertOCAuth(t, authFile, ocAccess, ocRefresh, rotatedExpiresMs, ocAcct)
+}
+
+// TestRefreshOAuthEndpointReturnsOtherStatusStaysStatusOnly pins the
+// non-401 status phrasing: a 400 from the OAuth refresh endpoint must use
+// the existing "OAuth refresh endpoint returned 400" phrasing and MUST
+// NOT include the actionable re-login phrase (which is reserved for
+// 401). This preserves the documented non-401 status semantics.
+func TestRefreshOAuthEndpointReturnsOtherStatusStaysStatusOnly(t *testing.T) {
+	t.Parallel()
+
+	fixedNow := time.Unix(1_700_000_000, 0)
+	farMs := fixedNow.Add(2 * time.Hour).UnixMilli()
+
+	refreshServer, _ := newRefreshServer(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = fmt.Fprint(w, `{"error":"invalid_request"}`)
+	})
+
+	usageServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+	}))
+	t.Cleanup(usageServer.Close)
+
+	authFile, _, accountsFile := piSyncFixture(t)
+	seedAuthFile(t, authFile, ocAuthBody("oc-a", "oc-r", farMs, "oc-acct"))
+	writeStore(t, accountsFile,
+		map[string]any{"user_id": "user-cur", "access": "oc-a", "refresh": "oc-r",
+			"expires": int64(farMs), "type": "oauth", "accountId": "oc-acct"},
+	)
+
+	var out strings.Builder
+	err := runAccountsCommand(context.Background(), config{
+		AuthFile:     authFile,
+		AccountsFile: accountsFile,
+		UsageURL:     usageServer.URL,
+		TokenURL:     refreshServer.URL,
+		HTTPClient:   usageServer.Client(),
+		Now:          func() time.Time { return fixedNow },
+	}, &out)
+	if err == nil {
+		t.Fatalf("expected overall error from refresh 400, got nil")
+	}
+	// The row error carries the non-401 status phrasing and is rendered
+	// into stdout via `[ERR: ...]`. The actionable re-login phrase is
+	// reserved for the 401 case.
+	if !strings.Contains(out.String(), "OAuth refresh endpoint returned 400") {
+		t.Fatalf("non-401 must keep status phrasing in stdout, got %q", out.String())
+	}
+	if strings.Contains(out.String(), "sign in again") {
+		t.Fatalf("non-401 must NOT carry the actionable re-login phrase, got %q", out.String())
+	}
+	if strings.Contains(err.Error(), "invalid_request") || strings.Contains(out.String(), "invalid_request") {
+		t.Fatalf("non-401 error leaked response body: err=%q stdout=%q", err.Error(), out.String())
+	}
+}
+
+// TestRefreshOAuthRequestExactPiParity pins the wire-level parity with
+// pi-main's OAuth refresh request for the fields our code controls: the
+// request body MUST be emitted in the documented insertion order
+// `grant_type`, `refresh_token`, `client_id` with standard
+// `application/x-www-form-urlencoded` percent-escaping, the Content-Type
+// MUST be `application/x-www-form-urlencoded`, and the request MUST NOT
+// carry an Accept header.
+//
+// Go's net/http transport adds `Accept-Encoding: gzip` by default; that
+// is a runtime default outside the explicit request generated by our code
+// and is documented as such in the README. This test deliberately avoids
+// asserting against Accept-Encoding so a regression that re-introduces the
+// Accept header or sorts the body fields alphabetically (as
+// `url.Values.Encode` would) is caught by the body/header assertions
+// below.
+//
+// The refresh token used here intentionally contains characters that
+// `url.QueryEscape` rewrites (space, slash, ampersand, equals, plus) so a
+// regression that swapped the primitive back to `fmt.Fprintf` with raw
+// concatenation would produce visibly different bytes.
+func TestRefreshOAuthRequestExactPiParity(t *testing.T) {
+	t.Parallel()
+
+	// refresh token deliberately encodes every special character that
+	// `url.QueryEscape` rewrites, so a regression that loses the escape
+	// primitive becomes visible in the captured body.
+	const trickyRefresh = "rt+with space/and&special=chars"
+
+	var capturedMethod atomic.Value
+	var capturedPath atomic.Value
+	var capturedRawBody atomic.Value
+	var capturedHeaders http.Header
+
+	server, hits := newRefreshServer(t, func(w http.ResponseWriter, r *http.Request) {
+		capturedMethod.Store(r.Method)
+		capturedPath.Store(r.URL.Path)
+		rawBody, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("read request body: %v", err)
+		}
+		capturedRawBody.Store(string(rawBody))
+		capturedHeaders = r.Header.Clone()
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"access_token":"x","refresh_token":"y","expires_in":3600}`)
+	})
+
+	_, _, _, err := performOAuthRefreshRequest(context.Background(), config{
+		TokenURL:   server.URL,
+		HTTPClient: server.Client(),
+		Now:        func() time.Time { return time.Unix(1_700_000_000, 0) },
+	}, trickyRefresh)
+	if err != nil {
+		t.Fatalf("performOAuthRefreshRequest: %v", err)
+	}
+	if v := hits.Load(); v != 1 {
+		t.Fatalf("expected exactly 1 POST, got %d", v)
+	}
+
+	// Method + path: standard POST to the configured token URL.
+	if got, _ := capturedMethod.Load().(string); got != http.MethodPost {
+		t.Fatalf("method: got %q, want POST", got)
+	}
+	if got, _ := capturedPath.Load().(string); got != "/" {
+		t.Fatalf("path: got %q, want /", got)
+	}
+
+	// Raw body MUST be the documented insertion order with url.QueryEscape
+	// percent-encoding, byte-for-byte. `client_id` MUST come AFTER
+	// `refresh_token` (not before, as a `url.Values.Encode` call would have
+	// emitted), and the refresh_token MUST have its special characters
+	// percent-escaped — `+` as `%2B`, space as `+`, `/` as `%2F`, `&` as
+	// `%26`, `=` as `%3D`.
+	wantRaw := "grant_type=refresh_token&refresh_token=" +
+		url.QueryEscape(trickyRefresh) +
+		"&client_id=" + url.QueryEscape(oauthRefreshClientID)
+	if got, _ := capturedRawBody.Load().(string); got != wantRaw {
+		t.Fatalf("raw body byte mismatch:\n got %q\nwant %q", got, wantRaw)
+	}
+
+	// Content-Type MUST be `application/x-www-form-urlencoded`.
+	if got := capturedHeaders.Get("Content-Type"); got != "application/x-www-form-urlencoded" {
+		t.Fatalf("Content-Type: got %q, want application/x-www-form-urlencoded", got)
+	}
+	// No Accept header: the only Accept header our code used to add was
+	// `Accept: application/json`; removing it is the explicit ask of the
+	// parity fix.
+	if _, present := capturedHeaders["Accept"]; present {
+		t.Fatalf("Accept header must NOT be set on the refresh POST (got %q); pi-main parity", capturedHeaders.Get("Accept"))
+	}
+}
+
+// TestSyncAccountToPiAuthWritesRotatedTupleWithoutAccountID is the
+// regression for the Pi-only refresh contract: when the helper is invoked
+// from the Pi-only refresh path and the rotated credential lacks an
+// accountId (the new access token's JWT carries no chatgpt_account_id
+// claim), it MUST still persist the rotated tuple to Pi's auth.json.
+// Previously the broad identity-based skip in syncAccountToPiAuth would
+// silently no-op a rotated access that no longer matched the on-disk Pi
+// access (which is always the case after a rotation), leaking the rotated
+// credential to memory but never to disk.
+func TestSyncAccountToPiAuthWritesRotatedTupleWithoutAccountID(t *testing.T) {
+	t.Parallel()
+
+	d := t.TempDir()
+	piAuthFile := filepath.Join(d, "pi.json")
+
+	// Pi's pre-refresh credential: access+refresh+expires+accountId. The
+	// rotated credential will have the same shape but a different access
+	// (typical rotation) and NO accountId at all (simulating a JWT whose
+	// chatgpt_account_id claim is missing/empty).
+	originalPi := fmt.Sprintf(`{"openai-codex":{"type":"oauth","access":"old-pi","refresh":"old-pi-r","expires":1700003600000,"accountId":"pi-acct"}}`)
+	seedAuthFile(t, piAuthFile, originalPi)
+
+	rotated := map[string]any{
+		"access":  "rotated-pi-access",
+		"refresh": "rotated-pi-refresh",
+		"expires": int64(1700007200000),
+		"type":    "oauth",
+		// accountId intentionally absent: Pi-only refresh must still
+		// persist the rotated tuple to disk.
+	}
+
+	if err := syncAccountToPiAuth(config{PiAuthFile: piAuthFile}, rotated); err != nil {
+		t.Fatalf("syncAccountToPiAuth must persist the rotated Pi tuple even when accountId is missing, got: %v", err)
+	}
+
+	// Pi MUST carry the rotated tuple. accountId is omitted from the
+	// rotated payload so Pi's on-disk accountId key MUST also be absent
+	// (Pi never invents identity metadata that isn't in the rotated tuple).
+	assertPiCodex(t, readJSONObject(t, piAuthFile), "rotated-pi-access", "rotated-pi-refresh", 1700007200000, "")
+}
+
+// TestSyncAccountToPiAuthWritesRotatedTupleWithChangedAccountID is the
+// companion regression for the same Pi-only contract: a rotation whose
+// derived accountId differs from the on-disk one (e.g. the JWT carries a
+// new chatgpt_account_id) MUST also be persisted. The on-disk accountId is
+// the Pi session's identity; once Pi just rotated its own access token via
+// the OAuth endpoint, the rotated accountId IS the Pi session's identity.
+func TestSyncAccountToPiAuthWritesRotatedTupleWithChangedAccountID(t *testing.T) {
+	t.Parallel()
+
+	d := t.TempDir()
+	piAuthFile := filepath.Join(d, "pi.json")
+
+	originalPi := fmt.Sprintf(`{"openai-codex":{"type":"oauth","access":"old-pi","refresh":"old-pi-r","expires":1700003600000,"accountId":"old-pi-acct"}}`)
+	seedAuthFile(t, piAuthFile, originalPi)
+
+	rotated := map[string]any{
+		"access":    "rotated-pi-access",
+		"refresh":   "rotated-pi-refresh",
+		"expires":   int64(1700007200000),
+		"type":      "oauth",
+		"accountId": "rotated-pi-acct",
+	}
+
+	if err := syncAccountToPiAuth(config{PiAuthFile: piAuthFile}, rotated); err != nil {
+		t.Fatalf("syncAccountToPiAuth must persist the rotated Pi tuple even when accountId changed, got: %v", err)
+	}
+
+	assertPiCodex(t, readJSONObject(t, piAuthFile), "rotated-pi-access", "rotated-pi-refresh", 1700007200000, "rotated-pi-acct")
+}
+
+// TestSyncRefreshedCredentialToBothDifferentAccountSkipsPiWithoutTouchingLock
+// is the dual-provider regression for the account-identity guard hoisted
+// from syncAccountToPiAuth: when OC and Pi are both installed but Pi
+// holds a different accountId AND a different access token, a successful
+// OC refresh MUST propagate to OC only and MUST leave Pi's auth.json
+// byte-identical to its pre-call state. The Pi lock MUST NOT be acquired
+// by the helper — a DIFFERENT account's rotated OpenCode credential is
+// never allowed to touch Pi's session.
+func TestSyncRefreshedCredentialToBothDifferentAccountSkipsPiWithoutTouchingLock(t *testing.T) {
+	t.Parallel()
+
+	d := t.TempDir()
+	authFile := filepath.Join(d, "opencode.json")
+	piAuthFile := filepath.Join(d, "pi.json")
+
+	const ocAcct = "oc-acct"
+	const piAcct = "pi-acct"
+	originalOC := fmt.Sprintf(`{"openai.access":"oc-a","openai.refresh":"oc-r","openai.expires":1700003600000,"openai.type":"oauth","openai.accountId":%q}`, ocAcct)
+	originalPi := fmt.Sprintf(`{"openai-codex":{"type":"oauth","access":"pi-a","refresh":"pi-r","expires":1700003600000,"accountId":%q}}`, piAcct)
+	seedAuthFile(t, authFile, originalOC)
+	seedAuthFile(t, piAuthFile, originalPi)
+
+	// Sanity: the lock must not pre-exist (we'll assert it is never created).
+	lockPath := piAuthFile + ".lock"
+	if _, err := os.Stat(lockPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("Pi lock must not pre-exist, stat err=%v", err)
+	}
+
+	// Rotated OC credential — a DIFFERENT account from Pi.
+	refreshed := map[string]any{
+		"access":    "rotated-oc-access",
+		"refresh":   "rotated-oc-refresh",
+		"expires":   int64(1700007200000),
+		"type":      "oauth",
+		"accountId": ocAcct,
+	}
+
+	if err := syncRefreshedCredentialToBoth(config{
+		AuthFile:   authFile,
+		PiAuthFile: piAuthFile,
+	}, refreshed, false); err != nil {
+		t.Fatalf("different-account refresh must NOT error (Pi is silently skipped): %v", err)
+	}
+
+	// OC MUST carry the rotated tuple.
+	assertOCAuth(t, authFile, "rotated-oc-access", "rotated-oc-refresh", 1700007200000, ocAcct)
+	// Pi MUST remain byte-identical to its pre-call state — the helper must
+	// not have touched a DIFFERENT account's session.
+	if got := string(mustReadFile(t, piAuthFile)); got != originalPi {
+		t.Fatalf("Pi auth file was mutated despite the account-identity guard; got %q", got)
+	}
+	// The Pi lock MUST never have been created or acquired: a different
+	// account's rotated credential is not allowed to coordinate with Pi's
+	// lock protocol.
+	if _, err := os.Stat(lockPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("Pi lock was acquired by the helper for a different-account refresh: stat err=%v", err)
+	}
 }
