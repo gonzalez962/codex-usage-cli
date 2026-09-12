@@ -132,6 +132,20 @@ func normalizeUsageForToggle(usage usageWindow, toggleEnabled bool) (usageWindow
 	return usage, false
 }
 
+// evaluateActiveUsageExhaustion reports whether the active account's usage
+// windows have crossed their rotation thresholds. Shared by the OC and
+// Pi-only default-command paths; rotation uses OR semantics. In 5h mode the
+// weekly (secondary) window is evaluated first, then the 5h (primary); when
+// 5h mode is off, or no secondary window is available, only the weekly
+// threshold applies to the primary window.
+func evaluateActiveUsageExhaustion(usage usageWindow, fiveHourMode bool, thresholds rotationThresholds) (weeklyExhausted, fiveHourExhausted bool) {
+	if fiveHourMode {
+		return usedPercentAtOrAboveThreshold(usage.SecondaryUsedPercent, thresholds.Weekly),
+			usedPercentAtOrAboveThreshold(usage.UsedPercent, thresholds.FiveHour)
+	}
+	return usedPercentAtOrAboveThreshold(usage.UsedPercent, thresholds.Weekly), false
+}
+
 func main() {
 	// Hide a console window this process allocated for itself, so callers that
 	// spawn the CLI without CREATE_NO_WINDOW do not flash one. No-op outside
@@ -386,16 +400,9 @@ func runDefaultCommandOpenCodePath(ctx context.Context, cfg config, stdout io.Wr
 		return err
 	}
 
-	primaryExhausted := false
-	secondaryExhausted := false
-	if fiveHourMode {
-		primaryExhausted = usedPercentAtOrAboveThreshold(usage.UsedPercent, cfg.FiveHourThreshold)
-		secondaryExhausted = usedPercentAtOrAboveThreshold(usage.SecondaryUsedPercent, cfg.WeeklyThreshold)
-	} else {
-		primaryExhausted = usedPercentAtOrAboveThreshold(usage.UsedPercent, cfg.WeeklyThreshold)
-	}
-
-	if primaryExhausted || secondaryExhausted {
+	thresholds := rotationThresholds{FiveHour: cfg.FiveHourThreshold, Weekly: cfg.WeeklyThreshold}
+	weeklyExhausted, fiveHourExhausted := evaluateActiveUsageExhaustion(usage, fiveHourMode, thresholds)
+	if weeklyExhausted || fiveHourExhausted {
 		store, err := readAccountsStore(cfg.AccountsFile)
 		if err != nil {
 			return err
@@ -452,6 +459,23 @@ func runDefaultCommandPiOnlyPath(ctx context.Context, cfg config, stdout io.Writ
 	// touched here: Pi-only mode must never create or rewrite it.
 	if err := persistOpenAIAccount(cfg.AccountsFile, persisted); err != nil {
 		return err
+	}
+
+	// Pi-only rotation: activateAccount recognizes the Pi-only install
+	// (openCodeEnabled requires the file to exist on disk) and only writes
+	// the Pi credential, so OpenCode auth.json is never created.
+	thresholds := rotationThresholds{FiveHour: cfg.FiveHourThreshold, Weekly: cfg.WeeklyThreshold}
+	weeklyExhausted, fiveHourExhausted := evaluateActiveUsageExhaustion(usage, fiveHourMode, thresholds)
+	if weeklyExhausted || fiveHourExhausted {
+		store, err := readAccountsStore(cfg.AccountsFile)
+		if err != nil {
+			return err
+		}
+		if nextAccount, ok := selectEligibleAlternateAccount(store, usage.UserID, cfg.Now().Unix(), fiveHourMode, cfg.FiveHourThreshold, cfg.WeeklyThreshold); ok {
+			if err := activateAccount(cfg, nextAccount); err != nil {
+				return err
+			}
+		}
 	}
 
 	_, err = io.WriteString(stdout, usage.UsedPercent)

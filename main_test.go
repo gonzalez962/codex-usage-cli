@@ -4797,20 +4797,74 @@ func TestPiOnlyNoRotation(t *testing.T) {
 		map[string]any{"user_id": "user-cur", "access": "pi-a", "refresh": "pi-r", "expires": int64(1778000000000), "type": "oauth"},
 		map[string]any{"user_id": "user-other", "access": "other-a", "refresh": "other-r", "expires": int64(1778000000000), "type": "oauth"},
 	)
-	server, _ := newPiServer(t, piResponses{"pi-a": piPayload("user-cur", "99", "")})
+	server, _ := newPiServer(t, piResponses{"pi-a": piPayload("user-cur", "30", "")})
 	var out strings.Builder
 	if err := runWithArgs(context.Background(), config{AuthFile: authFile, PiAuthFile: piAuthFile, AccountsFile: accountsFile, UsageURL: server.URL, HTTPClient: server.Client(),
 		Now: func() time.Time { return time.UnixMilli(1770000000000) }}, &out, nil); err != nil {
 		t.Fatalf("run: %v", err)
 	}
-	if out.String() != "99" {
-		t.Fatalf("stdout=%q want 99", out.String())
+	if out.String() != "30" {
+		t.Fatalf("stdout=%q want 30", out.String())
 	}
 	if _, err := os.Stat(authFile); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("Pi-only must NOT create OC auth, stat err=%v", err)
 	}
+	assertPiCodex(t, readJSONObject(t, piAuthFile), "pi-a", "pi-r", 1778000000000, "pi-acct")
 	if _, ok := mustReadStore(t, accountsFile)["user-cur"]; !ok {
-		t.Fatal("Pi account disappeared from store (rotated unexpectedly)")
+		t.Fatal("Pi account disappeared from store")
+	}
+}
+
+// ---------------------------------------------------------------------------------------
+// Pi-only rotation regression (weekly-exhausted, 5h below threshold).
+// ---------------------------------------------------------------------------------------
+
+// TestRunDefaultsRotatePiOnlyWhenWeeklyExhausted pins the Pi-only rotation
+// defect: OpenCode auth is absent (VPS with Pi only); active 5h=65 (<80),
+// WEEK=100 (>=98); CLI must rotate Pi auth to a complete eligible alternate
+// and must not create or touch OpenCode auth. Numeric stdout contract preserved.
+func TestRunDefaultsRotatePiOnlyWhenWeeklyExhausted(t *testing.T) {
+	t.Parallel()
+
+	resetAt := time.Now().Add(2 * time.Hour).Unix()
+	server, _ := newPiServer(t, piResponses{
+		"pi-current-access": fmt.Sprintf(
+			`{"user_id":"user-current","email":"user-current@example.com","rate_limit":{"primary_window":{"used_percent":65,"reset_at":%d},"secondary_window":{"used_percent":100,"reset_at":%d}}}`,
+			resetAt, resetAt),
+	})
+	defer server.Close()
+
+	// authFile intentionally not seeded: loadOpenCodeAccountIfAvailable reports
+	// unavailable and the dispatcher routes to runDefaultCommandPiOnlyPath.
+	authFile, piAuthFile, accountsFile := piSyncFixture(t)
+	seedAuthFile(t, piAuthFile, piAuthBody("pi-current-access", "pi-current-refresh", 1778000000000, "pi-current-acct"))
+
+	// Alternate carries the complete OAuth tuple so activateAccount validates
+	// it via buildPiCredential before touching either auth file.
+	expires := int64(1778000000000)
+	writeStore(t, accountsFile,
+		map[string]any{"user_id": "user-current", "accountId": "pi-current-acct", "access": "pi-current-access", "refresh": "pi-current-refresh", "expires": expires, "type": "oauth"},
+		map[string]any{"user_id": "user-alt", "accountId": "pi-alt-acct", "access": "pi-alt-access", "refresh": "pi-alt-refresh", "expires": expires, "type": "oauth"},
+	)
+
+	// ConfigFile omitted so runtime defaults (5h on, 5h_threshold=80,
+	// weekly_threshold=98) apply.
+	var out strings.Builder
+	if err := run(context.Background(), config{
+		AuthFile:     authFile,
+		PiAuthFile:   piAuthFile,
+		AccountsFile: accountsFile,
+		UsageURL:     server.URL,
+		HTTPClient:   server.Client(),
+	}, &out); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if out.String() != "65" {
+		t.Fatalf("stdout=%q want 65", out.String())
+	}
+	assertPiCodex(t, readJSONObject(t, piAuthFile), "pi-alt-access", "pi-alt-refresh", expires, "pi-alt-acct")
+	if _, err := os.Stat(authFile); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("Pi-only must NOT create OpenCode auth, stat err=%v", err)
 	}
 }
 
@@ -5425,6 +5479,56 @@ func TestRunWithArgsLoadsThresholdsFromConfig(t *testing.T) {
 			t.Fatalf("expected cooldownUntil=%d, got %v", resetAt, entry["cooldownUntil"])
 		}
 	})
+}
+
+// TestRunDefaultsRotateAbove5hThreshold proves a value above the default
+// 5-hour threshold rotates to an eligible alternate.
+func TestRunDefaultsRotateAbove5hThreshold(t *testing.T) {
+	t.Parallel()
+
+	resetAt := time.Now().Add(2 * time.Hour).Unix()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		// 85% primary (above default 80), 10% secondary (well below 98).
+		_, _ = w.Write([]byte(fmt.Sprintf(
+			`{"user_id":"user-current","rate_limit":{"primary_window":{"used_percent":85,"reset_at":%d},"secondary_window":{"used_percent":10,"reset_at":%d}}}`,
+			resetAt, resetAt,
+		)))
+	}))
+	defer server.Close()
+
+	dir := t.TempDir()
+	authFile := filepath.Join(dir, "auth.json")
+	if err := os.WriteFile(authFile, []byte(`{"openai.access":"current-token"}`), 0o600); err != nil {
+		t.Fatalf("write auth: %v", err)
+	}
+	accountsFile := filepath.Join(dir, "accounts.json")
+	writeStore(t, accountsFile,
+		map[string]any{"user_id": "user-current", "access": "current-token"},
+		map[string]any{"user_id": "user-alt", "access": "alt-token"},
+	)
+
+	var out strings.Builder
+	// Intentionally omit ConfigFile so the default 5h_threshold (80) applies.
+	err := run(context.Background(), config{
+		AuthFile:     authFile,
+		AccountsFile: accountsFile,
+		UsageURL:     server.URL,
+		HTTPClient:   server.Client(),
+	}, &out)
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+
+	// Preserve the numeric stdout contract.
+	if out.String() != "85" {
+		t.Fatalf("stdout=%q want 85", out.String())
+	}
+	// Rotation flipped the active credential to the eligible alternate.
+	data, _ := os.ReadFile(authFile)
+	if !strings.Contains(string(data), "alt-token") {
+		t.Fatalf("expected rotation to alt-token at default 80 threshold, got auth=%s", string(data))
+	}
 }
 
 // TestAccountWithUsageHonorsCustomThresholds locks the per-call threshold
@@ -8090,5 +8194,44 @@ func TestSyncRefreshedCredentialToBothDifferentAccountSkipsPiWithoutTouchingLock
 	// lock protocol.
 	if _, err := os.Stat(lockPath); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("Pi lock was acquired by the helper for a different-account refresh: stat err=%v", err)
+	}
+}
+
+// TestUsedPercentAtOrAboveThreshold locks the >= boundary used by rotation.
+func TestUsedPercentAtOrAboveThreshold(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name      string
+		input     string
+		threshold float64
+		want      bool
+	}{
+		{name: "below integer", input: "79", threshold: 80, want: false},
+		{name: "below decimal", input: "79.99", threshold: 80, want: false},
+		{name: "exact integer", input: "80", threshold: 80, want: true},
+		{name: "exact decimal", input: "80.00", threshold: 80, want: true},
+		{name: "decimal above", input: "80.01", threshold: 80, want: true},
+		{name: "integer above", input: "81", threshold: 80, want: true},
+		{name: "maximum", input: "100", threshold: 80, want: true},
+		{name: "whitespace exact", input: "  80  ", threshold: 80, want: true},
+		{name: "whitespace above", input: "\t85\n", threshold: 80, want: true},
+		{name: "empty", input: "", threshold: 80, want: false},
+		{name: "non-numeric", input: "abc", threshold: 80, want: false},
+		{name: "percent suffix", input: "80%", threshold: 80, want: false},
+		{name: "malformed decimal", input: "80.0.0", threshold: 80, want: false},
+		{name: "custom above", input: "50", threshold: 49.5, want: true},
+		{name: "custom below", input: "50", threshold: 50.5, want: false},
+		{name: "weekly exact", input: "98", threshold: 98, want: true},
+	}
+
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			if got := usedPercentAtOrAboveThreshold(tc.input, tc.threshold); got != tc.want {
+				t.Fatalf("usedPercentAtOrAboveThreshold(%q, %v) = %v, want %v", tc.input, tc.threshold, got, tc.want)
+			}
+		})
 	}
 }
